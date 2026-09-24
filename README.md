@@ -4,14 +4,15 @@
 
 *A thin mobile control plane for persistent AI agents.*
 
-![python](https://img.shields.io/badge/python-3-3776AB?logo=python&logoColor=white)
-![platform](https://img.shields.io/badge/platform-Linux-FCC624?logo=linux&logoColor=black)
-![android](https://img.shields.io/badge/android-Termux-3DDC84?logo=android&logoColor=white)
-![network](https://img.shields.io/badge/network-Tailscale-4B70CC?logo=tailscale&logoColor=white)
-![herdr](https://img.shields.io/badge/herdr-0.9%2B-8A5CF6)
-![push](https://img.shields.io/badge/push-ntfy-3E8B77)
-![release](https://img.shields.io/badge/release-v0.1.0-CBFD75)
-![license](https://img.shields.io/badge/license-MIT-green)
+![Python 3.x](https://img.shields.io/badge/python-3.x-3776AB?logo=python&logoColor=white)
+![Linux supported](https://img.shields.io/badge/linux-supported-FCC624?logo=linux&logoColor=black)
+![Android / Termux](https://img.shields.io/badge/android-Termux-3DDC84?logo=android&logoColor=white)
+![Tailscale required](https://img.shields.io/badge/tailscale-required-4B70CC?logo=tailscale&logoColor=white)
+
+![Herdr 0.9+](https://img.shields.io/badge/herdr-0.9%2B-8A5CF6)
+![ntfy push](https://img.shields.io/badge/ntfy-push-3E8B77)
+![release v0.1.0](https://img.shields.io/badge/release-v0.1.0-CBFD75)
+![MIT](https://img.shields.io/badge/license-MIT-green)
 
 </div>
 
@@ -103,8 +104,8 @@ read-only system check.
 ## Android setup
 
 See [docs/ANDROID.md](docs/ANDROID.md). The installer prints a personalized
-setup block (alias, hostname, username, launcher path) at the end — no
-placeholder translation required. The phone generates its own dedicated
+setup block (alias, hostname, username, launcher path) at the end — every
+value is filled in for you. The phone generates its own dedicated
 Ed25519 key; private keys are never copied between devices.
 
 ## Daily workflow
@@ -221,5 +222,6 @@ backup is offered explicitly.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). The copyright holder is intentionally a
-placeholder; **resolve before publishing**.
+MIT — see [LICENSE](LICENSE).
+
+Copyright (c) 2026 Ozymandes.
