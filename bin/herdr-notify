@@ -1,0 +1,285 @@
+#!/usr/bin/env python3
+"""herdr-notify — Herdr agent state transitions -> ntfy push (Android).
+
+Polls `herdr api snapshot` (same explicit 0.9.1 client as remote-agents),
+notifies ONLY on meaningful transitions into done/blocked. Baselines on
+start and after any Herdr outage so restarts never cause notification
+storms. Credentials live in ~/.config/remote-agents/notify.env (chmod 600).
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+
+# ---------- portable configuration + Herdr client detection ----------
+CONFIG_SEARCH = [
+    os.environ.get("REMOTE_AGENTS_CONFIG"),
+    os.path.expanduser("~/.config/remote-agents/config"),
+]
+
+
+def load_config():
+    for path in CONFIG_SEARCH:
+        if path and os.path.isfile(path):
+            cfg = {}
+            with open(path) as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if ln and not ln.startswith("#") and "=" in ln:
+                        k, v = ln.split("=", 1)
+                        cfg[k.strip()] = v.strip().strip('"').strip("'")
+            return cfg
+    return {}
+
+
+CONFIG = load_config()
+
+
+def _herdr_candidates():
+    out = []
+    override = CONFIG.get("HERDR_BIN") or os.environ.get("HERDR_BIN")
+    if override:
+        out.append(os.path.expanduser(override))
+    found = shutil.which("herdr")
+    if found:
+        out.append(found)
+    mise = os.path.expanduser("~/.local/share/mise/installs/herdr")
+    latest = os.path.join(mise, "latest", "herdr")
+    if os.path.isfile(latest):
+        out.append(latest)
+    if os.path.isdir(mise):
+        versions = []
+        for name in os.listdir(mise):
+            p = os.path.join(mise, name, "herdr")
+            if os.path.isfile(p):
+                versions.append((name, p))
+        versions.sort(key=lambda t: [int(x) if x.isdigit() else 0
+                                     for x in t[0].split(".")], reverse=True)
+        out += [p for _, p in versions]
+    seen, uniq = set(), []
+    for cand in out:
+        real = os.path.realpath(cand)
+        if real not in seen:
+            seen.add(real)
+            uniq.append(cand)
+    return uniq
+
+
+HERDR_VERDICTS = []
+
+
+def herdr_probe(path):
+    try:
+        v = subprocess.run([path, "--version"], capture_output=True,
+                           text=True, timeout=6)
+        version = (v.stdout or v.stderr).strip() or "(no version output)"
+    except OSError as e:
+        return False, f"not runnable: {e}"
+    try:
+        s = subprocess.run([path, "status"], capture_output=True,
+                           text=True, timeout=8)
+        txt = (s.stdout or "") + (s.stderr or "")
+    except OSError as e:
+        return False, f"{version}; status failed: {e}"
+    running = re.search(r"status:\s*running", txt)
+    compatible = (re.search(r"endpoint_compatible:\s*yes", txt)
+                  or re.search(r"private_protocol_compatible:\s*yes", txt))
+    if running and compatible:
+        return True, f"{version} (protocol-compatible with running server)"
+    if running:
+        return False, f"{version} (INCOMPATIBLE with running server)"
+    return True, f"{version} (no running server detected)"
+
+
+def detect_herdr():
+    picked = None
+    for cand in _herdr_candidates():
+        ok, detail = herdr_probe(cand)
+        HERDR_VERDICTS.append((cand, ok, detail))
+        if ok:
+            picked = cand
+            break
+    return picked
+
+
+HERDR = detect_herdr()
+ENV_FILE = (os.environ.get("NOTIFY_ENV")
+            or os.path.expanduser("~/.config/remote-agents/notify.env"))
+POLL_SECONDS = 8
+MIN_REPEAT = 90  # min seconds between pushes for the same pane
+
+# Herdr semantics (official docs): `idle` and `done` BOTH mean the agent is
+# ready for input; screen-detected agents (e.g. Pi) settle to `idle` after a
+# turn, integration-tracked agents may report `done`. `blocked` = approval or
+# question UI. Herdr exposes no distinct "error" state.
+COMPLETE = ("Task complete", "default", "white_check_mark")
+BLOCKED = ("Input required", "high", "rotating_light")
+
+
+def classify(prev_st, new_st):
+    """Meaningful transition -> (body, priority, tags); None = stay silent."""
+    if new_st == "blocked":
+        return BLOCKED
+    if prev_st == "working" and new_st in ("idle", "done"):
+        return COMPLETE
+    return None
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
+
+
+def load_env():
+    cfg = {}
+    try:
+        mode = os.stat(ENV_FILE).st_mode & 0o777
+        if mode != 0o600:
+            log(f"WARN {ENV_FILE} is mode {oct(mode)}; run: chmod 600 {ENV_FILE}")
+        with open(ENV_FILE) as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln and not ln.startswith("#") and "=" in ln:
+                    k, v = ln.split("=", 1)
+                    cfg[k.strip()] = v.strip().strip('"').strip("'")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        log(f"WARN cannot read {ENV_FILE}: {e}")
+    return cfg
+
+
+def configured(cfg):
+    return bool(cfg.get("NTFY_URL")) and bool(cfg.get("NTFY_TOPIC"))
+
+
+def send(cfg, title, body, priority, tags):
+    url = cfg["NTFY_URL"].rstrip("/") + "/" + cfg["NTFY_TOPIC"]
+    req = urllib.request.Request(url, data=body.encode("utf-8"), method="POST")
+    req.add_header("Title", title)
+    req.add_header("Priority", priority)
+    if tags:
+        req.add_header("Tags", tags)
+    token = cfg.get("NTFY_TOKEN", "")
+    if token:
+        req.add_header("Authorization", "Bearer " + token)
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        resp.read()
+
+
+def snapshot():
+    try:
+        p = subprocess.run([HERDR, "api", "snapshot"], capture_output=True,
+                           text=True, timeout=8)
+        if p.returncode != 0:
+            return None
+        return json.loads(p.stdout)["result"]["snapshot"]
+    except (subprocess.TimeoutExpired, json.JSONDecodeError, KeyError,
+            TypeError, OSError):
+        return None
+
+
+def poll(state, cfg, allow_push):
+    """One poll cycle. Returns True on success, False when snapshot failed."""
+    snap = snapshot()
+    if snap is None:
+        return False
+    ws_labels = {w.get("workspace_id"): (w.get("label") or w.get("workspace_id", "?"))
+                 for w in snap.get("workspaces", [])}
+    now = time.time()
+    seen = set()
+    for a in snap.get("agents", []):
+        pid = a.get("pane_id")
+        st = a.get("agent_status")
+        if not pid or not st:
+            continue
+        seen.add(pid)
+        kind = (a.get("agent") or "agent").upper()
+        label = ws_labels.get(a.get("workspace_id"), "?")
+        prev = state.get(pid)
+        if prev is None:
+            state[pid] = (st, 0.0)  # baseline: never push on first sighting
+            continue
+        prev_st, last_push = prev
+        if st == prev_st:
+            continue
+        state[pid] = (st, last_push)
+        title = f"{label} // {kind}"
+        hit = classify(prev_st, st)
+        log(f"TRANSITION {title}: {prev_st} -> {st}" + ("" if hit else " (silent)"))
+        if hit is None:
+            continue
+        body, priority, tags = hit
+        if not (allow_push and configured(cfg)):
+            continue
+        if now - last_push < MIN_REPEAT:
+            log(f"PUSH suppressed (repeat window) {title}")
+            continue
+        try:
+            send(cfg, title, body, priority, tags)
+            state[pid] = (st, now)
+            log(f"PUSH {title}: {body}")
+        except Exception as e:  # keep old ts so next poll retries
+            log(f"WARN push failed for {title}: {e}")
+    for pid in list(state):
+        if pid not in seen:
+            del state[pid]  # pane/agent gone; silent by design
+    return True
+
+
+def watch():
+    cfg = load_env()
+    if not configured(cfg):
+        log(f"push NOT CONFIGURED - transitions will only be logged. "
+            f"Create {ENV_FILE} (see notify.env.example).")
+    state = {}
+    while True:
+        if poll(state, cfg, allow_push=True):
+            gap = False
+        else:
+            if not gap:
+                log("WARN herdr snapshot unreachable; will re-baseline on recovery")
+            gap = True
+            state.clear()  # re-baseline after outage: no stale notification storm
+        time.sleep(POLL_SECONDS)
+
+
+def test():
+    cfg = load_env()
+    if not configured(cfg):
+        print(f"push NOT CONFIGURED. Create {ENV_FILE} like:")
+        print(f"  NTFY_URL=https://ntfy.sh")
+        print(f"  NTFY_TOPIC=<long-random-unguessable-name>")
+        print(f"  NTFY_TOKEN=<optional bearer token>")
+        print(f"then: chmod 600 {ENV_FILE} && systemctl --user restart herdr-notify")
+        return 1
+    try:
+        send(cfg, f"{os.uname().nodename} // remote-agents", "Test notification",
+             "default", "bell")
+    except Exception as e:
+        print(f"test push FAILED: {e}")
+        return 1
+    print("test push sent - check the phone.")
+    return 0
+
+
+def main():
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--test":
+            return test()
+        if sys.argv[1] == "--once":
+            cfg = load_env()
+            ok = poll({}, cfg, allow_push=False)
+            print("poll OK (baseline logged)" if ok else "snapshot FAILED")
+            return 0 if ok else 1
+        print(f"usage: {sys.argv[0]} [--test|--once]")
+        return 2
+    watch()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

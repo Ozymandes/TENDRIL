@@ -1,0 +1,279 @@
+#!/bin/sh
+# TENDRIL installer — user-local, interactive, never runs sudo.
+#   install              interactive install
+#   install --dry-run    preview every write, change nothing
+#   install --doctor     read-only system check (no fixes)
+
+set -u
+
+PKG_DIR=$(CDPATH= cd -- "$(dirname -- "$(readlink -f "$0")")" && pwd)
+MODE="${1:-install}"
+DRY_RUN=0
+
+say() { printf '%s\n' "$*"; }
+hr()  { say "------------------------------------------------------------"; }
+row() { printf '%-14s %s\n' "$1" "$2"; }
+ask() { printf '%s [%s] ' "$1" "$2"; read -r ans; [ -n "$ans" ] && printf '%s' "$ans" || printf '%s' "$2"; }
+confirm() { printf '%s [y/N] ' "$1"; read -r ans; [ "$ans" = "y" ] || [ "$ans" = "Y" ]; }
+backup() { [ -f "$1" ] && cp -p "$1" "$1.bak.$(date +%s)"; }
+act() {
+    if [ "$DRY_RUN" = "1" ]; then
+        say "  [dry-run] $1"; say "            -> $*"; return 0
+    fi
+    say "  $1"; "$@"
+}
+
+# ---------------- doctor (read-only) ----------------
+doctor() {
+    say "TENDRIL // SYSTEM CHECK"
+    say ""
+    if command -v python3 >/dev/null 2>&1; then
+        row "Python" "OK ($(python3 -V 2>&1))"
+    else
+        row "Python" "MISSING"
+    fi
+
+    HERDR_CHECK=$("$PKG_DIR/bin/remote-agents" --detect 2>&1)
+    HERDR_BIN=$(printf '%s\n' "$HERDR_CHECK" | sed -n 's/^chosen: //p')
+    if [ -n "$HERDR_BIN" ] && [ -x "$HERDR_BIN" ]; then
+        ST=$("$HERDR_BIN" status 2>/dev/null)
+        VER=$(printf '%s\n' "$ST" | grep -m1 -oE 'version: *[0-9.]+' | grep -oE '[0-9.]+')
+        PROTO=$(printf '%s\n' "$ST" | grep -m1 -oE 'private_protocol: *[0-9]+' | grep -oE '[0-9]+')
+        RUNNING=$(printf '%s\n' "$ST" | grep -E 'status: *running' >/dev/null && echo yes || echo no)
+        if [ "$RUNNING" = "yes" ]; then
+            row "Herdr" "OK ${VER:-?} / protocol ${PROTO:-?} (server running)"
+        else
+            row "Herdr" "CLIENT OK ${VER:-?} — server not running"
+        fi
+    else
+        row "Herdr" "NOT FOUND / INCOMPATIBLE"
+        printf '%s\n' "$HERDR_CHECK" | sed 's/^/                /'
+    fi
+
+    TIP=$(tailscale ip -4 2>/dev/null | head -1)
+    if [ -n "$TIP" ]; then row "Tailscale" "ACTIVE ($TIP)"; else row "Tailscale" "DOWN / NOT INSTALLED"; fi
+
+    command -v ssh  >/dev/null 2>&1 && row "SSH"  "OK"  || row "SSH"  "MISSING"
+    command -v mosh >/dev/null 2>&1 && row "Mosh" "OK"  || row "Mosh" "MISSING (optional, recommended)"
+
+    for a in pi claude codex; do
+        LABEL=$(printf '%s' "$a" | cut -c1 | tr 'a-z' 'A-Z')$(printf '%s' "$a" | cut -c2-)
+        command -v "$a" >/dev/null 2>&1 && row "$LABEL" "AVAILABLE" || row "$LABEL" "not installed"
+    done
+
+    if [ -f "$HOME/.config/remote-agents/notify.env" ] \
+       && grep -q '^NTFY_TOPIC=..\+' "$HOME/.config/remote-agents/notify.env" 2>/dev/null; then
+        row "Push" "ACTIVE"
+    else
+        row "Push" "NOT CONFIGURED"
+    fi
+
+    if systemctl --user is-active herdr-notify.service 2>/dev/null | grep -q active; then
+        row "Watcher" "RUNNING"
+    else
+        row "Watcher" "STOPPED"
+    fi
+    return 0
+}
+
+[ "$MODE" = "--doctor" ] && doctor && exit 0
+
+if [ "$MODE" = "--dry-run" ]; then DRY_RUN=1; fi
+
+BIN_DIR="$HOME/.local/bin"
+CONF_DIR="$HOME/.config/remote-agents"
+SYSTEMD_DIR="$HOME/.config/systemd/user"
+
+hr; say "TENDRIL // INSTALLER"; say "a thin mobile control plane for persistent AI agents"; hr
+[ "$DRY_RUN" = "1" ] && say "(dry-run: nothing will be written)"; say ""
+
+# ---------------- 1. dependencies ----------------
+say "1) Dependency check"
+PYTHON=$(command -v python3 || true)
+if [ -z "$PYTHON" ]; then
+    say "  MISSING: python3 is required."
+    say "  Install it first, e.g.:  sudo pacman -S python   (Arch)"
+    say "  (the installer never installs packages for you)"
+    exit 1
+fi
+say "  python3 : ok ($PYTHON)"
+say "  herdr   : probing candidates (protocol-checked)..."
+HERDR_CHECK=$("$PKG_DIR/bin/remote-agents" --detect 2>&1) || true
+printf '%s\n' "$HERDR_CHECK" | sed 's/^/    /'
+HERDR_BIN=$(printf '%s\n' "$HERDR_CHECK" | sed -n 's/^chosen: //p')
+if [ -z "$HERDR_BIN" ]; then
+    say "  MISSING: no protocol-compatible herdr client found."
+    say "  Install Herdr 0.9.x for your user, e.g.:"
+    say "    curl -fsSL https://herdr.dev/install.sh | sh"
+    say "  then re-run this installer."
+    exit 1
+fi
+for tool in ssh tailscale mosh; do
+    if command -v "$tool" >/dev/null 2>&1; then
+        say "  $tool    : ok"
+    else
+        say "  $tool    : NOT FOUND (optional; mobile access needs ssh+mosh."
+        say "            install it yourself, e.g.: sudo pacman -S openssh mosh tailscale)"
+    fi
+done
+for agent in pi claude codex; do
+    command -v "$agent" >/dev/null 2>&1 \
+        && say "  agent   : $agent found" \
+        || say "  agent   : $agent not installed (skipped in menus)"
+done
+say ""
+
+# ---------------- 2. questions ----------------
+say "2) Configuration"
+DEFAULT_ROOTS="$HOME/Projects:$HOME/src:$HOME/dev:$HOME/code"
+ROOTS=$(ask "Project roots to scan (colon-separated)" "$DEFAULT_ROOTS")
+TSHOST=$(ask "Tailscale hostname of this machine" "$(uname -n)")
+ALIAS=$(ask  "SSH alias the phone will use" "$TSHOST")
+say ""
+
+# ---------------- 3. write config + bins ----------------
+say "3) Install files"
+act "create $CONF_DIR" mkdir -p "$CONF_DIR" "$BIN_DIR" || exit 1
+CONFIG="$CONF_DIR/config"
+if [ -f "$CONFIG" ]; then backup "$CONFIG"; say "  backed up existing config"; fi
+CONF_BODY=$(printf 'TAILSCALE_HOST=%s\nSSH_ALIAS=%s\nPROJECT_ROOTS=%s\nHERDR_BIN=\nREMOTE_AGENTS_BIN=%s/%s\nNOTIFY_BIN=%s/%s\n' \
+    "$TSHOST" "$ALIAS" "$ROOTS" "$BIN_DIR" remote-agents "$BIN_DIR" herdr-notify)
+if [ "$DRY_RUN" = "1" ]; then
+    say "  [dry-run] write $CONFIG:"; printf '      %s\n' "$CONF_BODY"
+else
+    printf '%s\n' "$CONF_BODY" > "$CONFIG"
+    chmod 600 "$CONFIG"
+fi
+for f in remote-agents herdr-notify; do
+    [ -f "$BIN_DIR/$f" ] && backup "$BIN_DIR/$f"
+    act "install $BIN_DIR/$f" install -m 755 "$PKG_DIR/bin/$f" "$BIN_DIR/$f"
+done
+say ""
+
+# ---------------- 4. notifications (optional) ----------------
+say "4) Push notifications (ntfy -> Android), optional"
+if confirm "Configure ntfy push now?"; then
+    TOPIC=$(python3 -c 'import secrets; print("tendril-" + secrets.token_urlsafe(12))')
+    say ""
+    say "  Your private topic name:  $TOPIC"
+    say "  On Android: install the ntfy app -> Subscribe to topic -> enter exactly:"
+    say "      $TOPIC"
+    say "  (a random topic is obscurity, not access control - see docs/SECURITY.md)"
+    NOTIFY="$CONF_DIR/notify.env"
+    if [ -f "$NOTIFY" ]; then backup "$NOTIFY"; say "  backed up existing notify.env"; fi
+    if [ "$DRY_RUN" = "1" ]; then
+        say "  [dry-run] write $NOTIFY (chmod 600) with NTFY_URL/NTFY_TOPIC"
+    else
+        umask 177
+        printf 'NTFY_URL=https://ntfy.sh\nNTFY_TOPIC=%s\nNTFY_TOKEN=\n' "$TOPIC" > "$NOTIFY"
+        chmod 600 "$NOTIFY"
+        umask 022
+    fi
+else
+    say "  skipped - create $CONF_DIR/notify.env later (see config/notify.env.example),"
+    say "  then: systemctl --user restart herdr-notify"
+fi
+say ""
+
+# ---------------- 5. systemd watcher (optional) ----------------
+say "5) Notification watcher (systemd --user)"
+if command -v systemctl >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ] \
+   && systemctl --user is-system-running >/dev/null 2>&1; then
+    if confirm "Install and start herdr-notify.service (user unit)?"; then
+        act "install $SYSTEMD_DIR/herdr-notify.service" \
+            install -m 600 "$PKG_DIR/systemd/herdr-notify.service" \
+                           "$SYSTEMD_DIR/herdr-notify.service"
+        act "daemon-reload" systemctl --user daemon-reload
+        act "enable --now herdr-notify.service" \
+            systemctl --user enable --now herdr-notify.service
+    else
+        say "  skipped - unit lives at $PKG_DIR/systemd/, enable later with:"
+        say "    install -Dm600 $PKG_DIR/systemd/herdr-notify.service $SYSTEMD_DIR/herdr-notify.service"
+        say "    systemctl --user daemon-reload && systemctl --user enable --now herdr-notify"
+    fi
+else
+    say "  no user systemd session detected - skipped."
+fi
+say ""
+
+# ---------------- 6. herdr mobile keybinding ----------------
+say "6) Herdr mobile keybinding (Alt+D as a second detach)"
+HERDR_CONF="$HOME/.config/herdr/config.toml"
+if [ ! -f "$HERDR_CONF" ]; then
+    say "  no $HERDR_CONF found - skipped"
+elif grep -qE '^detach\s*=.*alt\+d' "$HERDR_CONF"; then
+    say "  Alt+D detach already present - nothing to do"
+else
+    if grep -qE '^detach\s*=' "$HERDR_CONF"; then
+        CUR=$(grep -E '^detach\s*=' "$HERDR_CONF" | head -1 | sed 's/^[^=]*=\s*//')
+        NEW=$(printf '%s' "$CUR" | sed -E 's/^\[(.*)\]$/[\1, "alt+d"]/; t; s/.*/[&], "alt+d"/')
+    else
+        NEW='["prefix+d", "alt+d"]'
+        say "  note: no detach line found; a new one will be added to [keys]"
+    fi
+    say "  proposed change in $HERDR_CONF:"
+    say "      detach = $NEW"
+    if confirm "Apply this keybinding change?"; then
+        backup "$HERDR_CONF"
+        BAK=$(ls -t "$HERDR_CONF".bak.* 2>/dev/null | head -1)
+        if [ "$DRY_RUN" = "1" ]; then
+            say "  [dry-run] set detach = $NEW; then herdr config check + reload-config"
+        else
+            python3 - "$HERDR_CONF" "$NEW" <<'PYEOF'
+import re, sys
+path, new = sys.argv[1], sys.argv[2]
+text = open(path).read()
+if re.search(r"^detach\s*=", text, re.M):
+    text = re.sub(r"^detach\s*=.*$", f"detach = {new}", text, count=1, flags=re.M)
+elif re.search(r"^\[keys\]", text, re.M):
+    text = re.sub(r"^(\[keys\]\s*)$", rf"\1detach = {new}\n", text, count=1, flags=re.M)
+else:
+    text += f"\n[keys]\ndetach = {new}\n"
+open(path, "w").write(text)
+PYEOF
+            if "$HERDR_BIN" config check >/dev/null 2>&1; then
+                "$HERDR_BIN" server reload-config >/dev/null 2>&1 \
+                    && say "  applied + reloaded live (no server restart)"
+            else
+                say "  config check FAILED - restoring backup"
+                cp -p "$BAK" "$HERDR_CONF"
+                "$HERDR_BIN" server reload-config >/dev/null 2>&1
+            fi
+        fi
+    else
+        say "  skipped - your bindings are unchanged"
+    fi
+fi
+say ""
+
+# ---------------- 7. personalized Android setup ----------------
+hr; say "TENDRIL // ANDROID SETUP (for this host)"; hr
+say "Run inside Termux on the phone:"
+say ""
+say "  pkg update && pkg install openssh mosh"
+say "  ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N '' -C termux"
+say ""
+say "  cat > ~/.ssh/config <<'EOF'"
+say "  Host $ALIAS"
+say "      HostName $TSHOST"
+say "      User $USER"
+say "      IdentityFile ~/.ssh/id_ed25519"
+say "      IdentitiesOnly yes"
+say "      ServerAliveInterval 30"
+say "      ServerAliveCountMax 3"
+say "  EOF"
+say ""
+say "  ssh-copy-id $ALIAS && ssh $ALIAS    # must log in without a password"
+say "  mkdir -p ~/bin"
+say "  scp $ALIAS:$PKG_DIR/phone/agent ~/bin/agent"
+say "  chmod +x ~/bin/agent && echo 'export PATH=\$HOME/bin:\$PATH' >> ~/.bashrc"
+say "  echo 'AGENT_ALIAS=$ALIAS' >> ~/.bashrc && source ~/.bashrc"
+say ""
+say "  agent                # TENDRIL console"
+say ""
+say "  (the phone generates its own key; private keys are never copied)"
+say ""
+hr
+say "Done. Host console:  $BIN_DIR/remote-agents   |   doctor:  $0 --doctor"
+say "Daily use from the phone:  agent"
+hr

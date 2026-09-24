@@ -1,0 +1,63 @@
+#!/bin/sh
+# remote-agents uninstaller — removes ONLY files this package installed.
+# Herdr, Tailscale, SSH, Mosh, agents and unrelated ntfy config are untouched.
+
+set -u
+
+BIN_DIR="$HOME/.local/bin"
+CONF_DIR="$HOME/.config/remote-agents"
+UNIT="$HOME/.config/systemd/user/herdr-notify.service"
+
+say() { printf '%s\n' "$*"; }
+confirm() { printf '%s [y/N] ' "$1"; read -r ans; [ "$ans" = "y" ] || [ "$ans" = "Y" ]; }
+
+say "remote-agents uninstaller"
+say ""
+
+if [ -f "$UNIT" ]; then
+    systemctl --user disable --now herdr-notify.service 2>/dev/null
+    rm -f "$UNIT"
+    systemctl --user daemon-reload 2>/dev/null
+    say "removed: $UNIT (watcher disabled)"
+fi
+
+for f in remote-agents herdr-notify; do
+    if [ -f "$BIN_DIR/$f" ]; then
+        rm -f "$BIN_DIR/$f"
+        say "removed: $BIN_DIR/$f"
+    fi
+done
+
+# bin timestamped backups created by the installer are leftovers too
+ls "$BIN_DIR"/remote-agents.bak.* "$BIN_DIR"/herdr-notify.bak.* >/dev/null 2>&1 \
+    && say "note: .bak.* copies remain in $BIN_DIR (review before deleting)"
+
+if [ -d "$CONF_DIR" ]; then
+    say ""
+    if confirm "Remove $CONF_DIR (config + notify.env contains your push topic)?"; then
+        rm -rf "$CONF_DIR"
+        say "removed: $CONF_DIR"
+    else
+        say "kept: $CONF_DIR (your push topic survives)"
+    fi
+fi
+
+echo ""
+if ls "$HOME"/.config/herdr/config.toml.bak.* >/dev/null 2>&1 \
+   && [ -f "$HOME/.config/herdr/config.toml" ]; then
+    if confirm "Restore the newest Herdr config backup (removes the Alt+D detach)?"; then
+        LATEST=$(ls -t "$HOME"/.config/herdr/config.toml.bak.* | head -1)
+        cp -p "$LATEST" "$HOME/.config/herdr/config.toml"
+        for H in "$HOME/.local/share/mise/installs/herdr/latest/herdr" "$(command -v herdr 2>/dev/null)"; do
+            if [ -n "$H" ] && [ -x "$H" ]; then
+                "$H" server reload-config >/dev/null 2>&1 && say "herdr config reloaded from: $LATEST"
+                break
+            fi
+        done
+    else
+        say "herdr config left as-is"
+    fi
+fi
+
+say ""
+say "uninstall complete"

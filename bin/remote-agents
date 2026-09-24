@@ -1,0 +1,743 @@
+#!/usr/bin/env python3
+"""remote-agents — TENDRIL host console: mobile ops for Herdr workspaces.
+
+One call to `herdr api snapshot` powers the whole menu. No config files,
+no daemon, no tmux. Built for narrow Android screens (Termux + Mosh/SSH).
+"""
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+# ---------- portable configuration ----------
+CONFIG_SEARCH = [
+    os.environ.get("REMOTE_AGENTS_CONFIG"),
+    os.path.expanduser("~/.config/remote-agents/config"),
+]
+
+
+def load_config():
+    for path in CONFIG_SEARCH:
+        if path and os.path.isfile(path):
+            cfg = {}
+            with open(path) as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if ln and not ln.startswith("#") and "=" in ln:
+                        k, v = ln.split("=", 1)
+                        cfg[k.strip()] = v.strip().strip('"').strip("'")
+            return cfg
+    return {}
+
+
+CONFIG = load_config()
+
+
+def _root_list(key, defaults):
+    raw = CONFIG.get(key, "").strip()
+    if raw:
+        return [os.path.expanduser(x.strip()) for x in raw.split(":") if x.strip()]
+    return [os.path.expanduser(d) for d in defaults]
+
+
+PROJECT_ROOTS = _root_list("PROJECT_ROOTS",
+                           ["~/Projects", "~/src", "~/dev", "~/code", "~"])
+NOTIFY_BIN = os.path.expanduser(CONFIG.get("NOTIFY_BIN")
+                                or "~/.local/bin/herdr-notify")
+HOST_LABEL = CONFIG.get("TAILSCALE_HOST") or os.uname().nodename
+
+
+# ---------- Herdr client detection (protocol-verified, newest-compatible) ----------
+def _herdr_candidates():
+    out = []
+    override = CONFIG.get("HERDR_BIN") or os.environ.get("HERDR_BIN")
+    if override:
+        out.append(os.path.expanduser(override))
+    found = shutil.which("herdr")
+    if found:
+        out.append(found)
+    mise = os.path.expanduser("~/.local/share/mise/installs/herdr")
+    latest = os.path.join(mise, "latest", "herdr")
+    if os.path.isfile(latest):
+        out.append(latest)
+    if os.path.isdir(mise):
+        versions = []
+        for name in os.listdir(mise):
+            p = os.path.join(mise, name, "herdr")
+            if os.path.isfile(p):
+                versions.append((name, p))
+        versions.sort(key=lambda t: [int(x) if x.isdigit() else 0
+                                     for x in t[0].split(".")], reverse=True)
+        out += [p for _, p in versions]
+    seen, uniq = set(), []
+    for cand in out:
+        real = os.path.realpath(cand)
+        if real not in seen:
+            seen.add(real)
+            uniq.append(cand)
+    return uniq
+
+
+HERDR_VERDICTS = []
+
+
+def herdr_probe(path):
+    """(compatible, detail): client must match the running server's protocol."""
+    try:
+        v = subprocess.run([path, "--version"], capture_output=True,
+                           text=True, timeout=6)
+        version = (v.stdout or v.stderr).strip() or "(no version output)"
+    except OSError as e:
+        return False, f"not runnable: {e}"
+    try:
+        s = subprocess.run([path, "status"], capture_output=True,
+                           text=True, timeout=8)
+        txt = (s.stdout or "") + (s.stderr or "")
+    except OSError as e:
+        return False, f"{version}; status failed: {e}"
+    running = re.search(r"status:\s*running", txt)
+    compatible = (re.search(r"endpoint_compatible:\s*yes", txt)
+                  or re.search(r"private_protocol_compatible:\s*yes", txt))
+    if running and compatible:
+        return True, f"{version} (protocol-compatible with running server)"
+    if running:
+        return False, f"{version} (INCOMPATIBLE with running server)"
+    return True, f"{version} (no running server detected)"
+
+
+def detect_herdr():
+    """First verified-protocol-compatible candidate wins."""
+    picked = None
+    for cand in _herdr_candidates():
+        ok, detail = herdr_probe(cand)
+        HERDR_VERDICTS.append((cand, ok, detail))
+        if ok:
+            picked = cand
+            break
+    return picked
+
+
+HERDR = detect_herdr()
+SESSION = "default"
+CACHE_DIR = os.path.expanduser("~/.cache/remote-agents")
+EXTRA_PATH = ":".join([
+    os.path.expanduser("~/.local/bin"),
+    os.path.expanduser("~/.local/share/mise/shims"),
+    os.path.expanduser("~/.local/share/mise/installs/pi/latest/pi"),
+    os.path.expanduser("~/.local/share/mise/installs/claude/latest"),
+    os.path.expanduser("~/.local/share/mise/installs/codex/latest/bin"),
+])
+os.environ["PATH"] = os.environ.get("PATH", "") + ":" + EXTRA_PATH
+
+RANK = {"working": 0, "blocked": 1, "done": 2, "idle": 3, "unknown": 4}
+ICON = {"working": "\u25cf", "blocked": "\u25c6", "done": "\u2713",
+        "idle": "\u25cb", "unknown": "\u25cb"}
+SHORT = {"pi": "PI", "claude": "CL", "codex": "CX", "gemini": "GE",
+         "cursor": "CU", "opencode": "OC", "copilot": "CP"}
+
+C_RESET = "\033[0m"
+C_LIME = "\033[38;2;203;253;117m"
+C_TEAL = "\033[38;2;47;179;196m"
+C_GRAY = "\033[38;2;112;128;136m"
+C_WHITE = "\033[97m"
+C_RED = "\033[38;2;232;92;111m"
+COLOR = (sys.stdout.isatty()
+         and os.environ.get("NO_COLOR") is None
+         and os.environ.get("TERM", "") != "dumb")
+if not COLOR:
+    C_RESET = C_LIME = C_TEAL = C_GRAY = C_WHITE = C_RED = ""
+
+
+def run(args, timeout=6):
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", "timeout"
+    except FileNotFoundError:
+        return 127, "", "not found"
+
+
+def find_key(obj, key):
+    """Depth-first search for the first value of `key` in nested JSON."""
+    if isinstance(obj, dict):
+        if key in obj and isinstance(obj[key], (str, int)):
+            return obj[key]
+        for v in obj.values():
+            r = find_key(v, key)
+            if r is not None:
+                return r
+    elif isinstance(obj, list):
+        for v in obj:
+            r = find_key(v, key)
+            if r is not None:
+                return r
+    return None
+
+
+def snapshot():
+    rc, out, _ = run([HERDR, "api", "snapshot"], 8)
+    if rc != 0:
+        return None
+    try:
+        return json.loads(out)["result"]["snapshot"]
+    except (json.JSONDecodeError, KeyError, TypeError):
+        return None
+
+
+def collect():
+    snap = snapshot()
+    if snap is None:
+        return None
+    pane_cwd = {}
+    for p in snap.get("panes", []):
+        if p.get("pane_id") and p.get("cwd"):
+            pane_cwd[p["pane_id"]] = p["cwd"]
+    by_ws = {}
+    for a in snap.get("agents", []):
+        by_ws.setdefault(a.get("workspace_id"), []).append(a)
+    rows = []
+    for w in snap.get("workspaces", []):
+        wid = w.get("workspace_id")
+        ags = by_ws.get(wid, [])
+        path = ""
+        for a in ags:
+            c = a.get("cwd") or a.get("foreground_cwd")
+            if c:
+                path = c
+                break
+        if not path:
+            atab = w.get("active_tab_id")
+            for p in snap.get("panes", []):
+                if p.get("tab_id") == atab and p.get("cwd"):
+                    path = p["cwd"]
+                    break
+        best = min((RANK.get(a.get("agent_status"), 4) for a in ags), default=4)
+        rows.append({
+            "id": wid,
+            "label": w.get("label") or wid,
+            "number": w.get("number", 99),
+            "focused": bool(w.get("focused")),
+            "agents": ags,
+            "path": path,
+            "rank": best,
+        })
+    rows.sort(key=lambda r: (r["rank"], not r["focused"], r["number"]))
+    return rows
+
+
+def short_path(path):
+    if not path:
+        return ""
+    home = os.path.expanduser("~")
+    if path.startswith(home):
+        path = "~" + path[len(home):]
+    return path
+
+
+def trunc(s, n):
+    return s if len(s) <= n else s[: max(1, n - 1)] + "\u2026"
+
+
+def box_width():
+    cols = shutil.get_terminal_size(fallback=(52, 24)).columns
+    return max(34, min(cols, 56))
+
+
+def line(w, ch="\u2500"):
+    return ch * w
+
+
+def tailscale_parts():
+    rc, out, _ = run(["tailscale", "ip", "-4"], 4)
+    if rc == 0 and out.strip():
+        return "ACTIVE", out.strip().splitlines()[0]
+    return "DOWN", ""
+
+
+def chip_parts(row, max_plain=40):
+    """Return (plain, colored) chip strings of identical visible width."""
+    if not row["agents"]:
+        p = "\u25cb SHELL"
+        return p, f"{C_GRAY}{p}{C_RESET}"
+    plain = colored = ""
+    shown = 0
+    for a in row["agents"]:
+        st = a.get("agent_status", "unknown")
+        kind = SHORT.get(a.get("agent", "?"), (a.get("agent") or "?")[:2].upper())
+        piece = ICON.get(st, "\u25cb") + kind + " "
+        if len(plain) + len(piece) + 3 > max_plain:
+            break
+        col = {"working": C_TEAL, "blocked": C_LIME, "done": C_LIME}.get(st, C_GRAY)
+        plain += piece
+        colored += f"{col}{ICON.get(st, '\u25cb')}{kind}{C_RESET} "
+        shown += 1
+    rest = len(row["agents"]) - shown
+    if rest > 0:
+        plain += f"+{rest} "
+        colored += f"{C_GRAY}+{rest}{C_RESET} "
+    return plain.rstrip(), colored.rstrip()
+
+
+def render(rows, note=""):
+    w = box_width()
+    inner = w - 2
+
+    def fit(s, n):
+        return s if len(s) <= n else s[: max(1, n - 1)] + "\u2026"
+
+    def pad(plain, colored):
+        return colored + " " * max(0, inner - len(plain))
+
+    lines = []
+    edge = f"{C_LIME}\u250c{line(inner)}\u2510{C_RESET}"
+    sep = f"{C_LIME}\u251c{line(inner)}\u2524{C_RESET}"
+    bot = f"{C_LIME}\u2514{line(inner)}\u2518{C_RESET}"
+    lines.append(edge)
+    t = f" {HOST_LABEL} // REMOTE AGENTS"
+    lines.append(f"{C_LIME}\u2502{C_RESET}" + pad(t, f"{C_WHITE}{t}{C_RESET}") + f"{C_LIME}\u2502{C_RESET}")
+    status, ip = tailscale_parts()
+    tl_plain = f" tailnet: {status} {ip}".rstrip()
+    scol = C_TEAL if status == "ACTIVE" else C_RED
+    tl_col = f" {C_GRAY}tailnet:{C_RESET} {scol}{status}{C_RESET}" + (f" {C_GRAY}{ip}{C_RESET}" if ip else "")
+    lines.append(f"{C_LIME}\u2502{C_RESET}" + pad(tl_plain, tl_col) + f"{C_LIME}\u2502{C_RESET}")
+    lines.append(sep)
+    compact = len(rows) > 6
+    for i, r in enumerate(rows):
+        budget = inner - 6
+        lbl_plain = fit(r["label"] + (" *" if r["focused"] else ""), budget - 9)
+        head_plain = f"{i + 1:>2}  {lbl_plain}"
+        chip_plain, chip_col = chip_parts(r, budget - len(head_plain) - 1)
+        while len(lbl_plain) + 1 + len(chip_plain) > budget and len(lbl_plain) > 4:
+            lbl_plain = fit(lbl_plain, len(lbl_plain) - 2)
+            chip_plain, chip_col = chip_parts(r, budget - len(lbl_plain) - 1)
+        gap = max(1, inner - 2 - len(head_plain) - len(chip_plain))
+        head_col = f"{C_WHITE}{i + 1:>2}{C_RESET}  {C_LIME}{lbl_plain}{C_RESET}"
+        lines.append(f"{C_LIME}\u2502{C_RESET} "
+                     + head_col + " " * gap + chip_col
+                     + f" {C_LIME}\u2502{C_RESET}")
+        if r["path"]:
+            p_plain = "    " + fit(short_path(r["path"]), inner - 6)
+            p_col = f" {C_GRAY}{p_plain[1:]}{C_RESET}"
+            lines.append(f"{C_LIME}\u2502{C_RESET}" + pad(p_plain, f" {C_GRAY}{p_plain[1:]}{C_RESET}") + f"{C_LIME}\u2502{C_RESET}")
+        if not compact:
+            lines.append(f"{C_LIME}\u2502{C_RESET}{' ' * inner}{C_LIME}\u2502{C_RESET}")
+    lines.append(sep)
+    def foot_lines(items):
+        cur, grouped = "", []
+        for it in items:
+            cand = (cur + "   " + it) if cur else it
+            if len(cand) > inner - 2 and cur:
+                grouped.append(cur)
+                cur = it
+            else:
+                cur = cand
+        if cur:
+            grouped.append(cur)
+        return grouped
+    for ln_ in foot_lines(["N New", "P Project", "S Shell", "I Info", "? Help"]) \
+            + foot_lines(["L Last", "T TestPush", "R Refresh", "Q Quit"]):
+        lines.append(f"{C_LIME}\u2502{C_RESET}"
+                     + pad(" " + ln_, f" {C_WHITE}{ln_}{C_RESET}")
+                     + f"{C_LIME}\u2502{C_RESET}")
+    lines.append(bot)
+    if note:
+        lines.append(f"{C_GRAY}{fit(note, w)}{C_RESET}")
+    print("\033[H\033[2J" + "\n".join(lines), flush=True)
+
+
+def save_last(row):
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        with open(os.path.join(CACHE_DIR, "last"), "w") as f:
+            f.write(row["id"] + "\n" + row["label"])
+    except OSError:
+        pass
+
+
+def load_last(rows):
+    try:
+        with open(os.path.join(CACHE_DIR, "last")) as f:
+            wid, label = f.read().splitlines()[:2]
+    except (OSError, ValueError):
+        return None
+    for r in rows:
+        if r["id"] == wid:
+            return r
+    return None
+
+
+def attach(row):
+    save_last(row)
+    run([HERDR, "workspace", "focus", row["id"]], 6)
+    if os.environ.get("HERDR_ENV") == "1":
+        input(f"already inside Herdr — workspace '{row['label']}' focused. Enter...")
+        return
+    print(f"{C_GRAY}attaching {row['label']} \u2014 detach: Alt+d (or ctrl+space, d) - menu returns here{C_RESET}",
+          flush=True)
+    subprocess.run([HERDR, "session", "attach", SESSION], check=False)
+
+
+def ws_create(cwd, label, focus=True):
+    args = [HERDR, "workspace", "create", "--cwd", cwd, "--label", label,
+            "--focus" if focus else "--no-focus"]
+    rc, out, err = run(args, 12)
+    if rc != 0:
+        return None, (err or out or "create failed")
+    try:
+        return json.loads(out), None
+    except json.JSONDecodeError:
+        return {}, None
+
+
+def start_agent(name, kind, pane_id):
+    print(f"{C_GRAY}starting {kind} \u2014 waiting for readiness...{C_RESET}", flush=True)
+    rc, out, err = run([HERDR, "agent", "start", name, "--kind", kind,
+                        "--pane", pane_id, "--timeout", "30000"], 45)
+    return rc == 0, (err or out)
+
+
+def choose(prompt, options):
+    for i, o in enumerate(options, 1):
+        print(f"  {C_WHITE}{i}{C_RESET}) {o}")
+    raw = input(prompt).strip()
+    if raw.isdigit() and 1 <= int(raw) <= len(options):
+        return options[int(raw) - 1]
+    return None
+
+
+def ask_dir():
+    opts = list(dict.fromkeys(PROJECT_ROOTS + [os.path.expanduser("~")]))
+    opts.append("custom path")
+    pick = choose("dir> ", opts)
+    if pick is None:
+        return None
+    if pick == "custom path":
+        pick = input("path> ").strip()
+        pick = os.path.expanduser(pick)
+        if not pick.startswith("/") and not pick.startswith("~"):
+            return None
+    if not os.path.isdir(pick):
+        print(f"{C_RED}no such directory: {pick}{C_RESET}")
+        return None
+    return pick
+
+
+def ask_agent():
+    kinds = [k for k in ("pi", "claude", "codex") if shutil.which(k)]
+    opts = ["shell only"] + [f"{k} (agent)" for k in kinds]
+    pick = choose("launch> ", opts)
+    if pick is None:
+        return None
+    if pick == "shell only":
+        return "shell"
+    return pick.split(" ")[0]
+
+
+def confirm(text):
+    ans = input(f"{C_WHITE}{text}{C_RESET} {C_GRAY}[Enter=go, n=cancel]{C_RESET} ").strip()
+    return ans != "n"
+
+
+def new_workspace():
+    name = input("name> ").strip()
+    d = ask_dir()
+    if not (name and d):
+        print(f"{C_RED}cancelled{C_RESET}")
+        return
+    kind = ask_agent()
+    if kind is None:
+        print(f"{C_RED}cancelled{C_RESET}")
+        return
+    if not confirm(f"create '{name}' @ {short_path(d)} + {kind}?"):
+        return
+    data, err = ws_create(d, name)
+    if data is None:
+        print(f"{C_RED}{err}{C_RESET}")
+        return
+    wid = find_key(data, "workspace_id")
+    pane = find_key(data, "pane_id")
+    if kind != "shell":
+        if not pane and wid:
+            snap = snapshot()
+            for p in (snap or {}).get("panes", []):
+                if p.get("workspace_id") == wid and p.get("pane_id"):
+                    pane = p["pane_id"]
+                    break
+        if not pane:
+            print(f"{C_RED}could not locate new pane; start {kind} manually{C_RESET}")
+            return
+        ok, msg = start_agent(name, kind, pane)
+        if not ok:
+            print(f"{C_RED}agent start: {trunc(msg.strip() or 'failed', 60)}{C_RESET}")
+            return
+    rows = collect() or []
+    for r in rows:
+        if r["id"] == wid:
+            attach(r)
+            return
+    print(f"{C_GRAY}workspace created; it will appear in the menu{C_RESET}")
+
+
+def quick_shell():
+    name = "shell-" + time.strftime("%H%M%S")
+    data, err = ws_create(os.path.expanduser("~"), name)
+    if data is None:
+        print(f"{C_RED}{err}{C_RESET}")
+        return
+    wid = find_key(data, "workspace_id")
+    for r in (collect() or []):
+        if r["id"] == wid:
+            attach(r)
+            return
+    print(f"{C_GRAY}shell workspace created{C_RESET}")
+
+
+def project_launcher():
+    roots = [r for r in PROJECT_ROOTS
+             if r != os.path.expanduser("~") and os.path.isdir(r)]
+    rows = collect() or []
+    entries = []
+    for root in roots:
+        try:
+            names = sorted(os.listdir(root), key=lambda n: -os.path.getmtime(
+                os.path.join(root, n)))
+        except OSError:
+            continue
+        for n in names:
+            p = os.path.join(root, n)
+            if os.path.isdir(p) and not n.startswith("."):
+                entries.append((n, p))
+                if len(entries) >= 9:
+                    break
+        if len(entries) >= 9:
+            break
+    if not entries:
+        print(f"{C_RED}no project directories found{C_RESET}")
+        return
+    cwdset = [r["path"].rstrip("/") for r in rows if r["path"]]
+    for i, (n, p) in enumerate(entries, 1):
+        exists = any(r["label"] == n or r["path"].rstrip("/") == p for r in rows) \
+            or p in cwdset or any(c.startswith(p + "/") for c in cwdset)
+        tag = f"  {C_TEAL}existing{C_RESET}" if exists else ""
+        print(f"  {C_WHITE}{i}{C_RESET}) {C_LIME}{n}{C_RESET} "
+              f"{C_GRAY}{short_path(p)}{C_RESET}{tag}")
+    raw = input("project> ").strip()
+    if not (raw.isdigit() and 1 <= int(raw) <= len(entries)):
+        return
+    n, p = entries[int(raw) - 1]
+    for r in rows:
+        if r["label"] == n or r["path"].rstrip("/") == p \
+                or r["path"].rstrip("/").startswith(p + "/"):
+            print(f"{C_GRAY}matching workspace exists \u2014 attaching{C_RESET}")
+            attach(r)
+            return
+    kind = ask_agent()
+    if kind is None:
+        return
+    if not confirm(f"create '{n}' @ {short_path(p)} + {kind}?"):
+        return
+    data, err = ws_create(p, n)
+    if data is None:
+        print(f"{C_RED}{err}{C_RESET}")
+        return
+    wid = find_key(data, "workspace_id")
+    pane = find_key(data, "pane_id")
+    if kind != "shell":
+        if not pane and wid:
+            snap = snapshot()
+            for pan in (snap or {}).get("panes", []):
+                if pan.get("workspace_id") == wid and pan.get("pane_id"):
+                    pane = pan["pane_id"]
+                    break
+        if not pane:
+            print(f"{C_RED}could not locate new pane; start {kind} manually{C_RESET}")
+            return
+        ok, msg = start_agent(n, kind, pane)
+        if not ok:
+            print(f"{C_RED}agent start: {trunc(msg.strip() or 'failed', 60)}{C_RESET}")
+            return
+    for r in (collect() or []):
+        if r["id"] == wid:
+            attach(r)
+            return
+
+
+def _read_key():
+    """One raw keypress on a tty; line fallback otherwise."""
+    if sys.stdin.isatty():
+        import termios
+        import tty
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            return sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return input()
+
+
+def help_screen():
+    """Mobile key reference. Bindings mirror ~/.config/herdr/config.toml."""
+    w = max(34, min(shutil.get_terminal_size(fallback=(48, 24)).columns, 48))
+    inner = w - 2
+
+    def fit(s, n):
+        return s if len(s) <= n else s[: max(1, n - 1)] + "\u2026"
+
+    rows = [
+        ("Alt+\u2190/\u2192", "prev / next tab"),
+        ("Alt+1..9", "jump directly to tab"),
+        ("Alt+\u2191/\u2193", "prev / next workspace"),
+        ("Alt+D", "detach to REMOTE AGENTS"),
+        ("Alt+Enter", "split pane horizontal"),
+        ("Alt+Shift+Enter", "split pane vertical"),
+        ("Alt+Esc", "close pane"),
+        ("Ctrl+Space, c", "new tab"),
+        ("Ctrl+Space, r", "rename tab"),
+        ("Ctrl+Space, k", "close tab"),
+        ("Ctrl+Space, ?", "native Herdr help"),
+    ]
+    kcol = 18
+    dbudget = inner - 4 - kcol
+    out = [f"{C_LIME}\u250c{line(inner)}\u2510{C_RESET}"]
+    t = " HERDR // MOBILE KEYS"
+    out.append(f"{C_LIME}\u2502{C_RESET}"
+               + f"{C_WHITE}{fit(t, inner)}{C_RESET}"
+               + " " * max(0, inner - len(t))
+               + f"{C_LIME}\u2502{C_RESET}")
+    out.append(f"{C_LIME}\u251c{line(inner)}\u2524{C_RESET}")
+    for key, desc in rows:
+        kfit = fit(key, kcol).ljust(kcol)
+        dfit = fit(desc, dbudget)
+        body = f" {C_LIME}{kfit}{C_RESET}{C_GRAY}{dfit}{C_RESET}"
+        padn = max(0, inner - 2 - len(kfit) - len(dfit))
+        out.append(f"{C_LIME}\u2502{C_RESET}" + body + " " * padn
+                   + f" {C_LIME}\u2502{C_RESET}")
+    out.append(f"{C_LIME}\u251c{line(inner)}\u2524{C_RESET}")
+    for note in ("Prefix = Ctrl+Space",
+                 "Detach keeps workspaces, panes,",
+                 "and agents running."):
+        nfit = fit(note, inner - 2)
+        out.append(f"{C_LIME}\u2502{C_RESET} {C_GRAY}{nfit}{C_RESET}"
+                   + " " * max(0, inner - 1 - len(nfit))
+                   + f"{C_LIME}\u2502{C_RESET}")
+    out.append(f"{C_LIME}\u2514{line(inner)}\u2518{C_RESET}")
+    print("\033[H\033[2J" + "\n".join(out), flush=True)
+    print(f"{C_GRAY}press any key to return...{C_RESET}", end="", flush=True)
+    _read_key()
+
+
+def info():
+    host = os.uname().nodename
+    rc, ip, _ = run(["tailscale", "ip", "-4"], 4)
+    ts = ip.strip().splitlines()[0] if rc == 0 and ip.strip() else "down"
+    _, up, _ = run(["uptime", "-p"], 3)
+    load = open("/proc/loadavg").read().split()[:3]
+    mem = {}
+    for ln in open("/proc/meminfo"):
+        k, v = ln.split(":")
+        mem[k] = int(v.split()[0]) // 1024
+    disk = run(["df", "-h", "/"], 3)[1].splitlines()[-1].split()
+    bat = ""
+    for b in ("/sys/class/power_supply/BAT0/capacity",
+              "/sys/class/power_supply/BAT1/capacity"):
+        try:
+            bat = open(b).read().strip() + "%"
+            break
+        except OSError:
+            pass
+    rows = collect() or []
+    nws = len(rows)
+    counts = {}
+    for r in rows:
+        for a in r["agents"]:
+            counts[a.get("agent", "?")] = counts.get(a.get("agent", "?"), 0) + 1
+    agents = " ".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "none"
+    print(f"{C_LIME}{host}{C_RESET}  {C_GRAY}tailscale{C_RESET} {C_TEAL}{ts}{C_RESET}"
+          f"  {C_GRAY}battery {bat or 'n/a'}{C_RESET}")
+    print(f"{C_GRAY}up {up.strip()}{C_RESET}")
+    print(f"{C_GRAY}load {load[0]} {load[1]} {load[2]}   "
+          f"mem {mem['MemAvailable']}/{mem['MemTotal']}M free   "
+          f"disk {disk[2]} used{C_RESET}")
+    print(f"{C_GRAY}herdr {nws} workspaces   agents {agents}{C_RESET}")
+    env_ok = os.path.isfile(os.path.expanduser("~/.config/remote-agents/notify.env"))
+    push = f"{C_TEAL}ACTIVE{C_RESET}" if env_ok else f"{C_GRAY}NOT CONFIGURED{C_RESET}"
+    rc_n, _, _ = run(["systemctl", "--user", "is-active", "herdr-notify"], 3)
+    watch = f"{C_TEAL}RUNNING{C_RESET}" if rc_n == 0 else f"{C_GRAY}STOPPED{C_RESET}"
+    print(f"{C_GRAY}Push       {push}{C_RESET}   {C_GRAY}Watcher    {watch}{C_RESET}")
+    input(f"{C_GRAY}Enter to continue...{C_RESET}")
+
+
+def main():
+    if "--detect" in sys.argv:
+        for cand, ok, detail in HERDR_VERDICTS:
+            tag = "SELECTED" if cand == HERDR else ("REJECT" if not ok else "skip  ")
+            print(f"[{tag}] {cand}\n        {detail}")
+        print("chosen:", HERDR or "NONE")
+        return 0
+    if not HERDR:
+        print(f"{C_RED}no compatible herdr client found{C_RESET}")
+        for cand, ok, detail in HERDR_VERDICTS:
+            print(f"  [{'ok' if ok else 'REJECT'}] {cand}: {detail}")
+        return 1
+    rows = collect()
+    if rows is None:
+        print(f"{C_RED}cannot reach the Herdr server.{C_RESET} "
+              f"{C_GRAY}Is it running? Try: herdr status{C_RESET}")
+        return 1
+    note = ""
+    while True:
+        render(rows, note)
+        note = ""
+        try:
+            raw = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if raw == "":
+            continue
+        if raw.isdigit() and 1 <= int(raw) <= len(rows):
+            attach(rows[int(raw) - 1])
+        elif raw in ("q", "Q"):
+            return 0
+        elif raw in ("r", "R"):
+            pass
+        elif raw in ("n", "N"):
+            new_workspace()
+        elif raw in ("p", "P"):
+            project_launcher()
+        elif raw in ("s", "S"):
+            quick_shell()
+        elif raw in ("i", "I"):
+            info()
+        elif raw == "?":
+            help_screen()
+        elif raw in ("t", "T"):
+            nb = NOTIFY_BIN if os.path.isfile(NOTIFY_BIN) else \
+                os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                             "herdr-notify")
+            if os.path.isfile(nb):
+                rc_t, out_t, _ = run([sys.executable, nb, "--test"], 15)
+                lines_t = out_t.strip().splitlines()
+                note = lines_t[-1] if lines_t else (
+                    "test push sent - check the phone" if rc_t == 0 else "test failed")
+            else:
+                note = "herdr-notify not installed"
+        elif raw in ("l", "L"):
+            last = load_last(rows)
+            if last:
+                attach(last)
+            else:
+                note = "no remembered workspace yet"
+        else:
+            note = f"unknown: {raw}"
+        rows = collect() or rows
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,11 @@
+[Unit]
+Description=Herdr agent state to ntfy push watcher (user-level)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 %h/.local/bin/herdr-notify
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

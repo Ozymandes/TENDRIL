@@ -1,0 +1,11 @@
+# python
+__pycache__/
+*.pyc
+
+# local machine configuration (never ship)
+notify.env
+*.env
+!.env.example
+
+# runtime
+*.log

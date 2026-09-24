@@ -1,0 +1,28 @@
+# remote-agents host configuration (optional).
+# Location: ~/.config/remote-agents/config
+# Format: KEY=VALUE lines, '#' comments. Every key has a working default.
+
+# Explicit Herdr client binary. Leave empty for automatic detection
+# (PATH -> mise -> versioned installs; protocol compatibility is verified
+# against the running server before a client is selected).
+HERDR_BIN=
+
+# Label shown in the console title (defaults to the machine hostname).
+TAILSCALE_HOST=
+
+# SSH alias the phone uses for this host (informational; printed by the
+# installer's personalized Android setup block).
+SSH_ALIAS=
+
+# Colon-separated directories offered by the N/P flows (defaults:
+# ~/Projects:~/src:~/dev:~/code plus ~). Expand with ~.
+PROJECT_ROOTS=
+
+# Where the console binary lives (default: ~/.local/bin/remote-agents).
+REMOTE_AGENTS_BIN=
+
+# Notifier helper (default: herdr-notify next to remote-agents, or
+# ~/.local/bin/herdr-notify).
+NOTIFY_BIN=
+
+# Push transport for herdr-notify lives in notify.env (see notify.env.example).
