@@ -4,15 +4,9 @@
 
 *A thin mobile control plane for persistent AI agents.*
 
-![Python 3.x](https://img.shields.io/badge/python-3.x-3776AB?logo=python&logoColor=white)
-![Linux supported](https://img.shields.io/badge/linux-supported-FCC624?logo=linux&logoColor=black)
-![Android / Termux](https://img.shields.io/badge/android-Termux-3DDC84?logo=android&logoColor=white)
-![Tailscale required](https://img.shields.io/badge/tailscale-required-4B70CC?logo=tailscale&logoColor=white)
+`Python 3.x` · `Linux` · `Android / Termux` · `Tailscale`
 
-![Herdr 0.9+](https://img.shields.io/badge/herdr-0.9%2B-8A5CF6)
-![ntfy push](https://img.shields.io/badge/ntfy-push-3E8B77)
-![release v0.1.0](https://img.shields.io/badge/release-v0.1.0-CBFD75)
-![MIT](https://img.shields.io/badge/license-MIT-green)
+`Herdr 0.9+` · `ntfy` · `v0.1.0` · `MIT`
 
 </div>
 
