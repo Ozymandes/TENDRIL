@@ -23,7 +23,7 @@ Android Termux                            Linux + systemd (user)
   Emergent-Abyss palette: lime frame, teal working dot, lime blocked/done,
   gray idle.
 - Attach = `herdr workspace focus <id>` + `herdr session attach`; when the
-  client exits (detach `Alt+D`, lost connection, closed terminal) the menu
+  client exits (detach `Ctrl+]` / `Alt+D`, lost connection, closed terminal) the menu
   redraws. Panes survive everything short of `herdr server stop`.
 - New workspace (`N`) / project launcher (`P`) / quick shell (`S`) create
   workspaces via the socket API, start agents with `herdr agent start`

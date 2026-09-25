@@ -2,6 +2,16 @@
 
 All notable changes to TENDRIL are documented here.
 
+## v0.1.1 — reliable Android/Termux detach
+
+- reliable Android/Termux Herdr detach via `Ctrl+]` — a single control byte
+  that cannot suffer ESC-sequence splitting across remote transports
+  (`Alt+D` kept as the desktop-friendly alternative, `prefix+d` universal)
+- installer merges/preserves the full detach set, never duplicates entries,
+  leaves every unrelated binding untouched, and only claims `ctrl+]` when
+  no other action already uses it
+- mobile help, attach hints, and docs updated to match verified behavior
+
 ## v0.1.0 — initial release
 
 - **remote-agents**: live Herdr workspace console for narrow terminals —

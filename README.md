@@ -11,7 +11,7 @@
 
 ![Herdr 0.9+](https://img.shields.io/badge/Herdr-0.9%2B-8A5CF6?style=for-the-badge)
 ![ntfy](https://img.shields.io/badge/ntfy-1B7F8C?style=for-the-badge&logo=ntfy&logoColor=white)
-![Release v0.1.0](https://img.shields.io/badge/Release-v0.1.0-CBFD75?style=for-the-badge&logo=github&logoColor=white)
+![Release v0.1.1](https://img.shields.io/badge/Release-v0.1.1-CBFD75?style=for-the-badge&logo=github&logoColor=white)
 ![MIT](https://img.shields.io/badge/MIT-1F1F1F?style=for-the-badge)
 
 </div>
@@ -89,7 +89,7 @@ and `herdr-notify` into `~/.local/bin`, and optionally:
 - configures ntfy push (generates a private topic, writes `notify.env`,
   chmod 600),
 - enables `herdr-notify.service` as a **user** systemd unit,
-- adds `Alt+D` as a second detach binding to Herdr — showing the exact
+- ensures the detach set `prefix+d`, `alt+d`, `ctrl+]` in Herdr — showing the exact
   proposed change, creating a timestamped backup, validating with
   `herdr config check`, and applying it with `reload-config` (never a
   server restart).
@@ -112,7 +112,7 @@ Ed25519 key; private keys are never copied between devices.
 
 ```
 agent        → live workspace menu → number → work
-Alt+D        → back to the menu (agents keep running)
+Ctrl+]       → back to the menu (agents keep running)
 close Termux → agents keep running
 ntfy push    → "Task complete" / "Input required"
 agent        → everything is exactly where you left it
@@ -128,13 +128,14 @@ agent        → everything is exactly where you left it
 | `Alt+←` / `Alt+→` | previous / next tab |
 | `Alt+1..9` | jump directly to tab |
 | `Alt+↑` / `Alt+↓` | previous / next workspace |
-| `Alt+D` | detach back to TENDRIL |
+| `Ctrl+]` | detach back to TENDRIL (Termux-safe) |
+| `Alt+D` | detach (desktop alternative) |
 | `Alt+Enter` / `Alt+Shift+Enter` | split pane horizontal / vertical |
 | `Alt+Esc` | close pane |
 | `Ctrl+Space`, then `c` / `r` / `k` / `?` | new / rename / close tab, native help |
 
 Bindings are read from your Herdr config; the installer only ever *adds*
-`Alt+D`, never overwrites anything.
+`ctrl+]` and `alt+d`, never overwrites anything.
 
 ## Notifications
 

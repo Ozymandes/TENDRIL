@@ -61,7 +61,7 @@ host's `~/.config/remote-agents/notify.env`. Test from the console with `T`.
 ## Daily use
 
 ```
-agent        → workspace menu → number → work → Alt+D → menu → close Termux
+agent        → workspace menu → number → work → Ctrl+] → menu → close Termux
 agent ssh    → force SSH if Mosh UDP is blocked
 ```
 

@@ -196,52 +196,89 @@ else
 fi
 say ""
 
-# ---------------- 6. herdr mobile keybinding ----------------
-say "6) Herdr mobile keybinding (Alt+D as a second detach)"
+# ---------------- 6. herdr detach keybindings ----------------
+say "6) Herdr detach keybindings"
+say "     Ctrl+]     recommended Android/Termux detach (single byte, never split)"
+say "     Alt+D      desktop-friendly alternative"
+say "     Prefix+D   universal fallback (prefix is Ctrl+Space by default)"
 HERDR_CONF="$HOME/.config/herdr/config.toml"
+
+# plan|apply the merged detach set without disturbing any other binding
+herdr_detach() {
+    python3 - "$HERDR_CONF" "$1" <<'PYEOF'
+import re, sys
+path, mode = sys.argv[1], sys.argv[2]
+text = open(path).read()
+WANT = ["prefix+d", "alt+d", "ctrl+]"]
+m = re.search(r'^([ \t]*)detach[ \t]*=[ \t]*(.+?)[ \t]*$', text, re.M)
+existing = re.findall(r'"([^"]+)"', m.group(2)) if m else []
+# only claim ctrl+] if no OTHER action already uses it
+conflicts = []
+for line in text.splitlines():
+    s = line.strip()
+    if s.startswith("#") or "=" not in s:
+        continue
+    k, v = s.split("=", 1)
+    if k.strip() != "detach" and "ctrl+]" in v:
+        conflicts.append(k.strip())
+merged, added = list(existing), []
+for w in WANT:
+    if w == "ctrl+]" and conflicts:
+        continue
+    if w not in merged:
+        merged.append(w)
+        added.append(w)
+newline = "detach = [" + ", ".join('"%s"' % e for e in merged) + "]"
+if mode == "plan":
+    print("CONFLICT=" + ",".join(conflicts))
+    print("EXISTING=" + ",".join(existing))
+    print("ADDED=" + ",".join(added))
+    print("LINE=" + newline)
+else:
+    if m:
+        text = text[:m.start()] + m.group(1) + newline + text[m.end():]
+    elif re.search(r'^\[keys\]', text, re.M):
+        text = re.sub(r'^\[keys\][ \t]*$', lambda _: "[keys]\n" + newline,
+                      text, count=1, flags=re.M)
+    else:
+        text += "\n[keys]\n" + newline + "\n"
+    open(path, "w").write(text)
+PYEOF
+}
+
 if [ ! -f "$HERDR_CONF" ]; then
     say "  no $HERDR_CONF found - skipped"
-elif grep -qE '^detach\s*=.*alt\+d' "$HERDR_CONF"; then
-    say "  Alt+D detach already present - nothing to do"
 else
-    if grep -qE '^detach\s*=' "$HERDR_CONF"; then
-        CUR=$(grep -E '^detach\s*=' "$HERDR_CONF" | head -1 | sed 's/^[^=]*=\s*//')
-        NEW=$(printf '%s' "$CUR" | sed -E 's/^\[(.*)\]$/[\1, "alt+d"]/; t; s/.*/[&], "alt+d"/')
+    PLAN=$(herdr_detach plan)
+    CONFLICT=$(printf '%s\n' "$PLAN" | sed -n 's/^CONFLICT=//p')
+    ADDED=$(printf '%s\n' "$PLAN" | sed -n 's/^ADDED=//p')
+    LINE=$(printf '%s\n' "$PLAN" | sed -n 's/^LINE=//p')
+    [ -n "$CONFLICT" ] && say "  note: ctrl+] already bound to '$CONFLICT' - leaving it untouched"
+    if [ -z "$ADDED" ]; then
+        say "  detach bindings already complete - nothing to do"
     else
-        NEW='["prefix+d", "alt+d"]'
-        say "  note: no detach line found; a new one will be added to [keys]"
-    fi
-    say "  proposed change in $HERDR_CONF:"
-    say "      detach = $NEW"
-    if confirm "Apply this keybinding change?"; then
-        backup "$HERDR_CONF"
-        BAK=$(ls -t "$HERDR_CONF".bak.* 2>/dev/null | head -1)
-        if [ "$DRY_RUN" = "1" ]; then
-            say "  [dry-run] set detach = $NEW; then herdr config check + reload-config"
-        else
-            python3 - "$HERDR_CONF" "$NEW" <<'PYEOF'
-import re, sys
-path, new = sys.argv[1], sys.argv[2]
-text = open(path).read()
-if re.search(r"^detach\s*=", text, re.M):
-    text = re.sub(r"^detach\s*=.*$", f"detach = {new}", text, count=1, flags=re.M)
-elif re.search(r"^\[keys\]", text, re.M):
-    text = re.sub(r"^(\[keys\]\s*)$", rf"\1detach = {new}\n", text, count=1, flags=re.M)
-else:
-    text += f"\n[keys]\ndetach = {new}\n"
-open(path, "w").write(text)
-PYEOF
-            if "$HERDR_BIN" config check >/dev/null 2>&1; then
-                "$HERDR_BIN" server reload-config >/dev/null 2>&1 \
-                    && say "  applied + reloaded live (no server restart)"
+        say "  proposed change in $HERDR_CONF (adds: $ADDED):"
+        say "      $LINE"
+        say "  every other binding in your config is left exactly as it is."
+        if confirm "Apply this keybinding change?"; then
+            backup "$HERDR_CONF"
+            BAK=$(ls -t "$HERDR_CONF".bak.* 2>/dev/null | head -1)
+            if [ "$DRY_RUN" = "1" ]; then
+                say "  [dry-run] write the line above; then herdr config check + reload-config"
             else
-                say "  config check FAILED - restoring backup"
-                cp -p "$BAK" "$HERDR_CONF"
-                "$HERDR_BIN" server reload-config >/dev/null 2>&1
+                herdr_detach apply
+                if "$HERDR_BIN" config check >/dev/null 2>&1; then
+                    "$HERDR_BIN" server reload-config >/dev/null 2>&1 \
+                        && say "  applied + reloaded live (no server restart)"
+                else
+                    say "  config check FAILED - restoring backup"
+                    cp -p "$BAK" "$HERDR_CONF"
+                    "$HERDR_BIN" server reload-config >/dev/null 2>&1
+                fi
             fi
+        else
+            say "  skipped - your bindings are unchanged"
         fi
-    else
-        say "  skipped - your bindings are unchanged"
     fi
 fi
 say ""

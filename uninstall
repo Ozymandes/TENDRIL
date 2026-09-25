@@ -45,7 +45,7 @@ fi
 echo ""
 if ls "$HOME"/.config/herdr/config.toml.bak.* >/dev/null 2>&1 \
    && [ -f "$HOME/.config/herdr/config.toml" ]; then
-    if confirm "Restore the newest Herdr config backup (removes the Alt+D detach)?"; then
+    if confirm "Restore the newest Herdr config backup (removes the added detach bindings)?"; then
         LATEST=$(ls -t "$HOME"/.config/herdr/config.toml.bak.* | head -1)
         cp -p "$LATEST" "$HOME/.config/herdr/config.toml"
         for H in "$HOME/.local/share/mise/installs/herdr/latest/herdr" "$(command -v herdr 2>/dev/null)"; do
