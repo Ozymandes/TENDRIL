@@ -268,12 +268,13 @@ def chip_parts(row, max_plain=40):
     for a in row["agents"]:
         st = a.get("agent_status", "unknown")
         kind = SHORT.get(a.get("agent", "?"), (a.get("agent") or "?")[:2].upper())
-        piece = ICON.get(st, "\u25cb") + kind + " "
+        sym = ICON.get(st, "\u25cb")
+        piece = sym + kind + " "
         if len(plain) + len(piece) + 3 > max_plain:
             break
         col = {"working": C_TEAL, "blocked": C_LIME, "done": C_LIME}.get(st, C_GRAY)
         plain += piece
-        colored += f"{col}{ICON.get(st, '\u25cb')}{kind}{C_RESET} "
+        colored += f"{col}{sym}{kind}{C_RESET} "
         shown += 1
     rest = len(row["agents"]) - shown
     if rest > 0:
