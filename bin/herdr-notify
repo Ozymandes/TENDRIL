@@ -236,6 +236,7 @@ def watch():
         log(f"push NOT CONFIGURED - transitions will only be logged. "
             f"Create {ENV_FILE} (see notify.env.example).")
     state = {}
+    gap = False  # first failed poll must not hit an unbound local
     while True:
         if poll(state, cfg, allow_push=True):
             gap = False
