@@ -17,10 +17,11 @@ ask() { printf '%s [%s] ' "$1" "$2"; read -r ans; [ -n "$ans" ] && printf '%s' "
 confirm() { printf '%s [y/N] ' "$1"; read -r ans; [ "$ans" = "y" ] || [ "$ans" = "Y" ]; }
 backup() { [ -f "$1" ] && cp -p "$1" "$1.bak.$(date +%s)"; }
 act() {
+    desc=$1; shift
     if [ "$DRY_RUN" = "1" ]; then
-        say "  [dry-run] $1"; say "            -> $*"; return 0
+        say "  [dry-run] $desc"; say "            -> $*"; return 0
     fi
-    say "  $1"; "$@"
+    say "  $desc"; "$@"
 }
 
 # ---------------- doctor (read-only) ----------------
