@@ -125,8 +125,11 @@ agent        → everything is exactly where you left it
 
 | Keys | Action |
 |---|---|
-| `Alt+←` / `Alt+→` | previous / next tab |
-| `Alt+1..9` | jump directly to tab |
+| `Alt+←` / `Alt+→` | previous / next tab (desktop; unreliable in Termux) |
+| `Ctrl+B`, then `N` / `P` | previous / next tab (prefix chords — Termux-safe) |
+| `Ctrl+B`, then `1..9` | jump directly to tab (Termux-safe) |
+| `Ctrl+1..9` | jump directly to tab, no prefix (needs `keys.indexed.tabs = "ctrl"` in the host Herdr config) |
+| `Alt+1..9` | jump directly to tab (desktop) |
 | `Alt+↑` / `Alt+↓` | previous / next workspace |
 | `Ctrl+]` | detach back to TENDRIL (Termux-safe) |
 | `Alt+D` | detach (desktop alternative) |
@@ -135,7 +138,10 @@ agent        → everything is exactly where you left it
 | `Ctrl+Space`, then `c` / `r` / `k` / `?` | new / rename / close tab, native help |
 
 Bindings are read from your Herdr config; the installer only ever *adds*
-`ctrl+]` and `alt+d`, never overwrites anything.
+`ctrl+]` and `alt+d`, never overwrites anything. In Termux, `Alt+` combos
+need the extra-keys ALT toggle and can be mangled by the on-screen keyboard
+or Mosh's client-side input handling — prefer the `Ctrl`-chord rows
+(Volume Down acts as Ctrl).
 
 ## Notifications
 
