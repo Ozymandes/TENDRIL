@@ -13,9 +13,9 @@ DRY_RUN=0
 say() { printf '%s\n' "$*"; }
 hr()  { say "------------------------------------------------------------"; }
 row() { printf '%-14s %s\n' "$1" "$2"; }
-ask() { printf '%s [%s] ' "$1" "$2"; read -r ans; [ -n "$ans" ] && printf '%s' "$ans" || printf '%s' "$2"; }
+ask() { printf '%s [%s] ' "$1" "$2" >&2; read -r ans; [ -n "$ans" ] && printf '%s' "$ans" || printf '%s' "$2"; }
 confirm() { printf '%s [y/N] ' "$1"; read -r ans; [ "$ans" = "y" ] || [ "$ans" = "Y" ]; }
-backup() { [ -f "$1" ] && cp -p "$1" "$1.bak.$(date +%s)"; }
+backup() { [ "$DRY_RUN" = "1" ] && return 0; [ -f "$1" ] && cp -p "$1" "$1.bak.$(date +%s)"; }
 act() {
     desc=$1; shift
     if [ "$DRY_RUN" = "1" ]; then
