@@ -6,6 +6,9 @@ After=network-online.target
 ExecStart=/usr/bin/python3 %h/.local/bin/herdr-notify
 Restart=on-failure
 RestartSec=5
+# The poll loop pings every cycle (POLL_SECONDS=8); a hung process stops
+# pinging and systemd SIGABRTs + restarts it within this window.
+WatchdogSec=60
 
 [Install]
 WantedBy=default.target

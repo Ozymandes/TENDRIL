@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -133,6 +134,24 @@ def log(msg):
     print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, flush=True)
 
 
+def sd_notify(state):
+    """Best-effort systemd watchdog ping (no-op outside a NotifyAccess unit)."""
+    addr = os.environ.get("NOTIFY_SOCKET")
+    if not addr:
+        return
+    if addr.startswith("@"):
+        addr = "\0" + addr[1:]
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        try:
+            s.connect(addr)
+            s.send(state.encode("utf-8"))
+        finally:
+            s.close()
+    except OSError:
+        pass  # watchdog loss must never take the watcher down
+
+
 def load_env():
     cfg = {}
     try:
@@ -238,6 +257,7 @@ def watch():
     state = {}
     gap = False  # first failed poll must not hit an unbound local
     while True:
+        sd_notify("WATCHDOG=1")  # feed systemd watchdog every cycle
         if poll(state, cfg, allow_push=True):
             gap = False
         else:
