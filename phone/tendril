@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/sh
 # tendril — TENDRIL phone launcher: connect to the host (Mosh preferred, SSH fallback).
-# `agent` is kept as a compatibility alias (phone/agent, or a symlink to this file).
+# The phone/agent compatibility wrapper delegates to this launcher.
 #
 # One-time setup (see docs/ANDROID.md):
 #   1. pkg install openssh mosh

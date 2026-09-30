@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/sh
 # agent — compatibility alias for `tendril` (the TENDRIL phone launcher).
-# A symlink does the same: ln -sf tendril ~/bin/agent
+# Install this wrapper as ~/bin/agent alongside ~/bin/tendril.
 here=$(dirname -- "$0")
 [ -f "$here/tendril" ] && exec sh "$here/tendril" "$@"
 exec tendril "$@"

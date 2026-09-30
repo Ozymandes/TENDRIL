@@ -1,18 +1,14 @@
 <div align="center">
 
-# T E N D R I L
+# TENDRIL
 
 *A thin mobile control plane for persistent AI agents.*
 
-![Python 3.x](https://img.shields.io/badge/Python-3.x-3776AB?style=for-the-badge&logo=python&logoColor=white)
-![Linux](https://img.shields.io/badge/Linux-FCC624?style=for-the-badge&logo=linux&logoColor=black)
-![Android / Termux](https://img.shields.io/badge/Android%20%2F%20Termux-197A46?style=for-the-badge&logo=android&logoColor=white)
-![Tailscale](https://img.shields.io/badge/Tailscale-1F1F1F?style=for-the-badge&logo=tailscale&logoColor=white)
+**THE EDGE IS YOURS**
 
-![Herdr 0.9+](https://img.shields.io/badge/Herdr-0.9%2B-8A5CF6?style=for-the-badge)
-![ntfy](https://img.shields.io/badge/ntfy-1B7F8C?style=for-the-badge&logo=ntfy&logoColor=white)
-![Release v0.1.1](https://img.shields.io/badge/Release-v0.1.1-CBFD75?style=for-the-badge&logo=github&logoColor=white)
-![MIT](https://img.shields.io/badge/MIT-1F1F1F?style=for-the-badge)
+![TENDRIL launch banner](assets/branding/TENDRIL_BANNER.png)
+
+[![Python](https://img.shields.io/badge/Python-stdlib-3776AB?style=for-the-badge&logo=python&logoColor=white)](#host-installation) [![Linux](https://img.shields.io/badge/Linux-host-1F2937?style=for-the-badge&logo=linux&logoColor=F0C94A)](#host-installation) [![Android](https://img.shields.io/badge/Android-Termux-197A46?style=for-the-badge&logo=android&logoColor=white)](docs/ANDROID.md) [![Herdr](https://img.shields.io/badge/Herdr-0.9%2B-8A5CF6?style=for-the-badge)](https://herdr.dev) [![Remote agents](https://img.shields.io/badge/remote-agents-1F1F1F?style=for-the-badge&logo=github&logoColor=white)](#daily-workflow) [![Mosh%20%2F%20SSH](https://img.shields.io/badge/Mosh%20%2F%20SSH-private_network-238DB5?style=for-the-badge)](#security) [![CLI%20%2F%20TUI](https://img.shields.io/badge/CLI%20%2F%20TUI-terminal-16A6A1?style=for-the-badge)](#daily-workflow) [![Version tag](https://img.shields.io/badge/version-v0.1.1-3974AD?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Ozymandes/TENDRIL/tree/v0.1.1) [![MIT](https://img.shields.io/badge/licence-MIT-D6A62E?style=for-the-badge&logo=opensourceinitiative&logoColor=white)](LICENSE)
 
 </div>
 
@@ -62,20 +58,20 @@ No tmux. No web dashboard. No paid service. Python stdlib only.
 Host (Linux, user-local, no sudo):
 
 ```sh
-git clone <repo-url> tendril && cd tendril
+git clone https://github.com/Ozymandes/TENDRIL.git && cd TENDRIL
 ./install --doctor     # read-only system check
 ./install              # interactive; backs up everything it touches
 ```
 
-Android ([full guide](docs/ANDROID.md)):
+Android ([full guide](docs/ANDROID.md)): install both canonical launchers from the host checkout; use `tendril` (`agent` remains only for backwards compatibility):
 
 ```sh
 pkg update && pkg install openssh mosh
 ssh-keygen -t ed25519                       # dedicated Termux key
-# create ~/.ssh/config (see docs/ANDROID.md), then:
+# configure ~/.ssh/config and install the key; see docs/ANDROID.md
 ssh-copy-id <alias>
-# install phone/tendril as ~/bin/tendril (exact command printed by ./install)
-tendril                                     # `agent` still works as an alias
+# copy phone/tendril and phone/agent from the host checkout; see docs/ANDROID.md
+tendril
 ```
 
 ## Host installation

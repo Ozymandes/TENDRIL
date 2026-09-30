@@ -36,16 +36,36 @@ After this works, disable password auth on the host (`PermitRootLogin no`,
 `PubkeyAuthentication yes`, `PasswordAuthentication no` in
 `/etc/ssh/sshd_config.d/*.conf`, then `sudo sshd -t` and restart sshd).
 
-## 5. Install the launcher
+## 5. Install both canonical launchers
 
-Copy `phone/tendril` from this repo to Termux (`agent`, the old name, stays
-as an alias):
+The repo provides two real launchers: `phone/tendril` is the official command;
+`phone/agent` is the legacy compatibility wrapper. Copy both from the Linux
+host checkout over SSH. Set `HOST` to the SSH config alias from step 3 and
+`REPO` to the checkout path on that host. The temporary `tendril -> agent`
+symlink is removed before installing the canonical files.
 
 ```sh
-mkdir -p ~/bin
-cp /path/to/tendril/phone/tendril ~/bin/tendril
-chmod +x ~/bin/tendril && ln -sf tendril ~/bin/agent
-echo 'export PATH=$HOME/bin:$PATH' >> ~/.bashrc && source ~/.bashrc
+set -e
+HOST=home
+REPO=/path/to/tendril
+mkdir -p "$HOME/bin" "$HOME/tendril-launchers"
+scp "$HOST:$REPO/phone/tendril" "$HOME/tendril-launchers/tendril"
+scp "$HOST:$REPO/phone/agent" "$HOME/tendril-launchers/agent"
+rm -f "$HOME/bin/tendril" "$HOME/bin/agent"
+mv "$HOME/tendril-launchers/tendril" "$HOME/bin/tendril"
+mv "$HOME/tendril-launchers/agent" "$HOME/bin/agent"
+chmod 700 "$HOME/bin/tendril" "$HOME/bin/agent"
+rmdir "$HOME/tendril-launchers"
+echo 'export PATH=$HOME/bin:$PATH' >> ~/.bashrc
+source ~/.bashrc
+```
+
+Verify both resolve to the installed repo launchers:
+
+```sh
+command -v tendril
+command -v agent
+ls -l ~/bin/tendril ~/bin/agent
 ```
 
 Set your alias once (or pass it every time: `tendril <alias>`;
