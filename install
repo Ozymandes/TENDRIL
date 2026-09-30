@@ -149,6 +149,12 @@ for f in remote-agents herdr-notify; do
     [ -f "$BIN_DIR/$f" ] && backup "$BIN_DIR/$f"
     act "install $BIN_DIR/$f" install -m 755 "$PKG_DIR/bin/$f" "$BIN_DIR/$f"
 done
+# `tendril` is the official command: same program, one executable
+if [ -e "$BIN_DIR/tendril" ] && [ ! -L "$BIN_DIR/tendril" ]; then
+    say "  kept existing $BIN_DIR/tendril (not ours) - run remote-agents instead"
+else
+    act "link $BIN_DIR/tendril -> remote-agents" ln -sfn remote-agents "$BIN_DIR/tendril"
+fi
 say ""
 
 # ---------------- 4. notifications (optional) ----------------
@@ -303,15 +309,16 @@ say "  EOF"
 say ""
 say "  ssh-copy-id $ALIAS && ssh $ALIAS    # must log in without a password"
 say "  mkdir -p ~/bin"
-say "  scp $ALIAS:$PKG_DIR/phone/agent ~/bin/agent"
-say "  chmod +x ~/bin/agent && echo 'export PATH=\$HOME/bin:\$PATH' >> ~/.bashrc"
-say "  echo 'AGENT_ALIAS=$ALIAS' >> ~/.bashrc && source ~/.bashrc"
+say "  scp $ALIAS:$PKG_DIR/phone/tendril ~/bin/tendril"
+say "  chmod +x ~/bin/tendril && ln -sf tendril ~/bin/agent   # agent = old name, still works"
+say "  echo 'export PATH=\$HOME/bin:\$PATH' >> ~/.bashrc"
+say "  echo 'TENDRIL_ALIAS=$ALIAS' >> ~/.bashrc && source ~/.bashrc"
 say ""
-say "  agent                # TENDRIL console"
+say "  tendril              # TENDRIL console"
 say ""
 say "  (the phone generates its own key; private keys are never copied)"
 say ""
 hr
-say "Done. Host console:  $BIN_DIR/remote-agents   |   doctor:  $0 --doctor"
-say "Daily use from the phone:  agent"
+say "Done. Host console:  tendril (= $BIN_DIR/remote-agents)   |   doctor:  $0 --doctor"
+say "Daily use from the phone:  tendril"
 hr

@@ -39,6 +39,8 @@ COVERAGE = os.path.join(HERE, "master_coverage.txt")
 DEFAULT_MASTER = os.path.expanduser("~/Downloads/TENDRIL_LOGO.ans")
 
 LIME = (203, 253, 117)          # the CLI's own C_LIME
+GRAY = (112, 128, 136)          # the CLI's own C_GRAY (slogan: quiet second tier)
+SLOGAN = "THE EDGE IS YOURS"
 LEVELS = 15                     # coverage quantization in master_coverage.txt
 
 # quadrant bits: TL=1 TR=2 BL=4 BR=8
@@ -539,12 +541,39 @@ def to_lines(canvas):
     return [ln[lead:].rstrip() for ln in lines]
 
 
-def to_ans(lines):
+def tracked(text, word_gap):
+    """Letter-spaced caps: one space between letters, `word_gap` between words."""
+    return (" " * word_gap).join(" ".join(w) for w in text.split())
+
+
+def place_slogan(lines):
+    """(row, col, text): the slogan centred under the wordmark (not the whole
+    mark), one empty row below it (rows are added if the art is too short),
+    with the widest letter-spacing that fits the wordmark's width."""
+    width = max(map(len, lines))
+    grid = [ln.ljust(width) for ln in lines]
+    ink = [any(r[c] != " " for r in grid) for c in range(width)]
+    icon_end = next(c for c in range(ink.index(True), width) if not ink[c])
+    w0 = next(c for c in range(icon_end, width) if ink[c])
+    span = width - w0
+    word_rows = [y for y, r in enumerate(grid) if r[w0:].strip()]
+    text = next(t for t in (tracked(SLOGAN, 3), tracked(SLOGAN, 2), SLOGAN) if len(t) <= span)
+    row = word_rows[-1] + 2
+    assert all(not grid[y][w0:].strip() for y in range(word_rows[-1] + 1, min(row + 1, len(grid))))
+    return row, w0 + (span - len(text)) // 2, text
+
+
+def to_ans(lines, slogan=None):
     """Ink-only truecolor: fg SGR around each glyph run, reset closes every
-    run, background never touched (transparent)."""
+    run, background never touched (transparent). Slogan in the muted gray."""
     on = "\x1b[38;2;%d;%d;%dm" % LIME
-    return "".join(re.sub(r"(\S+)", lambda m: on + m.group(1) + "\x1b[0m", ln) + "\n"
-                   for ln in lines)
+    out = [re.sub(r"(\S+)", lambda m: on + m.group(1) + "\x1b[0m", ln) for ln in lines]
+    if slogan:
+        row, col, text = slogan
+        out += [""] * (row + 1 - len(out))
+        vis = len(lines[row]) if row < len(lines) else 0
+        out[row] += " " * (col - vis) + ("\x1b[38;2;%d;%d;%dm" % GRAY) + text + "\x1b[0m"
+    return "".join(ln + "\n" for ln in out)
 
 
 def icon_symmetric(canvas):
@@ -554,18 +583,26 @@ def icon_symmetric(canvas):
     return all(r[a:b] == r[a:b][::-1] for r in canvas)
 
 
-def verify(name, lines, data, budget, canvas):
+def verify(name, lines, data, budget, canvas, slogan):
     fails = []
     width, height = max(len(ln) for ln in lines), len(lines)
+    row, col, text = slogan
+    if row < len(lines) and len(lines[row]) >= col:
+        fails.append("slogan overlaps the art")
+    if col + len(text) > width or text.replace(" ", "") != SLOGAN.replace(" ", ""):
+        fails.append("slogan outside the mark / misspelt")
     if width > budget:
         fails.append(f"width {width} > {budget}")
     if set("".join(lines)) - set(GLYPH.values()):
         fails.append(f"unexpected glyphs {set(''.join(lines)) - set(GLYPH.values())}")
+    height = max(height, row + 1)
     seqs = re.findall(r"\x1b\[([0-9;]*)([@-~])", data)
     if {f for _, f in seqs} - {"m"}:
         fails.append("non-SGR escape (cursor motion?)")
     if any(p.startswith("48") or ";48;" in p for p, _ in seqs):
         fails.append("background colour escape")
+    if set("".join(re.sub(r"\x1b\[[0-9;]*m", "", data).split())) - set(GLYPH.values()) - set(SLOGAN):
+        fails.append("unexpected characters")
     if any(ln and not ln.endswith("\x1b[0m") for ln in data.split("\n")):
         fails.append("line without trailing reset")
     if not icon_symmetric(canvas):
@@ -583,27 +620,29 @@ def build_all(out_dir=HERE, quiet=False):
     for name, min_cols, budget, rows, word_q, aspect in TIERS:
         canvas, meta = compose(cov, budget, rows, word_q, aspect)
         lines = to_lines(canvas)
-        data = to_ans(lines)
+        slogan = place_slogan(lines)
+        data = to_ans(lines, slogan)
         with open(os.path.join(out_dir, f"tendril_{name}.ans"), "w") as f:
             f.write(data)
         if not quiet:
-            ok &= verify(f"tendril_{name}.ans", lines, data, budget, canvas)
+            ok &= verify(f"tendril_{name}.ans", lines, data, budget, canvas, slogan)
             print(f"         scale {meta['sx']:.4f} x {meta['sy']:.4f} px/quadrant "
                   f"(aspect {meta['aspect']:.2f}), spine dashes merged: "
                   f"{meta['dropped_spine_dashes']}")
-            for ln in lines:
+            for ln in re.sub(r"\x1b\[[0-9;]*m", "", data).rstrip("\n").split("\n"):
                 print("         |" + ln.ljust(max(map(len, lines))) + "|")
-        results.append((name, min_cols, lines))
+        results.append((name, min_cols, lines, slogan))
     return results, ok
 
 
 def embed_block(results):
     out = ["_MASTHEAD = (",
-           "    # (min columns, lines) - generated by assets/masthead/build_masthead.py --embed"]
-    for name, min_cols, lines in results:
+           "    # (min columns, lines, slogan (row, col, text))",
+           "    # generated by assets/masthead/build_masthead.py --embed"]
+    for name, min_cols, lines, slogan in results:
         out.append(f"    ({min_cols}, (  # {name}")
         out += [f'        "{ln}",' for ln in lines]
-        out.append("    )),")
+        out.append(f"    ), {slogan!r}),")
     out.append(")")
     return "\n".join(out)
 

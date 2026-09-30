@@ -21,6 +21,12 @@ if [ -f "$UNIT" ]; then
     say "removed: $UNIT (watcher disabled)"
 fi
 
+# the `tendril` command is only a symlink to remote-agents; never touch a foreign file
+if [ -L "$BIN_DIR/tendril" ] && [ "$(readlink "$BIN_DIR/tendril")" = "remote-agents" ]; then
+    rm -f "$BIN_DIR/tendril"
+    say "removed: $BIN_DIR/tendril"
+fi
+
 for f in remote-agents herdr-notify; do
     if [ -f "$BIN_DIR/$f" ]; then
         rm -f "$BIN_DIR/$f"

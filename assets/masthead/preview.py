@@ -176,6 +176,8 @@ def main():
     ap.add_argument("--masthead")
     a = ap.parse_args()
     mod = load_cli()
+    if a.masthead:                             # show the given asset instead
+        mod.masthead = lambda width, body: []
     frame = capture(mod, a.cols, a.rows)
     if a.masthead:
         mast = open(a.masthead).read().rstrip("\n").split("\n")

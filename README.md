@@ -32,7 +32,7 @@ ANDROID                              LINUX HOST
 
 Termux                               Herdr
   │                                    ├─ Pi
-  │ agent                              ├─ Claude
+  │ tendril                            ├─ Claude
   ▼                                    └─ Codex
 Tailscale                               │
   │                                     │
@@ -74,8 +74,8 @@ pkg update && pkg install openssh mosh
 ssh-keygen -t ed25519                       # dedicated Termux key
 # create ~/.ssh/config (see docs/ANDROID.md), then:
 ssh-copy-id <alias>
-# install phone/agent as ~/bin/agent (exact command printed by ./install)
-agent
+# install phone/tendril as ~/bin/tendril (exact command printed by ./install)
+tendril                                     # `agent` still works as an alias
 ```
 
 ## Host installation
@@ -111,11 +111,11 @@ Ed25519 key; private keys are never copied between devices.
 ## Daily workflow
 
 ```
-agent        → live workspace menu → number → work
+tendril      → live workspace menu → number → work
 Ctrl+]       → back to the menu (agents keep running)
 close Termux → agents keep running
 ntfy push    → "Task complete" / "Input required"
-agent        → everything is exactly where you left it
+tendril      → everything is exactly where you left it
 ```
 
 `N` new workspace · `P` project launcher · `S` quick shell ·
@@ -184,7 +184,7 @@ Watcher         RUNNING
 ```
 
 Read-only — doctor never fixes anything. Common issues: Tailscale app not
-connected (`agent` tells you), Mosh UDP blocked on the network (`agent ssh`
+connected (`tendril` tells you), Mosh UDP blocked on the network (`tendril ssh`
 falls back), "cannot reach Herdr server" (start Herdr on the host).
 
 ## Security

@@ -38,19 +38,21 @@ After this works, disable password auth on the host (`PermitRootLogin no`,
 
 ## 5. Install the launcher
 
-Copy `phone/agent` from this repo to Termux:
+Copy `phone/tendril` from this repo to Termux (`agent`, the old name, stays
+as an alias):
 
 ```sh
 mkdir -p ~/bin
-cp /path/to/remote-agents/phone/agent ~/bin/agent
-chmod +x ~/bin/agent
+cp /path/to/tendril/phone/tendril ~/bin/tendril
+chmod +x ~/bin/tendril && ln -sf tendril ~/bin/agent
 echo 'export PATH=$HOME/bin:$PATH' >> ~/.bashrc && source ~/.bashrc
 ```
 
-Set your alias once (or pass it every time: `agent <alias>`):
+Set your alias once (or pass it every time: `tendril <alias>`;
+an existing `AGENT_ALIAS` keeps working):
 
 ```sh
-echo 'AGENT_ALIAS=<alias>' >> ~/.bashrc
+echo 'TENDRIL_ALIAS=<alias>' >> ~/.bashrc
 ```
 
 ## 6. Notifications
@@ -61,8 +63,8 @@ host's `~/.config/remote-agents/notify.env`. Test from the console with `T`.
 ## Daily use
 
 ```
-agent        → workspace menu → number → work → Ctrl+] → menu → close Termux
-agent ssh    → force SSH if Mosh UDP is blocked
+tendril      → workspace menu → number → work → Ctrl+] → menu → close Termux
+tendril ssh  → force SSH if Mosh UDP is blocked
 ```
 
 ## Troubleshooting
@@ -70,7 +72,7 @@ agent ssh    → force SSH if Mosh UDP is blocked
 | Symptom | Fix |
 |---|---|
 | `key-auth check failed` | Tailscale app not connected, or key not installed yet — try `ssh <alias>` interactively |
-| mosh connects then dies instantly | host firewall may block UDP 60000-61000 on `tailscale0`; use `agent ssh` meanwhile |
+| mosh connects then dies instantly | host firewall may block UDP 60000-61000 on `tailscale0`; use `tendril ssh` meanwhile |
 | menu says "cannot reach Herdr server" | the host Herdr server is down — start it locally (`herdr`) |
 | `Alt+←`/`→` does nothing on the phone | Termux on-screen Alt is unreliable — use `Ctrl+B` then `N`/`P` (prefix chords), or tap the extra-keys `CTRL` then a digit (host needs `keys.indexed.tabs = "ctrl"` in `~/.config/herdr/config.toml`) |
 | garbled glyphs | `pkg install font-firas-mono` or any Nerd Font, and ensure UTF-8 locale |

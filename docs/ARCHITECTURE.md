@@ -3,7 +3,7 @@
 ```
 PHONE (thin control surface)              HOST (where the work lives)
 Android Termux                            Linux + systemd (user)
-  └─ agent (sh, ~40 lines)                ├─ Tailscale / OpenSSH / mosh-server
+  └─ tendril (sh, ~40 lines; alias agent) ├─ Tailscale / OpenSSH / mosh-server
       └─ Tailscale                        ├─ ~/.local/bin/remote-agents
           └─ Mosh / SSH ─────────────────>│    └─ herdr api snapshot (1 call)
                                           ├─ Herdr server (persistent panes)

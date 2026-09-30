@@ -9,8 +9,14 @@ font hinter snaps stems to pixels.
 | tier | size | used when the selector box is |
 |---|---|---|
 | `tendril_full.ans` | 50×8 | ≥ 50 columns (the 54-column phone) |
-| `tendril_compact.ans` | 42×6 | 44–49 columns |
-| plain `TENDRIL` caption | 7×1 | narrower |
+| `tendril_compact.ans` | 42×7 | 44–49 columns |
+| plain `TENDRIL` caption + slogan | 2 rows | narrower |
+
+Every tier carries the slogan **THE EDGE IS YOURS**, letter-spaced, in the
+selector's muted gray, centred under the wordmark one row below it (in the
+full tier it fits beside the icon's tail, so it adds no height). A tested
+single down-right offset layer was rejected: at quadrant resolution it
+cannot be applied without bridging strokes or leaving unrenderable cells.
 
 The masthead is skipped when colour is off (non-tty, `NO_COLOR`, `TERM=dumb`)
 and steps down a tier, or disappears, whenever it would push the selector or
@@ -23,7 +29,7 @@ prompt past the terminal height. The selector itself is never touched.
   (the 317 KB `.ans` is only needed to refresh this)
 - `tendril_full.ans`, `tendril_compact.ans` – generated assets (`cat` them)
 - `preview.py` – terminal-accurate PNG of the real selector screen
-  (needs Pillow)
+  (needs Pillow; `--masthead FILE` previews an asset in place of the built-in one)
 
 Runtime cost is zero: `bin/remote-agents` embeds the glyph lines as plain
 strings and only wraps them in colour when printing.

@@ -1,4 +1,5 @@
-"""Masthead tests: asset hygiene, deterministic build, selector integrity.
+"""Masthead + launcher tests: asset hygiene, deterministic build, selector
+integrity, slogan, and the tendril/agent phone launchers.
 
 Run from the repo root:  python3 -m unittest discover -s tests -v
 The PTY test needs a reachable Herdr server and is skipped otherwise.
@@ -27,6 +28,8 @@ import build_masthead  # noqa: E402
 CLEAR = "\033[H\033[2J"
 SGR = re.compile(r"\x1b\[([0-9;]*)([@-~])")
 QUADS = set(build_masthead.GLYPH.values())
+SLOGAN_CHARS = set(build_masthead.SLOGAN)
+GRAY = "\x1b[38;2;112;128;136m"
 
 
 def load(path, name):
@@ -90,13 +93,15 @@ class Assets(unittest.TestCase):
             for ln in data.rstrip("\n").split("\n"):
                 self.assertTrue(ln.endswith("\x1b[0m"), "every line resets")
                 self.assertLessEqual(visible(ln), budget)
-                self.assertLessEqual(set(SGR.sub("", ln)), QUADS)
+                self.assertLessEqual(set(SGR.sub("", ln)), QUADS | SLOGAN_CHARS)
+            plain = SGR.sub("", data).replace(" ", "")
+            self.assertEqual(plain.count("THEEDGEISYOURS"), 1, f"{name}: slogan once")
 
     def test_runtime_embeds_the_committed_assets(self):
         mod = load(CLI, "ra_embed")
         results, ok = build_masthead.build_all(tempfile.mkdtemp(), quiet=True)
         self.assertTrue(ok)
-        self.assertEqual([(m, tuple(l)) for _, m, l in results], [(m, a) for m, a in mod._MASTHEAD])
+        self.assertEqual([(m, tuple(l), sl) for _, m, l, sl in results], list(mod._MASTHEAD))
 
 
 class Selector(unittest.TestCase):
@@ -124,16 +129,43 @@ class Selector(unittest.TestCase):
 
     def test_tiers_and_blank_separator(self):
         box = lambda c: max(34, min(c, 56))                      # noqa: E731
-        for cols, arts in ((54, 8), (56, 8), (80, 8), (50, 8), (49, 6), (44, 6), (43, 1), (34, 1)):
+        for cols, arts in ((54, 8), (56, 8), (80, 8), (50, 8), (49, 7), (44, 7), (43, 2), (34, 2)):
             head = self.masthead_of(cols, 7)
             self.assertEqual(len(head), arts + 1, f"{cols} cols")
             self.assertEqual(head[-1], "", "one blank row before the box")
             for ln in head:
                 self.assertLessEqual(visible(ln), box(cols), f"{cols}: masthead wider than box")
                 self.assertTrue(ln == "" or ln.endswith("\x1b[0m"), "reset before selector")
-            if arts == 1:
+            if arts == 2:
                 self.assertEqual(SGR.sub("", head[0]).strip(), "TENDRIL")
                 self.assertEqual(visible(head[0]) - 7, (box(cols) - 7) // 2, "caption centred")
+
+    def test_slogan_sits_quietly_under_the_wordmark(self):
+        for cols in (54, 50, 48, 44, 40, 34):
+            head = self.masthead_of(cols, 7)
+            line = next(ln for ln in head if "E D G E" in ln or "EDGE" in ln)
+            self.assertIn(GRAY + "T H E", line, f"{cols}: slogan must be muted gray, tracked")
+            self.assertEqual(SGR.sub("", line).replace(" ", "")[-14:], "THEEDGEISYOURS")
+            self.assertLess(head.index(line), len(head) - 1, "blank row before the selector")
+        # full tier: centred under TENDRIL (not the whole mark), one row of air above
+        head = [SGR.sub("", ln) for ln in self.masthead_of(54, 7)]
+        s_line = next(ln for ln in head if "E D G E" in ln)
+        art = [ln.ljust(54) for ln in head if ln is not s_line]
+        ink = [any(r[c] != " " for r in art) for c in range(54)]
+        icon_end = ink.index(False, ink.index(True))                   # gap after the icon
+        w0 = ink.index(True, icon_end)                                 # wordmark span
+        w1 = max(c for c in range(54) if ink[c]) + 1
+        s0, s1 = s_line.index("T H E"), len(s_line.rstrip())           # the icon's spine tip shares the row
+        self.assertLessEqual(abs((s0 + s1) - (w0 + w1)), 2, "slogan centred under wordmark")
+        self.assertFalse(head[head.index(s_line) - 1][w0:].strip(), "air between mark and slogan")
+
+    def test_slogan_dropped_before_the_menu_suffers(self):
+        for lines in range(20, 40):
+            for n in (7, 10, 13):
+                out = frame(self.new, 40, lines, n)[len(CLEAR):]
+                body = frame(self.old, 40, lines, n)[len(CLEAR):]
+                if body.count("\n") + 1 <= lines:
+                    self.assertLessEqual(out.count("\n") + 1, lines)
 
     def test_nothing_wraps_at_phone_width(self):
         for n in (0, 3, 7, 10):
@@ -240,6 +272,62 @@ class Pty(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("\u2580", out)
         self.assertIn("REMOTE AGENTS", out)
+
+
+class Launcher(unittest.TestCase):
+    """phone/tendril is the launcher; `agent` (symlink or wrapper) must behave
+    identically. ssh/mosh are stubbed to record what would be run."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        t = self.tmp.name
+        self.log = os.path.join(t, "calls.log")
+        self.stubs = os.path.join(t, "stubs")
+        self.home_bin = os.path.join(t, "bin")                 # the phone's ~/bin
+        os.makedirs(self.stubs)
+        os.makedirs(self.home_bin)
+        for tool in ("ssh", "mosh"):
+            path = os.path.join(self.stubs, tool)
+            with open(path, "w") as f:
+                f.write(f'#!/bin/sh\necho "{tool} $*" >> "{self.log}"\nexit 0\n')
+            os.chmod(path, 0o755)
+        shutil.copy(os.path.join(REPO, "phone", "tendril"), os.path.join(self.home_bin, "tendril"))
+        os.symlink("tendril", os.path.join(self.home_bin, "agent-link"))
+        shutil.copy(os.path.join(REPO, "phone", "agent"), os.path.join(self.home_bin, "agent"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def launch(self, name, args=(), **env):
+        if os.path.exists(self.log):
+            os.unlink(self.log)
+        e = {"PATH": self.stubs + os.pathsep + os.environ["PATH"], "HOME": self.tmp.name}
+        e.update(env)
+        r = subprocess.run(["sh", os.path.join(self.home_bin, name), *args],
+                           capture_output=True, text=True, env=e, timeout=20)
+        calls = read(self.log, "r") if os.path.exists(self.log) else ""
+        return r.returncode, calls, r.stdout
+
+    def test_agent_alias_runs_exactly_what_tendril_runs(self):
+        for args, env in (((), {"TENDRIL_ALIAS": "omarchy"}), ((), {"AGENT_ALIAS": "omarchy"}),
+                          (("omarchy",), {}), (("ssh", "omarchy"), {"TENDRIL_ALIAS": "x"})):
+            ref = self.launch("tendril", args, **env)
+            self.assertEqual(ref[0], 0)
+            self.assertIn("omarchy", ref[1])
+            self.assertIn("remote-agents", ref[1])
+            for alias in ("agent-link", "agent"):
+                self.assertEqual(self.launch(alias, args, **env), ref, f"{alias} {args} {env}")
+
+    def test_tendril_alias_wins_over_legacy_agent_alias(self):
+        _, calls, _ = self.launch("tendril", TENDRIL_ALIAS="new", AGENT_ALIAS="old")
+        self.assertIn("mosh new", calls)
+        self.assertNotIn("old", calls)
+
+    def test_missing_alias_prints_usage(self):
+        code, calls, out = self.launch("agent")
+        self.assertEqual(code, 1)
+        self.assertIn("usage: tendril", out)
+        self.assertEqual(calls, "")
 
 
 if __name__ == "__main__":

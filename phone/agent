@@ -1,44 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/sh
-# agent — TENDRIL phone launcher: connect to the host (Mosh preferred, SSH fallback).
-#
-# One-time setup (see docs/ANDROID.md):
-#   1. pkg install openssh mosh
-#   2. ssh-keygen -t ed25519   (dedicated Termux key; never share private keys)
-#   3. create ~/.ssh/config with your Host alias
-#   4. ssh-copy-id <alias>
-#   5. either pass the alias every time:  agent <alias>
-#      or set it once here / in your profile:  AGENT_ALIAS=<alias>
-#
-# Usage:
-#   agent            connect using $AGENT_ALIAS
-#   agent <alias>    connect using <alias>
-#   agent ssh <alias>  force plain SSH (skip Mosh)
-
-ALIAS="${1:-${AGENT_ALIAS:-}}"
-FORCE_SSH=""
-if [ "$1" = "ssh" ]; then
-    ALIAS="${2:-${AGENT_ALIAS:-}}"
-    FORCE_SSH=1
-fi
-REMOTE_BIN="${REMOTE_AGENTS_BIN:-remote-agents}"   # resolved on the HOST (login shell)
-
-if [ -z "$ALIAS" ]; then
-    echo "usage: agent <ssh-alias>"
-    echo "first time: see docs/ANDROID.md — create a key, then: ssh-copy-id <alias>"
-    exit 1
-fi
-
-if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$ALIAS" true 2>/dev/null; then
-    echo "[agent] key-auth check failed for '$ALIAS'."
-    echo "  - is Tailscale connected on this phone?"
-    echo "  - first time? run: ssh $ALIAS   (accept host key, password once)"
-    echo "  - then: ssh-copy-id $ALIAS"
-    echo "[agent] attempting interactive SSH anyway..."
-    exec ssh -t "$ALIAS" "$REMOTE_BIN"
-fi
-
-if [ -z "$FORCE_SSH" ] && command -v mosh >/dev/null 2>&1; then
-    mosh "$ALIAS" -- sh -lc "exec $REMOTE_BIN" && exit 0
-    echo "[agent] mosh failed - falling back to ssh"
-fi
-exec ssh -t "$ALIAS" "$REMOTE_BIN"
+# agent — compatibility alias for `tendril` (the TENDRIL phone launcher).
+# A symlink does the same: ln -sf tendril ~/bin/agent
+here=$(dirname -- "$0")
+[ -f "$here/tendril" ] && exec sh "$here/tendril" "$@"
+exec tendril "$@"
