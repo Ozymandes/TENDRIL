@@ -346,20 +346,61 @@ def render(rows, note=""):
     def pad(plain, colored):
         return colored + " " * max(0, inner - len(plain))
 
+    def foot_lines(items):
+        cur, grouped = "", []
+        for it in items:
+            cand = (cur + "   " + it) if cur else it
+            if len(cand) > inner - 2 and cur:
+                grouped.append(cur)
+                cur = it
+            else:
+                cur = cand
+        if cur:
+            grouped.append(cur)
+        return grouped
+    feet = foot_lines(["N New", "P Project", "S Shell", "I Info", "? Help"]) \
+        + foot_lines(["L Last", "T TestPush", "R Refresh", "Q Quit"])
+
+    compact = len(rows) > 6
+    # Phone geometry (31 rows keyboard-closed, ~22 open): the menu always wins,
+    # so decide before building whether the per-row path lines must yield. They
+    # do when dropping them buys the compact mark a slot; if even the dense
+    # layout can't fit the mark, keep the paths (the caption tier in masthead()
+    # degrades on its own from there).
+    term_rows = shutil.get_terminal_size(fallback=(52, 24)).lines
+    est = 4 + len(feet) + 2
+    with_paths = est + sum(1 + (1 if r["path"] else 0) + (0 if compact else 1)
+                           for r in rows)
+    without = est + sum(1 + (0 if compact else 1) for r in rows)
+    if note:
+        with_paths += 1
+        without += 1
+    mark = 7 + 1                                # compact tier + blank separator
+    show_paths = mark + with_paths + 1 <= term_rows \
+        or mark + without + 1 > term_rows
+
     lines = []
     edge = f"{C_LIME}\u250c{line(inner)}\u2510{C_RESET}"
     sep = f"{C_LIME}\u251c{line(inner)}\u2524{C_RESET}"
     bot = f"{C_LIME}\u2514{line(inner)}\u2518{C_RESET}"
     lines.append(edge)
-    t = f" {HOST_LABEL} // REMOTE AGENTS"
+    suffix = " // REMOTE AGENTS"
+    if len(HOST_LABEL) + len(suffix) + 1 <= inner:
+        t = f" {HOST_LABEL}{suffix}"
+    else:                                       # prompt-polluted label: clamp
+        t = " " + fit(HOST_LABEL, inner - len(suffix) - 1) + suffix
     lines.append(f"{C_LIME}\u2502{C_RESET}" + pad(t, f"{C_WHITE}{t}{C_RESET}") + f"{C_LIME}\u2502{C_RESET}")
     status, ip = tailscale_parts()
-    tl_plain = f" tailnet: {status} {ip}".rstrip()
+    tl_full = f" tailnet: {status} {ip}".rstrip()
+    tl_plain = fit(tl_full, inner)
     scol = C_TEAL if status == "ACTIVE" else C_RED
-    tl_col = f" {C_GRAY}tailnet:{C_RESET} {scol}{status}{C_RESET}" + (f" {C_GRAY}{ip}{C_RESET}" if ip else "")
+    if len(tl_full) <= inner:
+        tl_col = f" {C_GRAY}tailnet:{C_RESET} {scol}{status}{C_RESET}" \
+            + (f" {C_GRAY}{ip}{C_RESET}" if ip else "")
+    else:
+        tl_col = C_GRAY + tl_plain + C_RESET
     lines.append(f"{C_LIME}\u2502{C_RESET}" + pad(tl_plain, tl_col) + f"{C_LIME}\u2502{C_RESET}")
     lines.append(sep)
-    compact = len(rows) > 6
     for i, r in enumerate(rows):
         budget = inner - 6
         lbl_plain = fit(r["label"] + (" *" if r["focused"] else ""), budget - 9)
@@ -373,27 +414,14 @@ def render(rows, note=""):
         lines.append(f"{C_LIME}\u2502{C_RESET} "
                      + head_col + " " * gap + chip_col
                      + f" {C_LIME}\u2502{C_RESET}")
-        if r["path"]:
+        if r["path"] and show_paths:
             p_plain = "    " + fit(short_path(r["path"]), inner - 6)
             p_col = f" {C_GRAY}{p_plain[1:]}{C_RESET}"
             lines.append(f"{C_LIME}\u2502{C_RESET}" + pad(p_plain, f" {C_GRAY}{p_plain[1:]}{C_RESET}") + f"{C_LIME}\u2502{C_RESET}")
         if not compact:
             lines.append(f"{C_LIME}\u2502{C_RESET}{' ' * inner}{C_LIME}\u2502{C_RESET}")
     lines.append(sep)
-    def foot_lines(items):
-        cur, grouped = "", []
-        for it in items:
-            cand = (cur + "   " + it) if cur else it
-            if len(cand) > inner - 2 and cur:
-                grouped.append(cur)
-                cur = it
-            else:
-                cur = cand
-        if cur:
-            grouped.append(cur)
-        return grouped
-    for ln_ in foot_lines(["N New", "P Project", "S Shell", "I Info", "? Help"]) \
-            + foot_lines(["L Last", "T TestPush", "R Refresh", "Q Quit"]):
+    for ln_ in feet:
         lines.append(f"{C_LIME}\u2502{C_RESET}"
                      + pad(" " + ln_, f" {C_WHITE}{ln_}{C_RESET}")
                      + f"{C_LIME}\u2502{C_RESET}")

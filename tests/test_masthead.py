@@ -181,6 +181,39 @@ class Selector(unittest.TestCase):
                 if body.count("\n") + 1 <= lines:                # + input prompt line
                     self.assertLessEqual(out.count("\n") + 1, lines, f"{lines} rows, {n} ws")
 
+    def test_phone_height_yields_paths_and_keeps_the_mark(self):
+        """Phone, keyboard closed (48x31, 11 workspaces): the menu alone is 30
+        lines, so path lines yield and the compact mark still renders. With
+        the keyboard open (22 rows) only the paths yield; the menu wins."""
+        for n in (8, 11, 13):
+            out = frame(self.new, 48, 31, n)[len(CLEAR):]
+            self.assertIn("\u2580", out, f"{n} ws: compact mark missing at 48x31")
+            self.assertNotIn("project-0", out, f"{n} ws: paths should yield at 48x31")
+            self.assertLessEqual(out.count("\n") + 1, 31, f"{n} ws: overflows 48x31")
+            open_out = frame(self.new, 48, 22, n)[len(CLEAR):]
+            old_out = frame(self.old, 48, 22, n)[len(CLEAR):]
+            self.assertLessEqual(open_out.count("\n") + 1, old_out.count("\n") + 1,
+                                 f"{n} ws: never taller than before at 48x22")
+
+    def test_path_yield_never_fires_when_there_is_room(self):
+        """Generous height: body below the masthead is unchanged."""
+        for n in (0, 3, 7, 10, 13):
+            new = frame(self.new, 48, 50, n)
+            old = frame(self.old, 48, 50, n)
+            self.assertTrue(new.endswith(old[len(CLEAR):]), f"{n} ws")
+
+    def test_long_host_label_never_breaks_the_box(self):
+        """A prompt-captured TAILSCALE_HOST (old installer bug) must not
+        overflow the title row: the label clamps, the suffix survives."""
+        self.new.HOST_LABEL = "Tailscale hostname of this machine [horus] horus"
+        try:
+            out = frame(self.new, 48, 31, 3)[len(CLEAR):]
+            for ln in out.split("\n"):
+                self.assertLessEqual(visible(ln), 48)
+            self.assertIn("REMOTE AGENTS", out)
+        finally:
+            self.new.HOST_LABEL = load(CLI, "ra_label_reset").HOST_LABEL
+
     def test_color_off_prints_no_masthead(self):
         for mod in (self.new, self.old):
             mod.COLOR = False
@@ -207,10 +240,17 @@ class AgainstOriginMain(unittest.TestCase):
             t.write(origin_main_cli())
         try:
             old, new = load(t.name, "ra_origin_main"), load(CLI, "ra_branch")
+            # 36 rows keeps every tier the old binary had. n=10 at 36 rows is
+            # intentionally excluded: the path-yield for the compact mark buys
+            # a tier there, which changes the body by design. It is pinned at
+            # 50 rows below, where paths stay.
             for cols in (34, 44, 50, 54, 56, 80):
-                for n in (0, 3, 7, 10):
+                for n in (0, 3, 7):
                     o, w = frame(old, cols, 36, n), frame(new, cols, 36, n)
                     self.assertTrue(w.endswith(o[len(CLEAR):]), f"{cols} cols, {n} ws")
+                for n in (10, 13):
+                    o, w = frame(old, cols, 50, n), frame(new, cols, 50, n)
+                    self.assertTrue(w.endswith(o[len(CLEAR):]), f"{cols} cols, {n} ws @50")
         finally:
             os.unlink(t.name)
 

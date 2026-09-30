@@ -2,6 +2,23 @@
 
 All notable changes to TENDRIL are documented here.
 
+## v0.1.2 — the mark survives phone geometry
+
+- the selector now yields per-row path lines when the terminal is too short
+  to fit the masthead mark above the menu (phone, keyboard closed): the
+  compact TENDRIL mark renders at 48x31 instead of silently degrading to a
+  bare menu; with the keyboard open the menu still wins, never taller than
+  before
+- the title row clamps a polluted `TAILSCALE_HOST` (captured prompt text
+  from pre-0.1.1 installers) to the box width while keeping the
+  `// REMOTE AGENTS` suffix readable
+- configs written by pre-0.1.1 installers hold captured prompt text in
+  `TAILSCALE_HOST`/`SSH_ALIAS`/`PROJECT_ROOTS` — re-run `install` (or edit
+  `~/.config/remote-agents/config` by hand) to replace them with bare values
+- tests: phone-geometry mark regression, no-room path preservation,
+  polluted-label clamp, origin-main pin updated for the intentional
+  body change at tight heights
+
 ## v0.1.1 — reliable Android/Termux detach
 
 - reliable Android/Termux Herdr detach via `Ctrl+]` — a single control byte
