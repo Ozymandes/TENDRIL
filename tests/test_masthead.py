@@ -37,10 +37,10 @@ def load(path, name):
     spec = importlib.util.spec_from_loader(name, loader)
     mod = importlib.util.module_from_spec(spec)
     loader.exec_module(mod)
-    mod.COLOR = True
-    mod.C_RESET, mod.C_LIME = "\033[0m", "\033[38;2;203;253;117m"
-    mod.C_TEAL, mod.C_GRAY = "\033[38;2;47;179;196m", "\033[38;2;112;128;136m"
-    mod.C_WHITE, mod.C_RED = "\033[97m", "\033[38;2;232;92;111m"
+    mod.COLOR = True                       # render frames with the module's own
+    mod.C_RESET, mod.C_WHITE = "\033[0m", "\033[97m"           # palette
+    mod.C_LIME, mod.C_TEAL = mod._PALETTE[0], mod._PALETTE[1]
+    mod.C_GRAY, mod.C_RED = mod._PALETTE[2], mod._PALETTE[3]
     mod.tailscale_parts = lambda: ("ACTIVE", "100.64.0.1")
     return mod
 
@@ -144,7 +144,7 @@ class Selector(unittest.TestCase):
         for cols in (54, 50, 48, 44, 40, 34):
             head = self.masthead_of(cols, 7)
             line = next(ln for ln in head if "E D G E" in ln or "EDGE" in ln)
-            self.assertIn(GRAY + "T H E", line, f"{cols}: slogan must be muted gray, tracked")
+            self.assertIn(self.new.C_GRAY + "T H E", line, f"{cols}: slogan must be muted gray, tracked")
             self.assertEqual(SGR.sub("", line).replace(" ", "")[-14:], "THEEDGEISYOURS")
             self.assertLess(head.index(line), len(head) - 1, "blank row before the selector")
         # full tier: centred under TENDRIL (not the whole mark), one row of air above
@@ -231,6 +231,40 @@ def origin_main_cli():
     if src.returncode or "def masthead(" in src.stdout:
         return None
     return src.stdout
+
+
+class Palette(unittest.TestCase):
+    """Truecolour only when COLORTERM advertises it; 256-colour fallback
+    everywhere else (mosh < 1.4 drops 38;2 sequences entirely, which
+    rendered the whole phone UI monochrome)."""
+
+    def env_load(self, name, colorterm):
+        keep = os.environ.get("COLORTERM")
+        if colorterm is None:
+            os.environ.pop("COLORTERM", None)
+        else:
+            os.environ["COLORTERM"] = colorterm
+        try:
+            return load(CLI, name)
+        finally:
+            if keep is None:
+                os.environ.pop("COLORTERM", None)
+            else:
+                os.environ["COLORTERM"] = keep
+
+    def test_truecolour_when_advertised(self):
+        tc = self.env_load("ra_palette_tc", "truecolor")
+        self.assertEqual(tc._PALETTE[0], "\033[38;2;203;253;117m")
+        self.assertEqual(tc._PALETTE[1], "\033[38;2;47;179;196m")
+
+    def test_256_fallback_survives_mosh(self):
+        fb = self.env_load("ra_palette_fb", None)
+        self.assertEqual(fb._PALETTE,
+                         ("\033[38;5;191m", "\033[38;5;73m",
+                          "\033[38;5;244m", "\033[38;5;203m"))
+        out = frame(fb, 48, 31, 3)
+        self.assertIn("\033[38;5;191m", out)
+        self.assertNotIn(";2;", out, "no truecolour SGR may reach the frame")
 
 
 @unittest.skipUnless(origin_main_cli(), "origin/main already contains the masthead")

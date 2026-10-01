@@ -9,6 +9,10 @@ All notable changes to TENDRIL are documented here.
   compact TENDRIL mark renders at 48x31 instead of silently degrading to a
   bare menu; with the keyboard open the menu still wins, never taller than
   before
+- truecolour only where the terminal advertises it (`COLORTERM=truecolor`);
+  otherwise the nearest 256-colour entries. mosh < 1.4 (Ubuntu 22.04 ships
+  1.3.2) drops `38;2;r;g;b` sequences entirely, which rendered the whole
+  phone UI monochrome — the fallback palette survives every transport
 - the title row clamps a polluted `TAILSCALE_HOST` (captured prompt text
   from pre-0.1.1 installers) to the box width while keeping the
   `// REMOTE AGENTS` suffix readable
