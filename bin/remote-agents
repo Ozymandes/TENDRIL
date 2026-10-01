@@ -681,18 +681,21 @@ def help_screen():
         return s if len(s) <= n else s[: max(1, n - 1)] + "\u2026"
 
     rows = [
-        ("Alt+\u2190/\u2192", "prev / next tab"),
-        ("Alt+1..9", "jump directly to tab"),
-        ("Alt+\u2191/\u2193", "prev / next workspace"),
+        ("Ctrl+B 1..9", "jump to workspace"),
+        ("Alt+1..9", "jump to workspace (no prefix)"),
+        ("Ctrl+B w", "workspace picker (digits work)"),
+        ("Ctrl+B n/p", "next / previous tab (phone-safe)"),
+        ("Alt+\u2190/\u2192", "prev / next tab (desktop encoding)"),
+        ("Alt+\u2191/\u2193", "prev / next workspace (desktop)"),
         ("Ctrl+]", "detach to REMOTE AGENTS"),
         ("Alt+D", "detach (desktop alternative)"),
         ("Alt+Enter", "split pane horizontal"),
         ("Alt+Shift+Enter", "split pane vertical"),
         ("Alt+Esc", "close pane"),
-        ("Ctrl+Space, c", "new tab"),
-        ("Ctrl+Space, r", "rename tab"),
-        ("Ctrl+Space, k", "close tab"),
-        ("Ctrl+Space, ?", "native Herdr help"),
+        ("Ctrl+B c", "new tab"),
+        ("Ctrl+B shift+T", "rename tab"),
+        ("Ctrl+B shift+X", "close tab"),
+        ("Ctrl+B ?", "native Herdr help"),
     ]
     kcol = 18
     dbudget = inner - 4 - kcol
@@ -711,9 +714,9 @@ def help_screen():
         out.append(f"{C_LIME}\u2502{C_RESET}" + body + " " * padn
                    + f" {C_LIME}\u2502{C_RESET}")
     out.append(f"{C_LIME}\u251c{line(inner)}\u2524{C_RESET}")
-    for note in ("Prefix = Ctrl+Space",
-                 "Alt needs an unsplit ESC byte;",
-                 "Ctrl+] is one byte - Termux-safe.",
+    for note in ("Prefix = Ctrl+B; Ctrl+B 1..9 = workspace",
+                 "Alt needs the xterm modifier form -",
+                 "phones: Ctrl+B chords, ALT+digit.",
                  "Detach keeps workspaces, panes,",
                  "and agents running."):
         nfit = fit(note, inner - 2)

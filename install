@@ -203,11 +203,15 @@ else
 fi
 say ""
 
-# ---------------- 6. herdr detach keybindings ----------------
-say "6) Herdr detach keybindings"
-say "     Ctrl+]     recommended Android/Termux detach (single byte, never split)"
-say "     Alt+D      desktop-friendly alternative"
-say "     Prefix+D   universal fallback (prefix is Ctrl+Space by default)"
+# ---------------- 6. herdr keybindings (detach + switching) ----------------
+say "6) Herdr keybindings"
+say "     Ctrl+]        recommended Android/Termux detach (single byte, never split)"
+say "     Alt+D         desktop-friendly alternative"
+say "     Prefix+D      universal fallback (prefix is Ctrl+B by default)"
+say "     Ctrl+B 1..9   jump to workspace (needs the switching bindings below)"
+say "     Alt+1..9      jump to workspace, no prefix (Termux: tap ALT then digit)"
+say "     Ctrl+B n / p  next / previous tab (phone-safe)"
+say "     Alt+←/→       next / previous tab (desktop modifier encoding)"
 HERDR_CONF="$HOME/.config/herdr/config.toml"
 
 # plan|apply the merged detach set without disturbing any other binding
@@ -253,6 +257,98 @@ else:
 PYEOF
 }
 
+# plan|apply the workspace/tab switching bindings without disturbing anything else.
+# Requires herdr >= 0.9.3 (0.9.1 ignores switch_workspace and alt-indexed keys).
+herdr_switch() {
+    python3 - "$HERDR_CONF" "$1" <<'PYEOF'
+import re, sys
+path, mode = sys.argv[1], sys.argv[2]
+text = open(path).read()
+
+def section_span(t, name):
+    m = re.search(r'^\[' + re.escape(name) + r'\][ \t]*$', t, re.M)
+    if not m:
+        return None
+    body = m.end()
+    nxt = re.search(r'^\[', t[body:], re.M)
+    end = body + (nxt.start() if nxt else len(t[body:]))
+    return body, end
+
+# every quoted chord in the file -> the keys that claim it
+used = {}
+for line in text.splitlines():
+    s = line.strip()
+    if not s or s.startswith("#") or "=" not in s:
+        continue
+    k, v = s.split("=", 1)
+    for c in re.findall(r'"([^"]+)"', v):
+        used.setdefault(c, set()).add(k.strip())
+
+def chord_free(c, key):
+    return all(k == key for k in used.get(c, ()))
+
+def insert_line(t, sec, line):
+    span = section_span(t, sec)
+    if span is None:
+        if t and not t.endswith("\n"):
+            t += "\n"
+        return t + "\n[" + sec + "]\n" + line + "\n"
+    body, end = span
+    if end > 0 and t[end-1] != "\n":
+        t = t[:end] + "\n" + t[end:]
+        end += 1
+    return t[:end] + line + "\n" + t[end:]
+
+def set_scalar(t, sec, key, value):
+    span = section_span(t, sec)
+    pat = re.compile(r'^[ \t]*' + re.escape(key) + r'[ \t]*=[ \t]*(.+?)[ \t]*$', re.M)
+    if span:
+        m = pat.search(t, span[0], span[1])
+        if m:
+            return t, False                      # user's own binding wins
+    return insert_line(t, sec, key + " = " + value), True
+
+def merge_list(t, sec, key, defaults, chords):
+    """Ensure the chords are in key's list (create with defaults if absent)."""
+    span = section_span(t, sec)
+    pat = re.compile(r'^[ \t]*' + re.escape(key) + r'[ \t]*=[ \t]*(.+?)[ \t]*$', re.M)
+    m = pat.search(t, span[0], span[1]) if span else None
+    if not m:
+        line = key + " = [" + ", ".join('"%s"' % d for d in defaults) + "]"
+        return insert_line(t, sec, line), True
+    items = re.findall(r'"([^"]+)"', m.group(1))
+    add = [c for c in chords if c not in items and chord_free(c, key)]
+    if not add:
+        return t, False
+    newline = key + " = [" + ", ".join('"%s"' % i for i in items + add) + "]"
+    return t[:m.start()] + newline + t[m.end():], True
+
+added = []
+# switch_workspace takes the prefix+digit range unless switch_tab already claims it
+if "1..9" not in used.get("switch_tab", ()) and "prefix+1..9" not in used.get("switch_workspace", ()):
+    text, did = set_scalar(text, "keys", "switch_workspace", '"prefix+1..9"')
+    if did: added.append("switch_workspace=prefix+1..9")
+text, did = merge_list(text, "keys", "next_tab", ["prefix+n", "alt+right"], ["alt+right"])
+if did: added.append("next_tab+=alt+right")
+text, did = merge_list(text, "keys", "previous_tab", ["prefix+p", "alt+left"], ["alt+left"])
+if did: added.append("previous_tab+=alt+left")
+text, did = set_scalar(text, "keys", "next_workspace", '"alt+down"')
+if did: added.append("next_workspace=alt+down")
+text, did = set_scalar(text, "keys", "previous_workspace", '"alt+up"')
+if did: added.append("previous_workspace=alt+up")
+text, did = set_scalar(text, "keys.indexed", "tabs", '"ctrl"')
+if did: added.append("indexed.tabs=ctrl")
+text, did = set_scalar(text, "keys.indexed", "workspaces", '"alt"')
+if did: added.append("indexed.workspaces=alt")
+
+if mode == "plan":
+    print("ADDED=" + ",".join(added))
+else:
+    if added:
+        open(path, "w").write(text)
+PYEOF
+}
+
 if [ ! -f "$HERDR_CONF" ]; then
     say "  no $HERDR_CONF found - skipped"
 else
@@ -285,6 +381,33 @@ else
             fi
         else
             say "  skipped - your bindings are unchanged"
+        fi
+    fi
+    PLAN=$(herdr_switch plan)
+    ADDED=$(printf '%s\n' "$PLAN" | sed -n 's/^ADDED=//p')
+    if [ -z "$ADDED" ]; then
+        say "  switching bindings already complete - nothing to do"
+    else
+        say "  proposed switching bindings (adds: $ADDED):"
+        say "  every existing binding is left exactly as it is."
+        if confirm "Apply these switching bindings?"; then
+            backup "$HERDR_CONF"
+            BAK=$(ls -t "$HERDR_CONF".bak.* 2>/dev/null | head -1)
+            if [ "$DRY_RUN" = "1" ]; then
+                say "  [dry-run] write the keys above; then herdr config check + reload-config"
+            else
+                herdr_switch apply
+                if "$HERDR_BIN" config check >/dev/null 2>&1; then
+                    "$HERDR_BIN" server reload-config >/dev/null 2>&1 \
+                        && say "  applied + reloaded live (no server restart)"
+                else
+                    say "  config check FAILED - restoring backup"
+                    cp -p "$BAK" "$HERDR_CONF"
+                    "$HERDR_BIN" server reload-config >/dev/null 2>&1
+                fi
+            fi
+        else
+            say "  skipped - your switching bindings are unchanged"
         fi
     fi
 fi

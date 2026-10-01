@@ -95,7 +95,9 @@ of view.
 `AGENT_ALIAS` setting also continues to work.
 
 From the selector, choose a workspace by number. `Ctrl+]` detaches back to the
-menu while the agent keeps running. `N`, `P`, `S`, and `I` open the new-workspace,
+menu while the agent keeps running. Inside a workspace, `Ctrl+B 1..9` jumps
+to a workspace, `Ctrl+B w` opens the picker, and `Ctrl+B n`/`p` cycles tabs.
+`N`, `P`, `S`, and `I` open the new-workspace,
 project, shell, and host-status flows. See the [Android guide](docs/ANDROID.md)
 for Termux key behavior and setup details.
 

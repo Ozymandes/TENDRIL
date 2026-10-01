@@ -4,6 +4,20 @@ All notable changes to TENDRIL are documented here.
 
 ## v0.1.2 — the mark survives phone geometry
 
+- in-session switching that matches the muscle memory: the installer now also
+  provisions `switch_workspace = "prefix+1..9"` (Ctrl+B 1..9 jumps to a
+  workspace), Alt+1..9 indexed workspace jumps, prefix-free Alt+←/→
+  next/previous tab, Alt+↑/↓ workspace cycling — added only when missing,
+  never clobbering existing bindings, with the same conflict guard as the
+  detach merge. Requires herdr >= 0.9.3 (0.9.1 ignores these keys);
+  `herdr update --handoff` upgrades live
+- mobile key reference corrected: herdr's prefix is Ctrl+B (was documented
+  as Ctrl+Space), tab chords are prefix+n/p and prefix+shift+T/X, and
+  Alt+1..9 jumps workspaces, not tabs
+- Android docs: Alt+arrows stay desktop-only (Termux sends the ESC-prefix
+  form Herdr deliberately ignores); phone paths are Ctrl+B chords,
+  ALT+digit, and Ctrl+B w + digit
+
 - the selector now yields per-row path lines when the terminal is too short
   to fit the masthead mark above the menu (phone, keyboard closed): the
   compact TENDRIL mark renders at 48x31 instead of silently degrading to a

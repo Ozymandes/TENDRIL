@@ -94,5 +94,5 @@ tendril ssh  → force SSH if Mosh UDP is blocked
 | `key-auth check failed` | Tailscale app not connected, or key not installed yet — try `ssh <alias>` interactively |
 | mosh connects then dies instantly | host firewall may block UDP 60000-61000 on `tailscale0`; use `tendril ssh` meanwhile |
 | menu says "cannot reach Herdr server" | the host Herdr server is down — start it locally (`herdr`) |
-| `Alt+←`/`→` does nothing on the phone | Termux on-screen Alt is unreliable — use `Ctrl+B` then `N`/`P` (prefix chords), or tap the extra-keys `CTRL` then a digit (host needs `keys.indexed.tabs = "ctrl"` in `~/.config/herdr/config.toml`) |
+| `Alt+←`/`→` does nothing on the phone | Termux sends arrows with an ESC prefix, which Herdr ignores by design — for tabs use `Ctrl+B` then `N`/`P`; for workspaces tap `ALT` then a digit (no prefix), or `Ctrl+B w` + digit |
 | garbled glyphs | `pkg install font-firas-mono` or any Nerd Font, and ensure UTF-8 locale |
