@@ -16,9 +16,14 @@ All notable changes to TENDRIL are documented here.
   remains for workspace selection and text fields. Info returns on any key;
   Help paginates to the phone screen with any-key advance/return. Workspace
   paths yield when needed to fit the menu and prompt with the keyboard open.
-  `N` opens the creation chooser, including shell-only creation, and keeps
-  the selected/focused workspace-directory defaults. Use `herdr-notify --test`
-  on the host to send a test notification.
+  `N` immediately opens a shell in the selected/focused workspace directory,
+  with Herdr's native directory-based name: no wizard, prompts, confirmation,
+  or automatic agent startup. Active-pane cwd takes priority over cached agent
+  cwd, with the console cwd as fallback. Use `herdr-notify --test` on the host
+  to send a test notification.
+- Stop provisioning Herdr's Alt+Up previous-workspace binding so Pi can use the
+  key to edit steering messages. Existing installs must remove the old binding
+  and reload Herdr config; workspace digits/picker remain available.
 
 - The selector supports ↑/↓ highlighting and Enter-to-attach while preserving
   numeric workspace selection; raw TTY mode restores terminal settings on
@@ -27,9 +32,8 @@ All notable changes to TENDRIL are documented here.
   the fallback. Native Ctrl+Home bindings remain optional; the installer
   validates them where supported, preserves unrelated bindings, and adds only
   conflict-free shortcuts.
-- New-workspace labels are derived from the selected cwd (the installed CLI's
-  docs do not specify an automatic label default); agent names are sanitized
-  from the resulting label.
+- New shell workspaces leave `--label` unset, using Herdr's native cwd-based
+  name. Users can start agents directly from the shell.
 
 ## v0.1.2 — the mark survives phone geometry
 

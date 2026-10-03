@@ -38,13 +38,13 @@ Android Termux                            Linux + systemd (user)
   returns on any key; Help paginates to terminal height with any-key advance
   and return. Paths yield when needed to keep the menu and prompt visible.
   Non-TTY input keeps its line-based menu.
-- `N` opens the new-workspace chooser, including a shell-only option. Creation
-  keeps the selected/focused existing workspace directory as its default when
-  available; an explicit absolute path can override it, with the directory
-  chooser as fallback when no usable cwd exists. New-workspace labels derive
-  from the selected initial-tab cwd (the directory basename), because the
-  installed CLI does not specify an automatic label default; agent names are
-  sanitized from the resulting label.
+- `N` immediately creates and attaches a shell workspace via `herdr workspace
+  create --cwd <directory> --focus`, without `--label`, prompts, or agent startup.
+  Herdr derives the name from the directory. Use the selected/focused workspace's
+  active pane directory, preferring its foreground cwd over cached agent cwd;
+  fall back to the console cwd (or HOME if that cwd was deleted).
+- Alt+Up is not provisioned as a Herdr workspace key: Pi uses it to edit steering
+  messages. Workspace digits and the Ctrl+B w picker remain available.
 - Herdr client selection: PATH → explicit config → mise installs, newest
   first; every candidate is probed (`--version` + `status`) and only a
   client whose protocol is **compatible with the running server** is chosen.

@@ -114,12 +114,17 @@ tendril ssh  → force SSH if Mosh UDP is blocked
 The selector footer is `N New`, `I Info`, `? Help`, `R Refresh`, `Q Quit`.
 Press a footer key once; no Enter is needed. Enter remains for workspace
 selection and text fields. Info returns on any key; Help pages fit the screen,
-with any key advancing to the next page or returning from the last. `N` opens the
-workspace-creation chooser, including a shell-only option. Existing behavior
-that defaults to the selected/focused workspace's directory remains; an
-explicit absolute path overrides it, and the directory chooser remains the
-fallback when there is no usable current directory. Detaching keeps workspaces
-and agents running.
+with any key advancing to the next page or returning from the last. `N` opens a
+shell immediately in the selected/focused workspace's directory, with Herdr's
+native directory-based name. It asks no questions and does not launch an agent;
+start your agent from the shell normally. If no workspace directory is usable,
+it uses the console's current directory. Detaching keeps workspaces and agents
+running.
+
+Alt+Up belongs to Pi for editing steering messages, not Herdr workspace switching.
+Use Ctrl+B then a digit, ALT+digit, or Ctrl+B w for workspace switching. Existing
+installs with `previous_workspace = "alt+up"` should remove that Herdr binding
+and run `herdr server reload-config`; the installer no longer adds it.
 
 ## Updating the host selector
 

@@ -25,7 +25,7 @@ control, simplicity, and openness I wanted from the start.
 - `tendril` connects from Termux to your Linux host, preferring Mosh and falling
   back to SSH.
 - `remote-agents` presents Herdr's live workspaces in a terminal selector. Pick
-  a workspace to attach, open the new-workspace chooser, or view host info.
+  a workspace to attach, open a shell, or view host info.
 - `herdr-notify` can watch session state and send an ntfy alert when work
   finishes or an agent needs input.
 
@@ -112,8 +112,10 @@ its number followed by Enter still works, including multi-digit numbers. The
 footer actions are `N New`, `I Info`, `? Help`, `R Refresh`, and `Q Quit`; each
 runs on a single keypress, without Enter. Enter remains for workspace selection
 and text fields. Help pages fit the screen; any key advances or returns.
-`N` opens the workspace-creation chooser, which includes a
-shell-only option and keeps the selected/focused workspace-directory defaults.
+`N` immediately opens a shell in the selected/focused workspace's directory.
+Herdr names it after that directory; there are no name, directory, agent, or
+confirmation prompts. Without a usable workspace directory, it uses the
+console's current directory.
 
 `Alt+D` detaches back to the menu (tap ALT then D on the phone); `Ctrl+B` then
 `D` is the fallback. Detaching leaves workspaces and agents running. The host
@@ -122,7 +124,8 @@ TTY attachments, including over Mosh or SSH. It does not require `TERMUX_VERSION
 to be forwarded from the phone. Set host-side `TENDRIL_DETACH_BRIDGE=0` to
 disable it; non-TTY attachments pass input through unchanged. Inside a
 workspace, `Ctrl+B 1..9` jumps to a workspace, `Ctrl+B w` opens the picker, and
-`Ctrl+B n`/`p` cycles tabs. Run `herdr-notify --test` on the host to send a test
+`Ctrl+B n`/`p` cycles tabs. Alt+Up is left to Pi for editing steering messages,
+not bound to Herdr workspace switching. Run `herdr-notify --test` on the host to send a test
 notification. See the [Android guide](docs/ANDROID.md) for setup and troubleshooting.
 
 ## Further reading

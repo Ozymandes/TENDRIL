@@ -124,10 +124,12 @@ class Panels(unittest.TestCase):
             stack.enter_context(mock.patch.object(ra, "wait_for_key"))
             ra.help_screen()
         text = output.getvalue()
-        for expected in ("new workspace", "host/workspace info", "quit selector",
+        for expected in ("new shell in cwd", "host/workspace info", "quit selector",
                          "detach (host bridge)", "Ctrl+Home bridge: default on.",
                          "TENDRIL_DETACH_BRIDGE=0", "false/no/off/empty"):
             self.assertIn(expected, text)
+        self.assertIn("Alt+↓", text)
+        self.assertNotIn("Alt+↑", text)
 
     def test_help_pages_fit_phone_screen_including_any_key_prompt(self):
         for height in (22, 31):
@@ -251,42 +253,90 @@ class Selection(unittest.TestCase):
         self.assertEqual(notes, ["", "no workspaces to attach", "no workspaces to attach"])
 
 
+class CollectCwd(unittest.TestCase):
+    def test_active_focused_pane_cwd_wins_over_inactive_tab_and_first_agent(self):
+        snap = {
+            "workspaces": [{"workspace_id": "w1", "label": "project",
+                            "number": 1, "focused": True, "active_tab_id": "active"}],
+            "agents": [
+                {"workspace_id": "w1", "cwd": "/agent/first"},
+                {"workspace_id": "w1", "cwd": "/agent/second"},
+            ],
+            "panes": [
+                {"pane_id": "inactive", "tab_id": "inactive", "focused": True,
+                 "foreground_cwd": "/tab/inactive", "cwd": "/tab/inactive"},
+                {"pane_id": "active-other", "tab_id": "active", "focused": False,
+                 "foreground_cwd": "/pane/other", "cwd": "/pane/other"},
+                {"pane_id": "active-focused", "tab_id": "active", "focused": True,
+                 "foreground_cwd": "/pane/focused/foreground", "cwd": "/pane/focused"},
+            ],
+        }
+        with mock.patch.object(ra, "snapshot", return_value=snap):
+            rows = ra.collect()
+        self.assertEqual(rows[0]["path"], "/pane/focused/foreground")
+
+    def test_collect_falls_back_to_active_pane_cwd_then_agent_cwd(self):
+        base = {"workspaces": [{"workspace_id": "w1", "active_tab_id": "active"}],
+                "agents": [{"workspace_id": "w1", "cwd": "/agent/cwd"}],
+                "panes": [{"pane_id": "p1", "tab_id": "active", "focused": True,
+                           "cwd": "/pane/cwd"}]}
+        with mock.patch.object(ra, "snapshot", return_value=base):
+            self.assertEqual(ra.collect()[0]["path"], "/pane/cwd")
+
+        base["panes"] = [{"pane_id": "p1", "tab_id": "active", "focused": True}]
+        base["agents"] = [
+            {"workspace_id": "w1", "foreground_cwd": "/agent/foreground", "cwd": "/agent/cwd"},
+            {"workspace_id": "w1", "cwd": "/agent/second"},
+        ]
+        with mock.patch.object(ra, "snapshot", return_value=base):
+            self.assertEqual(ra.collect()[0]["path"], "/agent/foreground")
+
+
 class WorkspaceCreation(unittest.TestCase):
-    def test_new_workspace_without_usable_cwd_falls_back_to_dir_menu(self):
-        events = []
-        created = {"result": {
-            "workspace": {"workspace_id": "w-new", "label": "Café API"},
-            "root_pane": {"pane_id": "p-new"},
-        }}
+    def test_new_workspace_without_usable_workspace_cwd_falls_back_to_process_cwd(self):
+        created = {"result": {"workspace": {"workspace_id": "w-new"}}}
         with tempfile_directory() as cwd:
             with contextlib.ExitStack() as stack:
-                stack.enter_context(mock.patch.object(
-                    ra, "ask_dir", side_effect=lambda: events.append("dir") or cwd))
-                stack.enter_context(mock.patch.object(
-                    ra, "ask_agent", side_effect=lambda: events.append("agent") or "claude"))
-                stack.enter_context(mock.patch.object(
-                    ra, "confirm", side_effect=lambda prompt: events.append(("confirm", prompt)) or True))
-                stack.enter_context(mock.patch.object(
-                    ra, "ws_create", side_effect=lambda path, label=None:
-                    events.append(("create", path, label)) or (created, None)))
-                stack.enter_context(mock.patch.object(
-                    ra, "start_agent", side_effect=lambda *args:
-                    events.append(("start",) + args) or (True, "")))
-                stack.enter_context(mock.patch.object(
-                    ra, "collect", return_value=[{"id": "w-new", "label": "Café API"}]))
-                stack.enter_context(mock.patch.object(
-                    ra, "attach", side_effect=lambda row: events.append(("attach", row["id"]))))
-                stack.enter_context(mock.patch("builtins.input", return_value="cli"))
+                create = stack.enter_context(mock.patch.object(
+                    ra, "ws_create", return_value=(created, None)))
+                stack.enter_context(mock.patch.object(ra, "collect", return_value=[]))
+                stack.enter_context(mock.patch.object(ra.os, "getcwd", return_value=cwd))
                 result = ra.new_workspace([], None)
 
         self.assertEqual(result, "w-new")
-        self.assertEqual(events[0:2], ["dir", "agent"])
-        self.assertEqual(events[2], (
-            "confirm", f"create 'cli' @ {ra.short_path(cwd)} + claude?"))
-        self.assertEqual(events[3], ("create", cwd, "cli"))
-        expected_name = ra.agent_name_for_workspace("Café API", cwd, "w-new")
-        self.assertEqual(events[4], ("start", expected_name, "claude", "p-new"))
-        self.assertEqual(events[5], ("attach", "w-new"))
+        create.assert_called_once_with(cwd)
+
+    def test_new_workspace_uses_home_when_deleted_cwd_and_getcwd_fails(self):
+        created = {"result": {"workspace": {"workspace_id": "w-home"}}}
+        rows = [{"id": "stale", "focused": True, "path": "/deleted/workspace"}]
+        home = "/test/home"
+        with contextlib.ExitStack() as stack:
+            create = stack.enter_context(mock.patch.object(
+                ra, "ws_create", return_value=(created, None)))
+            stack.enter_context(mock.patch.object(ra, "collect", return_value=[]))
+            stack.enter_context(mock.patch.object(
+                ra.os, "getcwd", side_effect=OSError("deleted current directory")))
+            stack.enter_context(mock.patch.object(ra.os.path, "expanduser", return_value=home))
+            result = ra.new_workspace(rows, 0)
+
+        self.assertEqual(result, "w-home")
+        create.assert_called_once_with(home)
+
+    def test_new_workspace_create_failure_does_not_attach(self):
+        with tempfile_directory() as cwd:
+            rows = [{"id": "w0", "focused": True, "path": cwd}]
+            with contextlib.ExitStack() as stack:
+                create = stack.enter_context(mock.patch.object(
+                    ra, "ws_create", return_value=(None, "permission denied")))
+                collect = stack.enter_context(mock.patch.object(ra, "collect"))
+                attach = stack.enter_context(mock.patch.object(ra, "attach"))
+                output = stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+                result = ra.new_workspace(rows, 0)
+
+        self.assertIsNone(result)
+        create.assert_called_once_with(cwd)
+        collect.assert_not_called()
+        attach.assert_not_called()
 
     def test_project_launcher_uses_workspace_id_for_agent_name(self):
         with tempfile_directory() as root:
@@ -337,9 +387,7 @@ class WorkspaceCreation(unittest.TestCase):
 
 
 class DirectoryInheritance(unittest.TestCase):
-    """N/S flows default to the selected/focused workspace's directory.
-    Ported from local ee54eeb, reconciled with origin/main's derived-label
-    and agent-name safety (origin/main always asked the full dir menu)."""
+    """Workspace cwd selection and the retained quick-shell helper behavior."""
 
     def test_current_ws_dir_prefers_selected_then_focused(self):
         with tempfile_directory() as sel_dir, tempfile_directory() as foc_dir:
@@ -351,94 +399,32 @@ class DirectoryInheritance(unittest.TestCase):
                 [{"id": "w", "focused": False, "path": "/definitely/not/here"}], 0))
             self.assertIsNone(ra.current_ws_dir([], None))
 
-    def test_enter_accepts_inherited_directory_and_empty_name_auto_labels(self):
-        events = []
-        created = {"result": {
-            "workspace": {"workspace_id": "w-auto", "label": "inherit"},
-            "root_pane": {"pane_id": "p-auto"},
-        }}
-        with tempfile_directory() as cwd:
-            rows = [{"id": "w0", "focused": True, "path": cwd}]
-            with contextlib.ExitStack() as stack:
-                stack.enter_context(mock.patch.object(ra, "ask_agent", return_value="shell"))
-                stack.enter_context(mock.patch.object(
-                    ra, "confirm", side_effect=lambda p: events.append(("confirm", p)) or True))
-                stack.enter_context(mock.patch.object(
-                    ra, "ws_create", side_effect=lambda path, label=None:
-                    events.append(("create", path, label)) or (created, None)))
-                stack.enter_context(mock.patch.object(
-                    ra, "collect", return_value=rows + [{"id": "w-auto", "label": "inherit"}]))
-                stack.enter_context(mock.patch.object(
-                    ra, "attach", side_effect=lambda row: events.append(("attach", row["id"]))))
-                stack.enter_context(mock.patch("builtins.input", side_effect=["", ""]))
-                result = ra.new_workspace(rows, 0)
-
-        self.assertEqual(result, "w-auto")
-        self.assertEqual(events[0], (
-            "confirm", f"create '{os.path.basename(cwd)} (auto)' "
-                        f"@ {ra.short_path(cwd)} + shell?"))
-        self.assertEqual(events[1], ("create", cwd, os.path.basename(cwd)))
-        self.assertEqual(events[2], ("attach", "w-auto"))
-
-    def test_n_shell_only_creation_inherits_selected_workspace_cwd(self):
+    def test_n_dispatch_creates_and_attaches_native_shell_without_prompting(self):
         created = {"result": {"workspace": {"workspace_id": "w-shell"}}}
         with tempfile_directory() as cwd:
             rows = [{"id": "w0", "focused": True, "path": cwd}]
-            created_rows = rows + [{"id": "w-shell", "label": "shell-inherited",
-                                    "focused": False, "path": cwd}]
+            shell_row = {"id": "w-shell", "label": os.path.basename(cwd),
+                         "focused": False, "path": cwd}
+            refreshed_rows = rows + [shell_row]
             with contextlib.ExitStack() as stack:
                 stack.enter_context(mock.patch.object(ra, "render"))
                 stack.enter_context(mock.patch.object(
                     ra, "read_menu_action",
                     side_effect=[("line", "N"), ("line", "q")]))
-                stack.enter_context(mock.patch.object(ra, "ask_agent", return_value="shell"))
-                stack.enter_context(mock.patch.object(ra, "confirm", return_value=True))
                 create = stack.enter_context(mock.patch.object(
                     ra, "ws_create", return_value=(created, None)))
-                started = stack.enter_context(mock.patch.object(ra, "start_agent"))
-                stack.enter_context(mock.patch.object(ra, "collect", return_value=created_rows))
-                attach = stack.enter_context(mock.patch.object(ra, "attach"))
-                stack.enter_context(mock.patch("builtins.input", side_effect=["shell-inherited", ""]))
-                self.assertEqual(ra.menu_loop(rows, tty_mode=True, fd=0), 0)
-            create.assert_called_once_with(cwd, "shell-inherited")
-            started.assert_not_called()
-            attach.assert_called_once_with(created_rows[1])
-
-    def test_explicit_absolute_path_overrides_inherited_default(self):
-        created = {"result": {
-            "workspace": {"workspace_id": "w2"},
-            "root_pane": {"pane_id": "p2"},
-        }}
-        with tempfile_directory() as inherited, tempfile_directory() as override:
-            rows = [{"id": "w0", "focused": True, "path": inherited}]
-            creates = []
-            with contextlib.ExitStack() as stack:
-                stack.enter_context(mock.patch.object(ra, "ask_agent", return_value="shell"))
-                stack.enter_context(mock.patch.object(ra, "confirm", return_value=True))
                 stack.enter_context(mock.patch.object(
-                    ra, "ws_create", side_effect=lambda path, label=None:
-                    creates.append((path, label)) or (created, None)))
-                stack.enter_context(mock.patch.object(ra, "collect", return_value=rows))
-                stack.enter_context(mock.patch.object(ra, "attach"))
+                    ra, "collect", side_effect=[refreshed_rows, refreshed_rows]))
+                attach = stack.enter_context(mock.patch.object(ra, "attach"))
+                for name in ("ask_dir", "ask_agent", "confirm", "start_agent"):
+                    stack.enter_context(mock.patch.object(
+                        ra, name, side_effect=AssertionError(f"{name} must not be called")))
                 stack.enter_context(mock.patch(
-                    "builtins.input", side_effect=["feat", override]))
-                ra.new_workspace(rows, 0)
-        self.assertEqual(creates, [(override, "feat")])
+                    "builtins.input", side_effect=AssertionError("input must not be called")))
+                self.assertEqual(ra.menu_loop(rows, tty_mode=True, fd=0), 0)
 
-    def test_bad_override_cancels_without_creating(self):
-        with tempfile_directory() as inherited:
-            rows = [{"id": "w0", "focused": True, "path": inherited}]
-            with contextlib.ExitStack() as stack:
-                ws_create = stack.enter_context(mock.patch.object(ra, "ws_create"))
-                ask_agent = stack.enter_context(mock.patch.object(ra, "ask_agent"))
-                stack.enter_context(mock.patch(
-                    "builtins.input", side_effect=["x", "relative/path"]))
-                buf = io.StringIO()
-                with contextlib.redirect_stdout(buf):
-                    self.assertIsNone(ra.new_workspace(rows, 0))
-        self.assertIn("no such directory", buf.getvalue())
-        ws_create.assert_not_called()
-        ask_agent.assert_not_called()
+        create.assert_called_once_with(cwd)
+        attach.assert_called_once_with(shell_row)
 
     def test_quick_shell_inherits_selected_cwd_else_home(self):
         created = {"result": {"workspace": {"workspace_id": "s1"}}}
