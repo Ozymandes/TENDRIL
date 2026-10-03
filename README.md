@@ -100,6 +100,9 @@ its number followed by Enter still works, including multi-digit numbers.
 `Ctrl+B` then `D` is the fallback. Detaching leaves workspaces and agents running.
 The installer preserves existing bindings and only adds conflict-free shortcuts.
 `Ctrl+Home` is optional on Herdr versions that accept it; Herdr 0.9.3 does not.
+On Termux, `remote-agents` bridges the gap itself: when attached from the menu,
+`CTRL`+`HOME` rewrites to Alt+D inside a transparent PTY bridge (no Herdr
+config change; `TENDRIL_DETACH_BRIDGE=0` disables it).
 Inside a workspace, `Ctrl+B 1..9` jumps to a workspace, `Ctrl+B w` opens the
 picker, and `Ctrl+B n`/`p` cycles tabs. `N`, `P`, `S`, and `I` open the
 new-workspace, project, shell, and host-status flows. See the [Android guide](docs/ANDROID.md)

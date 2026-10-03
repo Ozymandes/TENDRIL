@@ -80,17 +80,44 @@ echo 'TENDRIL_ALIAS=<alias>' >> ~/.bashrc
 Install the [ntfy app](https://ntfy.sh), Subscribe → enter the topic from the
 host's `~/.config/remote-agents/notify.env`. Test from the console with `T`.
 
+## Detach: Ctrl+Home (Termux) via the TENDRIL bridge
+
+In the extra-keys row, tap CTRL then HOME — the active session detaches and
+the TENDRIL selector returns:
+
+```
+CTRL + HOME  →  ESC [ 1 ; 5 H  →  TENDRIL bridge  →  Alt+D (ESC d)  →  detach
+```
+
+Termux encodes Ctrl+Home as `ESC [ 1 ; 5 H` (xterm modifier encoding —
+`KeyHandler.getCode` applies `transformForModifiers` for the HOME key).
+Herdr's key grammar has no Home key, so on Termux `remote-agents` runs the
+attach behind a small PTY bridge that rewrites exactly those six bytes to the
+Alt+D detach Herdr already binds. Everything else is forwarded byte-for-byte:
+a plain HOME tap (`ESC [ H`) keeps its normal meaning, Android's system Home
+button is not touched, and Alt+D / Ctrl+B d keep working. Herdr's config is
+never modified by the bridge. It is a TENDRIL convenience: automatic on
+Termux, opt-in elsewhere with `TENDRIL_DETACH_BRIDGE=1`, and `=0` disables it.
+
+Confirm the sequence on the phone (in a plain Termux shell, not inside
+Herdr): run `cat -v`, tap CTRL then HOME — you should see `^[[1;5H`.
+`Ctrl+C` exits.
+
 ## Daily use
 
 ```
 tendril      → workspace menu → ↑/↓ or number + Enter → work
-               → Alt+D → menu → close Termux
+               → CTRL+HOME (bridge) or Alt+D → menu → close Termux
 tendril ssh  → force SSH if Mosh UDP is blocked
 ```
 
-Tap ALT then D to return to the menu. If your keyboard does not send Alt+D
-correctly, use Ctrl+B then D. Detaching keeps workspaces and agents running.
-`N` creates a workspace labeled from its directory without asking for a name.
+Tap ALT then D to return to the menu (the bridge makes CTRL+HOME do the same
+on Termux). If your keyboard does not send Alt+D correctly, use Ctrl+B then
+D. Detaching keeps workspaces and agents running.
+`N` asks for an optional name and defaults to the selected workspace's
+directory — Enter accepts it, an absolute path overrides it, an empty name
+keeps the directory-based label. `S` opens a shell in that directory too.
+The `P` project picker is unchanged.
 
 ## Troubleshooting
 
@@ -101,5 +128,5 @@ correctly, use Ctrl+B then D. Detaching keeps workspaces and agents running.
 | menu says "cannot reach Herdr server" | the host Herdr server is down — start it locally (`herdr`) |
 | `Alt+←`/`→` does nothing on the phone | Termux sends arrows with an ESC prefix, which Herdr ignores by design — for tabs use `Ctrl+B` then `N`/`P`; for workspaces tap `ALT` then a digit (no prefix), or `Ctrl+B w` + digit |
 | `Alt+D` does not detach | Tap ALT then D; if the keyboard encoding or a custom binding prevents it, use Ctrl+B then D. The installer adds these bindings only when conflict-free. |
-| `Ctrl+Home` does not detach | Herdr 0.9.3 rejects this binding; use Alt+D instead. The installer only adds Ctrl+Home on versions that validate it, and retains existing Ctrl+] when migration is unsafe. |
+| `Ctrl+Home` does not detach | On Termux the TENDRIL bridge rewrites `ESC [ 1 ; 5 H` to Alt+D — check `cat -v` shows `^[[1;5H` for the combo, and that you attached from `remote-agents` (the bridge lives there). `TENDRIL_DETACH_BRIDGE=0` turns the bridge off; then use Alt+D. Herdr itself rejects `ctrl+home`, so the installer only adds it natively on versions that validate it. |
 | garbled glyphs | `pkg install font-firas-mono` or any Nerd Font, and ensure UTF-8 locale |

@@ -476,15 +476,166 @@ def load_last(rows):
     return None
 
 
+def _bridge_enabled():
+    """Ctrl+Home bridge: automatic on Termux, opt-in elsewhere.
+
+    TENDRIL_DETACH_BRIDGE=1 forces it on, =0 (or false/no/off) disables it
+    everywhere — the plain `herdr session attach` path is then byte-identical
+    to the pre-bridge behavior."""
+    raw = os.environ.get("TENDRIL_DETACH_BRIDGE")
+    if raw is not None:
+        return raw.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(os.environ.get("TERMUX_VERSION"))
+
+
 def attach(row):
     save_last(row)
     run([HERDR, "workspace", "focus", row["id"]], 6)
     if os.environ.get("HERDR_ENV") == "1":
         input(f"already inside Herdr — workspace '{row['label']}' focused. Enter...")
         return
-    print(f"{C_GRAY}attaching {row['label']} \u2014 detach: Alt+D \u00b7 Ctrl+B then D fallback - menu returns here{C_RESET}",
-          flush=True)
-    subprocess.run([HERDR, "session", "attach", SESSION], check=False)
+    if _bridge_enabled():
+        print(f"{C_GRAY}attaching {row['label']} \u2014 detach: Ctrl+Home \u00b7 Alt+D \u00b7 Ctrl+B d - menu returns here{C_RESET}",
+              flush=True)
+        _attach_session()
+    else:
+        print(f"{C_GRAY}attaching {row['label']} \u2014 detach: Alt+D \u00b7 Ctrl+B then D fallback - menu returns here{C_RESET}",
+              flush=True)
+        subprocess.run([HERDR, "session", "attach", SESSION], check=False)
+
+
+# ---------- Ctrl+Home detach bridge (optional TENDRIL convenience) ----------
+# Termux encodes Ctrl+Home as `ESC [ 1 ; 5 H` (termux-app KeyHandler.getCode +
+# transformForModifiers: KEYMOD_CTRL -> xterm modifier 5). Herdr's key grammar
+# has no Home key in any modifier combination, so `herdr session attach` runs
+# behind a transparent PTY bridge that rewrites exactly those six bytes to the
+# Alt+D detach (`ESC d`) Herdr already binds. Every other byte — including
+# plain Home (`ESC [ H`) — is forwarded unchanged. Herdr's config is untouched;
+# Alt+D and Ctrl+B d keep working, and TENDRIL_DETACH_BRIDGE=0 turns the whole
+# bridge off.
+_CTRL_HOME = b"\x1b[1;5H"
+_ALT_D = b"\x1bd"
+
+
+def _detach_translate(data):
+    """(tail, out): rewrite Ctrl+Home to the detach; hold a trailing byte
+    run that could still complete Ctrl+Home; forward all else unchanged."""
+    out = bytearray()
+    while True:
+        i = data.find(_CTRL_HOME)
+        if i < 0:
+            break
+        out += data[:i]
+        out += _ALT_D
+        data = data[i + len(_CTRL_HOME):]
+    hold = 0
+    for k in range(min(len(data), len(_CTRL_HOME) - 1), 0, -1):
+        if _CTRL_HOME.startswith(data[-k:]):
+            hold = k
+            break
+    cut = len(data) - hold
+    out += data[:cut]
+    return data[cut:], bytes(out)
+
+
+def _write_all(fd, data):
+    while data:
+        data = data[os.write(fd, data):]
+
+
+def _attach_session():
+    """Run `herdr session attach` behind the Ctrl+Home bridge (tty only)."""
+    import fcntl
+    import pty
+    import select
+    import signal
+    import termios
+    import tty
+    if not sys.stdin.isatty():    # no tty (pipes/tests): plain passthrough
+        subprocess.run([HERDR, "session", "attach", SESSION], check=False)
+        return
+    pid, master = pty.fork()
+    if pid == 0:                  # child: Herdr owns the bridge pty
+        try:
+            os.execvp(HERDR, [HERDR, "session", "attach", SESSION])
+        finally:
+            os._exit(127)
+    fd = sys.stdin.fileno()
+    out_fd = sys.stdout.fileno()
+    old = termios.tcgetattr(fd)
+
+    def resize(*_):
+        try:
+            ws = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
+            fcntl.ioctl(master, termios.TIOCSWINSZ, ws)
+        except OSError:
+            pass
+
+    def _stop(*_):                # TERM/HUP: exit through finally (restore tty)
+        sys.exit(1)
+
+    old_winch = signal.signal(signal.SIGWINCH, resize)
+    old_term = signal.signal(signal.SIGTERM, _stop)
+    old_hup = signal.signal(signal.SIGHUP, _stop)
+    resize()
+    tty.setraw(fd)
+    tail = b""
+    reaped = False
+    try:
+        while True:
+            r, _, _ = select.select([fd, master], [], [], 1.0)
+            if not r and tail:    # a cancelled combo must not hold bytes forever
+                _write_all(master, tail)
+                tail = b""
+            if fd in r:
+                data = os.read(fd, 4096)
+                if not data:
+                    break
+                tail, out = _detach_translate(tail + data)
+                if out:
+                    _write_all(master, out)
+            if master in r:
+                try:
+                    data = os.read(master, 4096)
+                except OSError:   # EIO: child exited
+                    break
+                if not data:
+                    break
+                _write_all(out_fd, data)
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            if done == pid:
+                reaped = True
+                break
+    finally:
+        if tail:                      # flush a held partial sequence
+            try:
+                _write_all(master, tail)
+            except OSError:
+                pass
+        signal.signal(signal.SIGWINCH, old_winch)
+        signal.signal(signal.SIGTERM, old_term)
+        signal.signal(signal.SIGHUP, old_hup)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        try:                          # drain Herdr's last output
+            while True:
+                r, _, _ = select.select([master], [], [], 0.2)
+                if not r:
+                    break
+                data = os.read(master, 4096)
+                if not data:
+                    break
+                _write_all(out_fd, data)
+        except OSError:
+            pass
+        try:
+            os.close(master)
+        except OSError:
+            pass
+        if not reaped:
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
 
 
 def ws_create(cwd, label=None, focus=True):
@@ -574,20 +725,51 @@ def agent_name_for_workspace(label, cwd, unique_key=None):
     return name[:32].rstrip("-_") or "workspace"
 
 
-def new_workspace():
-    d = ask_dir()
-    if not d:
-        print(f"{C_RED}cancelled{C_RESET}")
-        return None
+def current_ws_dir(rows, selected=None):
+    """Usable create-default cwd: the selected workspace's path, else the
+    focused one. None when neither has a directory that still exists."""
+    order = []
+    if selected is not None and 0 <= selected < len(rows):
+        order.append(rows[selected])
+    for r in rows:
+        if r.get("focused") and r not in order:
+            order.append(r)
+    for r in order:
+        path = r.get("path")
+        if path and os.path.isdir(path):
+            return path
+    return None
+
+
+def new_workspace(rows=None, selected=None):
+    if rows is None:
+        rows = collect() or []
+    name = input("name> ").strip()
+    d = current_ws_dir(rows, selected)
+    if d:
+        raw = input(f"dir> [Enter = {short_path(d)}] ").strip()
+        if raw:
+            cand = os.path.expanduser(raw)
+            if not cand.startswith("/") or not os.path.isdir(cand):
+                print(f"{C_RED}no such directory: {cand}{C_RESET}")
+                return None
+            d = cand
+    else:
+        d = ask_dir()
+        if not d:
+            print(f"{C_RED}cancelled{C_RESET}")
+            return None
     kind = ask_agent()
     if kind is None:
         print(f"{C_RED}cancelled{C_RESET}")
         return None
-    if not confirm(f"create workspace @ {short_path(d)} + {kind}?"):
+    disp = name or os.path.basename(d.rstrip("/")) + " (auto)"
+    if not confirm(f"create '{disp}' @ {short_path(d)} + {kind}?"):
         return None
-    # The installed CLI documents --label as optional but does not promise its
-    # default; derive the initial-tab cwd label explicitly rather than guess.
-    label = _created_workspace_label({}, d)
+    # An explicit name is used verbatim; an empty name falls back to the
+    # derived cwd label (the installed CLI does not promise a label default,
+    # so the initial-tab label is computed here rather than trusted).
+    label = name or _created_workspace_label({}, d)
     data, err = ws_create(d, label)
     if data is None:
         print(f"{C_RED}{err}{C_RESET}")
@@ -619,9 +801,12 @@ def new_workspace():
     return wid
 
 
-def quick_shell():
+def quick_shell(rows=None, selected=None):
+    if rows is None:
+        rows = collect() or []
+    d = current_ws_dir(rows, selected) or os.path.expanduser("~")
     name = "shell-" + time.strftime("%H%M%S")
-    data, err = ws_create(os.path.expanduser("~"), name)
+    data, err = ws_create(d, name)
     if data is None:
         print(f"{C_RED}{err}{C_RESET}")
         return None
@@ -851,6 +1036,7 @@ def help_screen():
         ("Alt+\u2191/\u2193", "prev / next workspace (desktop)"),
         ("Alt+D", "detach to REMOTE AGENTS"),
         ("Ctrl+B d", "detach (fallback)"),
+        ("Ctrl+Home", "detach (TENDRIL bridge; Termux default)"),
         ("Alt+Enter", "split pane horizontal"),
         ("Alt+Shift+Enter", "split pane vertical"),
         ("Alt+Esc", "close pane"),
@@ -881,6 +1067,9 @@ def help_screen():
                  "phones: Ctrl+B chords, ALT+digit.",
                  "Phone: tap ALT then D to detach.",
                  "Fallback: Ctrl+B then D.",
+                 "Ctrl+Home: TENDRIL bridges it; no",
+                 "Herdr config change. Set",
+                 "TENDRIL_DETACH_BRIDGE=0 to disable.",
                  "Detach keeps workspaces and agents."):
         nfit = fit(note, inner - 2)
         out.append(f"{C_LIME}\u2502{C_RESET} {C_GRAY}{nfit}{C_RESET}"
@@ -988,11 +1177,11 @@ def menu_loop(rows, tty_mode=False, fd=None):
         elif raw in ("r", "R"):
             pass
         elif raw in ("n", "N"):
-            preferred_id = new_workspace() or preferred_id
+            preferred_id = new_workspace(rows, selected) or preferred_id
         elif raw in ("p", "P"):
             preferred_id = project_launcher() or preferred_id
         elif raw in ("s", "S"):
-            preferred_id = quick_shell() or preferred_id
+            preferred_id = quick_shell(rows, selected) or preferred_id
         elif raw in ("i", "I"):
             info()
         elif raw == "?":

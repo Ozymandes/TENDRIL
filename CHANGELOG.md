@@ -4,6 +4,23 @@ All notable changes to TENDRIL are documented here.
 
 ## Unreleased
 
+- Ctrl+Home detaches on Termux without any Herdr config change: when attached
+  from `remote-agents` on Termux (auto; `TENDRIL_DETACH_BRIDGE=1` to force,
+  `=0` to disable), `herdr session attach` runs behind a transparent PTY
+  bridge that rewrites exactly Termux's `ESC [ 1 ; 5 H` to the Alt+D detach
+  Herdr already binds. Every other byte is forwarded unchanged — plain HOME
+  (`ESC [ H`), Ctrl+], Alt+D, mouse, paste, resize (SIGWINCH is propagated),
+  EOF, and the child's exit are all preserved; termios is restored on every
+  exit path including SIGTERM/SIGHUP. Alt+D / Ctrl+B d remain the documented,
+  always-working detach keys; the bridge only adds a key Herdr cannot natively
+  express (0.9.3 rejects `ctrl+home`).
+- `N` (new workspace) and `S` (quick shell) now default to the selected or
+  focused workspace's directory: Enter accepts it, an explicit absolute path
+  overrides it, and the full directory menu only appears when no usable
+  directory exists. An explicit name is used verbatim; an empty name keeps
+  the derived directory label (the CLI does not promise a label default).
+  The `P` project flow is unchanged.
+
 - The selector supports ↑/↓ highlighting and Enter-to-attach while preserving
   numeric and command-letter input; raw TTY mode restores terminal settings on
   every exit path.
