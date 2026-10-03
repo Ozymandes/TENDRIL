@@ -430,14 +430,16 @@ def attach(row):
     if os.environ.get("HERDR_ENV") == "1":
         input(f"already inside Herdr — workspace '{row['label']}' focused. Enter...")
         return
-    print(f"{C_GRAY}attaching {row['label']} \u2014 detach: Ctrl+] (Termux-safe) \u00b7 Alt+D desktop - menu returns here{C_RESET}",
+    print(f"{C_GRAY}attaching {row['label']} \u2014 detach: Ctrl+Esc (Termux) \u00b7 Ctrl+] legacy \u00b7 Alt+D desktop - menu returns here{C_RESET}",
           flush=True)
     subprocess.run([HERDR, "session", "attach", SESSION], check=False)
 
 
-def ws_create(cwd, label, focus=True):
-    args = [HERDR, "workspace", "create", "--cwd", cwd, "--label", label,
-            "--focus" if focus else "--no-focus"]
+def ws_create(cwd, label=None, focus=True):
+    args = [HERDR, "workspace", "create", "--cwd", cwd]
+    if label:
+        args += ["--label", label]
+    args.append("--focus" if focus else "--no-focus")
     rc, out, err = run(args, 12)
     if rc != 0:
         return None, (err or out or "create failed")
@@ -496,19 +498,40 @@ def confirm(text):
     return ans != "n"
 
 
-def new_workspace():
+def current_ws_dir(rows):
+    """Directory of the focused workspace, if usable as a create default."""
+    for r in rows:
+        if r["focused"] and r["path"] and os.path.isdir(r["path"]):
+            return r["path"]
+    return None
+
+
+def new_workspace(rows=None):
+    if rows is None:
+        rows = collect() or []
+    d = current_ws_dir(rows)
     name = input("name> ").strip()
-    d = ask_dir()
-    if not (name and d):
-        print(f"{C_RED}cancelled{C_RESET}")
-        return
+    if d:
+        raw = input(f"dir> [Enter = {short_path(d)}] ").strip()
+        if raw:
+            cand = os.path.expanduser(raw)
+            if not cand.startswith("/") or not os.path.isdir(cand):
+                print(f"{C_RED}no such directory: {cand}{C_RESET}")
+                return
+            d = cand
+    else:
+        d = ask_dir()
+        if not d:
+            print(f"{C_RED}cancelled{C_RESET}")
+            return
     kind = ask_agent()
     if kind is None:
         print(f"{C_RED}cancelled{C_RESET}")
         return
-    if not confirm(f"create '{name}' @ {short_path(d)} + {kind}?"):
+    disp = name or (os.path.basename(d.rstrip("/")) + " (auto)")
+    if not confirm(f"create '{disp}' @ {short_path(d)} + {kind}?"):
         return
-    data, err = ws_create(d, name)
+    data, err = ws_create(d, name or None)
     if data is None:
         print(f"{C_RED}{err}{C_RESET}")
         return
@@ -524,7 +547,8 @@ def new_workspace():
         if not pane:
             print(f"{C_RED}could not locate new pane; start {kind} manually{C_RESET}")
             return
-        ok, msg = start_agent(name, kind, pane)
+        ok, msg = start_agent(name or os.path.basename(d.rstrip("/")) or "ws",
+                              kind, pane)
         if not ok:
             print(f"{C_RED}agent start: {trunc(msg.strip() or 'failed', 60)}{C_RESET}")
             return
@@ -536,9 +560,12 @@ def new_workspace():
     print(f"{C_GRAY}workspace created; it will appear in the menu{C_RESET}")
 
 
-def quick_shell():
+def quick_shell(rows=None):
+    if rows is None:
+        rows = collect() or []
+    cwd = current_ws_dir(rows) or os.path.expanduser("~")
     name = "shell-" + time.strftime("%H%M%S")
-    data, err = ws_create(os.path.expanduser("~"), name)
+    data, err = ws_create(cwd, name)
     if data is None:
         print(f"{C_RED}{err}{C_RESET}")
         return
@@ -647,7 +674,8 @@ def help_screen():
         ("Alt+\u2190/\u2192", "prev / next tab"),
         ("Alt+1..9", "jump directly to tab"),
         ("Alt+\u2191/\u2193", "prev / next workspace"),
-        ("Ctrl+]", "detach to REMOTE AGENTS"),
+        ("Ctrl+Esc", "detach to REMOTE AGENTS"),
+        ("Ctrl+]", "detach (legacy, one byte)"),
         ("Alt+D", "detach (desktop alternative)"),
         ("Alt+Enter", "split pane horizontal"),
         ("Alt+Shift+Enter", "split pane vertical"),
@@ -676,7 +704,7 @@ def help_screen():
     out.append(f"{C_LIME}\u251c{line(inner)}\u2524{C_RESET}")
     for note in ("Prefix = Ctrl+Space",
                  "Alt needs an unsplit ESC byte;",
-                 "Ctrl+] is one byte - Termux-safe.",
+                 "Ctrl+Esc avoids the ] symbol layer.",
                  "Detach keeps workspaces, panes,",
                  "and agents running."):
         nfit = fit(note, inner - 2)
@@ -765,11 +793,11 @@ def main():
         elif raw in ("r", "R"):
             pass
         elif raw in ("n", "N"):
-            new_workspace()
+            new_workspace(rows)
         elif raw in ("p", "P"):
             project_launcher()
         elif raw in ("s", "S"):
-            quick_shell()
+            quick_shell(rows)
         elif raw in ("i", "I"):
             info()
         elif raw == "?":

@@ -83,7 +83,8 @@ host's `~/.config/remote-agents/notify.env`. Test from the console with `T`.
 ## Daily use
 
 ```
-tendril      → workspace menu → number → work → Ctrl+] → menu → close Termux
+tendril      → workspace menu → number → work → Ctrl+Esc → menu → close Termux
+             (Ctrl+] still works as the legacy single-byte detach)
 tendril ssh  → force SSH if Mosh UDP is blocked
 ```
 
