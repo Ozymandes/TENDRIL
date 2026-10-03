@@ -83,9 +83,14 @@ host's `~/.config/remote-agents/notify.env`. Test from the console with `T`.
 ## Daily use
 
 ```
-tendril      → workspace menu → number → work → Ctrl+] → menu → close Termux
+tendril      → workspace menu → ↑/↓ or number + Enter → work
+               → Alt+D → menu → close Termux
 tendril ssh  → force SSH if Mosh UDP is blocked
 ```
+
+Tap ALT then D to return to the menu. If your keyboard does not send Alt+D
+correctly, use Ctrl+B then D. Detaching keeps workspaces and agents running.
+`N` creates a workspace labeled from its directory without asking for a name.
 
 ## Troubleshooting
 
@@ -95,4 +100,6 @@ tendril ssh  → force SSH if Mosh UDP is blocked
 | mosh connects then dies instantly | host firewall may block UDP 60000-61000 on `tailscale0`; use `tendril ssh` meanwhile |
 | menu says "cannot reach Herdr server" | the host Herdr server is down — start it locally (`herdr`) |
 | `Alt+←`/`→` does nothing on the phone | Termux sends arrows with an ESC prefix, which Herdr ignores by design — for tabs use `Ctrl+B` then `N`/`P`; for workspaces tap `ALT` then a digit (no prefix), or `Ctrl+B w` + digit |
+| `Alt+D` does not detach | Tap ALT then D; if the keyboard encoding or a custom binding prevents it, use Ctrl+B then D. The installer adds these bindings only when conflict-free. |
+| `Ctrl+Home` does not detach | Herdr 0.9.3 rejects this binding; use Alt+D instead. The installer only adds Ctrl+Home on versions that validate it, and retains existing Ctrl+] when migration is unsafe. |
 | garbled glyphs | `pkg install font-firas-mono` or any Nerd Font, and ensure UTF-8 locale |

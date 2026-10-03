@@ -205,65 +205,70 @@ say ""
 
 # ---------------- 6. herdr keybindings (detach + switching) ----------------
 say "6) Herdr keybindings"
-say "     Ctrl+]        recommended Android/Termux detach (single byte, never split)"
-say "     Alt+D         desktop-friendly alternative"
+say "     Alt+D         recommended detach (phone: tap ALT then D)"
+say "     Ctrl+Home     optional detach (only when this Herdr CLI validates it)"
 say "     Prefix+D      universal fallback (prefix is Ctrl+B by default)"
 say "     Ctrl+B 1..9   jump to workspace (needs the switching bindings below)"
 say "     Alt+1..9      jump to workspace, no prefix (Termux: tap ALT then digit)"
 say "     Ctrl+B n / p  next / previous tab (phone-safe)"
 say "     Alt+←/→       next / previous tab (desktop modifier encoding)"
 HERDR_CONF="$HOME/.config/herdr/config.toml"
+DETACH_HELPER="$PKG_DIR/bin/herdr-bindings.py"
 
-# plan|apply the merged detach set without disturbing any other binding
+# Ask the installed client to parse Ctrl+Home in an isolated config. This
+# catches versions that do not know that key name without touching live config.
+CTRL_HOME_SUPPORTED=0
+if python3 "$DETACH_HELPER" supports "$HERDR_BIN" ctrl+home; then
+    CTRL_HOME_SUPPORTED=1
+    say "  Ctrl+Home key syntax verified by $HERDR_BIN config check"
+else
+    say "  note: $HERDR_BIN config check rejects ctrl+home; keeping legacy ctrl+] only when already configured"
+    say "        Alt+D and Prefix+D remain when conflict-free; use Alt+D on the phone"
+fi
+
+# plan|apply the managed detach set without disturbing unrelated bindings
 herdr_detach() {
-    python3 - "$HERDR_CONF" "$1" <<'PYEOF'
-import re, sys
-path, mode = sys.argv[1], sys.argv[2]
-text = open(path).read()
-WANT = ["prefix+d", "alt+d", "ctrl+]"]
-m = re.search(r'^([ \t]*)detach[ \t]*=[ \t]*(.+?)[ \t]*$', text, re.M)
-existing = re.findall(r'"([^"]+)"', m.group(2)) if m else []
-# only claim ctrl+] if no OTHER action already uses it
-conflicts = []
-for line in text.splitlines():
-    s = line.strip()
-    if s.startswith("#") or "=" not in s:
-        continue
-    k, v = s.split("=", 1)
-    if k.strip() != "detach" and "ctrl+]" in v:
-        conflicts.append(k.strip())
-merged, added = list(existing), []
-for w in WANT:
-    if w == "ctrl+]" and conflicts:
-        continue
-    if w not in merged:
-        merged.append(w)
-        added.append(w)
-newline = "detach = [" + ", ".join('"%s"' % e for e in merged) + "]"
-if mode == "plan":
-    print("CONFLICT=" + ",".join(conflicts))
-    print("EXISTING=" + ",".join(existing))
-    print("ADDED=" + ",".join(added))
-    print("LINE=" + newline)
-else:
-    if m:
-        text = text[:m.start()] + m.group(1) + newline + text[m.end():]
-    elif re.search(r'^\[keys\]', text, re.M):
-        text = re.sub(r'^\[keys\][ \t]*$', lambda _: "[keys]\n" + newline,
-                      text, count=1, flags=re.M)
-    else:
-        text += "\n[keys]\n" + newline + "\n"
-    open(path, "w").write(text)
-PYEOF
+    python3 "$DETACH_HELPER" "$1" "$HERDR_CONF" "$CTRL_HOME_SUPPORTED"
+}
+
+herdr_backup_config() {
+    [ "$DRY_RUN" = "1" ] && return 0
+    if [ -f "$HERDR_CONF" ]; then
+        backup "$HERDR_CONF"
+        ls -t "$HERDR_CONF".bak.* 2>/dev/null | head -1
+    fi
+}
+
+herdr_restore_config() {
+    if [ -n "$1" ]; then
+        cp -p "$1" "$HERDR_CONF"
+    else
+        rm -f "$HERDR_CONF"
+    fi
 }
 
 # plan|apply the workspace/tab switching bindings without disturbing anything else.
 # Requires herdr >= 0.9.3 (0.9.1 ignores switch_workspace and alt-indexed keys).
 herdr_switch() {
     python3 - "$HERDR_CONF" "$1" <<'PYEOF'
-import re, sys
+import os, re, sys
 path, mode = sys.argv[1], sys.argv[2]
-text = open(path).read()
+try:
+    with open(path) as config:
+        text = config.read()
+except FileNotFoundError:
+    text = ""
+
+
+def write_config(contents):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    if os.path.exists(path):
+        with open(path, "w") as config:
+            config.write(contents)
+    else:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w") as config:
+            config.write(contents)
 
 def section_span(t, name):
     m = re.search(r'^\[' + re.escape(name) + r'\][ \t]*$', t, re.M)
@@ -290,6 +295,8 @@ def chord_free(c, key):
 def insert_line(t, sec, line):
     span = section_span(t, sec)
     if span is None:
+        if not t:
+            return "[" + sec + "]" + chr(10) + line + chr(10)
         if t and not t.endswith("\n"):
             t += "\n"
         return t + "\n[" + sec + "]\n" + line + "\n"
@@ -345,27 +352,27 @@ if mode == "plan":
     print("ADDED=" + ",".join(added))
 else:
     if added:
-        open(path, "w").write(text)
+        write_config(text)
 PYEOF
 }
 
 if [ ! -f "$HERDR_CONF" ]; then
-    say "  no $HERDR_CONF found - skipped"
-else
-    PLAN=$(herdr_detach plan)
+    say "  no $HERDR_CONF yet; a minimal config will be proposed without replacing Herdr defaults"
+fi
+PLAN=$(herdr_detach plan)
     CONFLICT=$(printf '%s\n' "$PLAN" | sed -n 's/^CONFLICT=//p')
     ADDED=$(printf '%s\n' "$PLAN" | sed -n 's/^ADDED=//p')
+    REMOVED=$(printf '%s\n' "$PLAN" | sed -n 's/^REMOVED=//p')
     LINE=$(printf '%s\n' "$PLAN" | sed -n 's/^LINE=//p')
-    [ -n "$CONFLICT" ] && say "  note: ctrl+] already bound to '$CONFLICT' - leaving it untouched"
-    if [ -z "$ADDED" ]; then
+    [ -n "$CONFLICT" ] && say "  note: chord conflict(s) ($CONFLICT) - conflicting bindings are left untouched"
+    if [ -z "$ADDED" ] && [ -z "$REMOVED" ]; then
         say "  detach bindings already complete - nothing to do"
     else
-        say "  proposed change in $HERDR_CONF (adds: $ADDED):"
+        say "  proposed change in $HERDR_CONF (adds: ${ADDED:-none}; removes: ${REMOVED:-none}):"
         say "      $LINE"
         say "  every other binding in your config is left exactly as it is."
         if confirm "Apply this keybinding change?"; then
-            backup "$HERDR_CONF"
-            BAK=$(ls -t "$HERDR_CONF".bak.* 2>/dev/null | head -1)
+            BAK=$(herdr_backup_config)
             if [ "$DRY_RUN" = "1" ]; then
                 say "  [dry-run] write the line above; then herdr config check + reload-config"
             else
@@ -374,8 +381,8 @@ else
                     "$HERDR_BIN" server reload-config >/dev/null 2>&1 \
                         && say "  applied + reloaded live (no server restart)"
                 else
-                    say "  config check FAILED - restoring backup"
-                    cp -p "$BAK" "$HERDR_CONF"
+                    say "  config check FAILED - restoring previous config"
+                    herdr_restore_config "$BAK"
                     "$HERDR_BIN" server reload-config >/dev/null 2>&1
                 fi
             fi
@@ -391,8 +398,7 @@ else
         say "  proposed switching bindings (adds: $ADDED):"
         say "  every existing binding is left exactly as it is."
         if confirm "Apply these switching bindings?"; then
-            backup "$HERDR_CONF"
-            BAK=$(ls -t "$HERDR_CONF".bak.* 2>/dev/null | head -1)
+            BAK=$(herdr_backup_config)
             if [ "$DRY_RUN" = "1" ]; then
                 say "  [dry-run] write the keys above; then herdr config check + reload-config"
             else
@@ -401,8 +407,8 @@ else
                     "$HERDR_BIN" server reload-config >/dev/null 2>&1 \
                         && say "  applied + reloaded live (no server restart)"
                 else
-                    say "  config check FAILED - restoring backup"
-                    cp -p "$BAK" "$HERDR_CONF"
+                    say "  config check FAILED - restoring previous config"
+                    herdr_restore_config "$BAK"
                     "$HERDR_BIN" server reload-config >/dev/null 2>&1
                 fi
             fi
@@ -410,7 +416,6 @@ else
             say "  skipped - your switching bindings are unchanged"
         fi
     fi
-fi
 say ""
 
 # ---------------- 7. personalized Android setup ----------------

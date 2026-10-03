@@ -23,8 +23,17 @@ Android Termux                            Linux + systemd (user)
   Emergent-Abyss palette: lime frame, teal working dot, lime blocked/done,
   gray idle.
 - Attach = `herdr workspace focus <id>` + `herdr session attach`; when the
-  client exits (detach `Ctrl+]` / `Alt+D`, lost connection, closed terminal) the menu
-  redraws. Panes survive everything short of `herdr server stop`.
+  client exits (detach `Alt+D`, fallback Ctrl+B then D, lost connection,
+  closed terminal) the menu redraws. Panes survive everything short of
+  `herdr server stop`. The installer adds only conflict-free bindings;
+  Ctrl+Home is optional on clients that validate it (not Herdr 0.9.3).
+- The selector reads TTY keys in raw mode with guaranteed terminal restoration,
+  decodes CSI and SS3 arrows for selection, and restores the chosen workspace
+  across refreshes and attach returns. Non-TTY input keeps its line-based menu.
+- New-workspace creation derives its label from the selected initial-tab cwd
+  (the directory basename), because the installed CLI documents `--label` as
+  optional but does not specify an automatic label default. The label is also
+  sanitized into a valid agent name when starting an agent.
 - New workspace (`N`) / project launcher (`P`) / quick shell (`S`) create
   workspaces via the socket API, start agents with `herdr agent start`
   (waits for `interactive_ready`), then attach.

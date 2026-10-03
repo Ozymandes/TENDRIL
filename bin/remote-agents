@@ -4,13 +4,17 @@
 One call to `herdr api snapshot` powers the whole menu. No config files,
 no daemon, no tmux. Built for narrow Android screens (Termux + Mosh/SSH).
 """
+import contextlib
+import hashlib
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 
 # ---------- portable configuration ----------
 CONFIG_SEARCH = [
@@ -345,7 +349,7 @@ def chip_parts(row, max_plain=40):
     return plain.rstrip(), colored.rstrip()
 
 
-def render(rows, note=""):
+def render(rows, note="", selected=None):
     w = box_width()
     inner = w - 2
 
@@ -413,13 +417,24 @@ def render(rows, note=""):
     for i, r in enumerate(rows):
         budget = inner - 6
         lbl_plain = fit(r["label"] + (" *" if r["focused"] else ""), budget - 9)
-        head_plain = f"{i + 1:>2}  {lbl_plain}"
+        is_selected = selected == i
+        if is_selected:
+            head_plain = f">{i + 1:>2} {lbl_plain}"
+            head_col = f"{C_WHITE}>{i + 1:>2}{C_RESET} {C_WHITE}{lbl_plain}{C_RESET}"
+        else:
+            head_plain = f"{i + 1:>2}  {lbl_plain}"
+            head_col = f"{C_WHITE}{i + 1:>2}{C_RESET}  {C_LIME}{lbl_plain}{C_RESET}"
         chip_plain, chip_col = chip_parts(r, budget - len(head_plain) - 1)
         while len(lbl_plain) + 1 + len(chip_plain) > budget and len(lbl_plain) > 4:
             lbl_plain = fit(lbl_plain, len(lbl_plain) - 2)
-            chip_plain, chip_col = chip_parts(r, budget - len(lbl_plain) - 1)
+            if is_selected:
+                head_plain = f">{i + 1:>2} {lbl_plain}"
+                head_col = f"{C_WHITE}>{i + 1:>2}{C_RESET} {C_WHITE}{lbl_plain}{C_RESET}"
+            else:
+                head_plain = f"{i + 1:>2}  {lbl_plain}"
+                head_col = f"{C_WHITE}{i + 1:>2}{C_RESET}  {C_LIME}{lbl_plain}{C_RESET}"
+            chip_plain, chip_col = chip_parts(r, budget - len(head_plain) - 1)
         gap = max(1, inner - 2 - len(head_plain) - len(chip_plain))
-        head_col = f"{C_WHITE}{i + 1:>2}{C_RESET}  {C_LIME}{lbl_plain}{C_RESET}"
         lines.append(f"{C_LIME}\u2502{C_RESET} "
                      + head_col + " " * gap + chip_col
                      + f" {C_LIME}\u2502{C_RESET}")
@@ -467,14 +482,16 @@ def attach(row):
     if os.environ.get("HERDR_ENV") == "1":
         input(f"already inside Herdr — workspace '{row['label']}' focused. Enter...")
         return
-    print(f"{C_GRAY}attaching {row['label']} \u2014 detach: Ctrl+] (Termux-safe) \u00b7 Alt+D desktop - menu returns here{C_RESET}",
+    print(f"{C_GRAY}attaching {row['label']} \u2014 detach: Alt+D \u00b7 Ctrl+B then D fallback - menu returns here{C_RESET}",
           flush=True)
     subprocess.run([HERDR, "session", "attach", SESSION], check=False)
 
 
-def ws_create(cwd, label, focus=True):
-    args = [HERDR, "workspace", "create", "--cwd", cwd, "--label", label,
-            "--focus" if focus else "--no-focus"]
+def ws_create(cwd, label=None, focus=True):
+    args = [HERDR, "workspace", "create", "--cwd", cwd]
+    if label is not None:
+        args.extend(["--label", label])
+    args.append("--focus" if focus else "--no-focus")
     rc, out, err = run(args, 12)
     if rc != 0:
         return None, (err or out or "create failed")
@@ -533,22 +550,48 @@ def confirm(text):
     return ans != "n"
 
 
+def _created_workspace_label(data, cwd):
+    result = data.get("result", data) if isinstance(data, dict) else {}
+    workspace = result.get("workspace", {}) if isinstance(result, dict) else {}
+    label = workspace.get("label") if isinstance(workspace, dict) else None
+    if label:
+        return str(label)
+    return os.path.basename(os.path.normpath(cwd)) or "workspace"
+
+
+def agent_name_for_workspace(label, cwd, unique_key=None):
+    """Make a valid, workspace-unique Herdr agent name from its label."""
+    source = label or os.path.basename(os.path.normpath(cwd)) or "workspace"
+    ascii_name = unicodedata.normalize("NFKD", source).encode("ascii", "ignore").decode()
+    name = re.sub(r"[^a-zA-Z0-9_-]+", "-", ascii_name).strip("-_").lower()
+    if not name:
+        name = "workspace"
+    if not name[0].isalpha():
+        name = "workspace-" + name
+    if unique_key is not None:
+        suffix = hashlib.sha256(str(unique_key).encode("utf-8")).hexdigest()[:12]
+        name = (name[:19].rstrip("-_") or "workspace") + "-" + suffix
+    return name[:32].rstrip("-_") or "workspace"
+
+
 def new_workspace():
-    name = input("name> ").strip()
     d = ask_dir()
-    if not (name and d):
+    if not d:
         print(f"{C_RED}cancelled{C_RESET}")
-        return
+        return None
     kind = ask_agent()
     if kind is None:
         print(f"{C_RED}cancelled{C_RESET}")
-        return
-    if not confirm(f"create '{name}' @ {short_path(d)} + {kind}?"):
-        return
-    data, err = ws_create(d, name)
+        return None
+    if not confirm(f"create workspace @ {short_path(d)} + {kind}?"):
+        return None
+    # The installed CLI documents --label as optional but does not promise its
+    # default; derive the initial-tab cwd label explicitly rather than guess.
+    label = _created_workspace_label({}, d)
+    data, err = ws_create(d, label)
     if data is None:
         print(f"{C_RED}{err}{C_RESET}")
-        return
+        return None
     wid = find_key(data, "workspace_id")
     pane = find_key(data, "pane_id")
     if kind != "shell":
@@ -560,17 +603,20 @@ def new_workspace():
                     break
         if not pane:
             print(f"{C_RED}could not locate new pane; start {kind} manually{C_RESET}")
-            return
+            return None
+        name = agent_name_for_workspace(
+            _created_workspace_label(data, d) or label, d, wid or pane)
         ok, msg = start_agent(name, kind, pane)
         if not ok:
             print(f"{C_RED}agent start: {trunc(msg.strip() or 'failed', 60)}{C_RESET}")
-            return
+            return None
     rows = collect() or []
     for r in rows:
         if r["id"] == wid:
             attach(r)
-            return
+            return wid
     print(f"{C_GRAY}workspace created; it will appear in the menu{C_RESET}")
+    return wid
 
 
 def quick_shell():
@@ -578,13 +624,14 @@ def quick_shell():
     data, err = ws_create(os.path.expanduser("~"), name)
     if data is None:
         print(f"{C_RED}{err}{C_RESET}")
-        return
+        return None
     wid = find_key(data, "workspace_id")
     for r in (collect() or []):
         if r["id"] == wid:
             attach(r)
-            return
+            return wid
     print(f"{C_GRAY}shell workspace created{C_RESET}")
+    return wid
 
 
 def project_launcher():
@@ -625,7 +672,7 @@ def project_launcher():
                 or r["path"].rstrip("/").startswith(p + "/"):
             print(f"{C_GRAY}matching workspace exists \u2014 attaching{C_RESET}")
             attach(r)
-            return
+            return r["id"]
     kind = ask_agent()
     if kind is None:
         return
@@ -646,30 +693,145 @@ def project_launcher():
                     break
         if not pane:
             print(f"{C_RED}could not locate new pane; start {kind} manually{C_RESET}")
-            return
-        ok, msg = start_agent(n, kind, pane)
+            return None
+        ok, msg = start_agent(agent_name_for_workspace(n, p, wid or pane),
+                              kind, pane)
         if not ok:
             print(f"{C_RED}agent start: {trunc(msg.strip() or 'failed', 60)}{C_RESET}")
-            return
+            return None
     for r in (collect() or []):
         if r["id"] == wid:
             attach(r)
-            return
+            return wid
+    return wid
 
 
-def _read_key():
-    """One raw keypress on a tty; line fallback otherwise."""
-    if sys.stdin.isatty():
-        import termios
-        import tty
-        fd = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
+@contextlib.contextmanager
+def raw_terminal(fd):
+    """Put a terminal into raw mode and always restore its exact settings."""
+    import termios
+    import tty
+
+    original = termios.tcgetattr(fd)
+    try:
+        tty.setraw(fd, termios.TCSANOW)
+        yield
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, original)
+
+
+def _read_byte(fd, timeout=None):
+    if timeout is not None:
         try:
-            tty.setraw(fd)
-            return sys.stdin.read(1)
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-    return input()
+            ready, _, _ = select.select([fd], [], [], timeout)
+        except InterruptedError:
+            return b""
+        if not ready:
+            return b""
+    try:
+        return os.read(fd, 1)
+    except OSError:
+        return b""
+
+
+def read_key(fd, escape_timeout=0.2):
+    """Read one key, decoding CSI/SS3 arrows without blocking on bare Escape."""
+    first = _read_byte(fd)
+    if not first:
+        return None
+    if first == bytes([27]):
+        introducer = _read_byte(fd, escape_timeout)
+        if not introducer:
+            return "escape"
+        if introducer not in (b"[", b"O"):
+            return "escape"
+        for _ in range(16):
+            byte = _read_byte(fd, escape_timeout)
+            if not byte:
+                return "escape"
+            if 0x40 <= byte[0] <= 0x7e:
+                final = chr(byte[0])
+                return {"A": "up", "B": "down", "C": "right",
+                        "D": "left"}.get(final, "escape")
+        return "escape"
+    if first in (bytes([13]), bytes([10])):
+        return "enter"
+    if first in (bytes([127]), bytes([8])):
+        return "backspace"
+    if first == bytes([3]):
+        raise KeyboardInterrupt
+    if first == bytes([4]):
+        return None
+    try:
+        return first.decode("ascii")
+    except UnicodeDecodeError:
+        return "unknown"
+
+
+def read_menu_action(tty_mode, fd=None):
+    """Return (kind, value); non-TTY users retain the original line prompt."""
+    if not tty_mode:
+        return "line", input("> ").strip()
+    with raw_terminal(fd):
+        return _read_tty_action(fd)
+
+
+def _read_tty_action(fd):
+    prompt = "↑/↓ select · Enter attach · number / command> "
+    sys.stdout.write(C_GRAY + chr(10) + prompt + C_RESET)
+    sys.stdout.flush()
+    text = ""
+    while True:
+        key = read_key(fd)
+        if key is None:
+            return "eof", ""
+        if key in ("up", "down"):
+            return "navigate", key
+        if key == "enter":
+            return ("line", text.strip()) if text.strip() else ("enter", "")
+        if key == "backspace":
+            if text:
+                text = text[:-1]
+                sys.stdout.write(chr(13) + C_GRAY + prompt + text + chr(27) + "[K" + C_RESET)
+                sys.stdout.flush()
+            continue
+        if isinstance(key, str) and len(key) == 1 and key.isprintable():
+            text += key
+            sys.stdout.write(key)
+            sys.stdout.flush()
+
+
+def selection_index(rows, preferred_id=None, previous_index=None):
+    """Keep the selected workspace stable; fall back to focus, then row position."""
+    if not rows:
+        return None
+    if preferred_id is not None:
+        for index, row in enumerate(rows):
+            if row.get("id") == preferred_id:
+                return index
+    for index, row in enumerate(rows):
+        if row.get("focused"):
+            return index
+    if previous_index is not None:
+        return max(0, min(previous_index, len(rows) - 1))
+    return 0
+
+
+def move_selection(rows, selected, delta):
+    if not rows:
+        return None
+    if selected is None:
+        return selection_index(rows)
+    return max(0, min(selected + delta, len(rows) - 1))
+
+
+def wait_for_key():
+    if not sys.stdin.isatty():
+        input()
+        return
+    fd = sys.stdin.fileno()
+    with raw_terminal(fd):
+        read_key(fd)
 
 
 def help_screen():
@@ -687,8 +849,8 @@ def help_screen():
         ("Ctrl+B n/p", "next / previous tab (phone-safe)"),
         ("Alt+\u2190/\u2192", "prev / next tab (desktop encoding)"),
         ("Alt+\u2191/\u2193", "prev / next workspace (desktop)"),
-        ("Ctrl+]", "detach to REMOTE AGENTS"),
-        ("Alt+D", "detach (desktop alternative)"),
+        ("Alt+D", "detach to REMOTE AGENTS"),
+        ("Ctrl+B d", "detach (fallback)"),
         ("Alt+Enter", "split pane horizontal"),
         ("Alt+Shift+Enter", "split pane vertical"),
         ("Alt+Esc", "close pane"),
@@ -717,8 +879,9 @@ def help_screen():
     for note in ("Prefix = Ctrl+B; Ctrl+B 1..9 = workspace",
                  "Alt needs the xterm modifier form -",
                  "phones: Ctrl+B chords, ALT+digit.",
-                 "Detach keeps workspaces, panes,",
-                 "and agents running."):
+                 "Phone: tap ALT then D to detach.",
+                 "Fallback: Ctrl+B then D.",
+                 "Detach keeps workspaces and agents."):
         nfit = fit(note, inner - 2)
         out.append(f"{C_LIME}\u2502{C_RESET} {C_GRAY}{nfit}{C_RESET}"
                    + " " * max(0, inner - 1 - len(nfit))
@@ -726,7 +889,7 @@ def help_screen():
     out.append(f"{C_LIME}\u2514{line(inner)}\u2518{C_RESET}")
     print("\033[H\033[2J" + "\n".join(out), flush=True)
     print(f"{C_GRAY}press any key to return...{C_RESET}", end="", flush=True)
-    _read_key()
+    wait_for_key()
 
 
 def info():
@@ -770,6 +933,97 @@ def info():
     input(f"{C_GRAY}Enter to continue...{C_RESET}")
 
 
+def workspace_number(raw, count):
+    if not raw or not raw.isdigit():
+        return None
+    try:
+        number = int(raw)
+    except ValueError:
+        return None
+    return number - 1 if 1 <= number <= count else None
+
+
+def menu_loop(rows, tty_mode=False, fd=None):
+    note = ""
+    selected = selection_index(rows)
+    while True:
+        render(rows, note, selected)
+        note = ""
+        try:
+            kind, raw = read_menu_action(tty_mode, fd)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return 0
+        if kind == "eof":
+            print()
+            return 0
+        if kind == "navigate":
+            if not rows:
+                note = "no workspaces to select"
+            else:
+                selected = move_selection(rows, selected,
+                                          -1 if raw == "up" else 1)
+            continue
+
+        previous_id = rows[selected]["id"] if selected is not None else None
+        previous_index = selected
+        preferred_id = previous_id
+        if kind == "enter":
+            if selected is None:
+                note = "no workspaces to attach"
+            else:
+                attach(rows[selected])
+        elif raw == "":
+            # Preserve the line-oriented no-op for piped/non-TTY input.
+            continue
+        elif raw.isdigit():
+            index = workspace_number(raw, len(rows))
+            if index is None:
+                note = "no workspaces to attach" if not rows else f"no workspace {raw}"
+            else:
+                preferred_id = rows[index]["id"]
+                attach(rows[index])
+        elif raw in ("q", "Q"):
+            return 0
+        elif raw in ("r", "R"):
+            pass
+        elif raw in ("n", "N"):
+            preferred_id = new_workspace() or preferred_id
+        elif raw in ("p", "P"):
+            preferred_id = project_launcher() or preferred_id
+        elif raw in ("s", "S"):
+            preferred_id = quick_shell() or preferred_id
+        elif raw in ("i", "I"):
+            info()
+        elif raw == "?":
+            help_screen()
+        elif raw in ("t", "T"):
+            nb = (NOTIFY_BIN if os.path.isfile(NOTIFY_BIN) else
+                  os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "herdr-notify"))
+            if os.path.isfile(nb):
+                rc_t, out_t, _ = run([sys.executable, nb, "--test"], 15)
+                lines_t = out_t.strip().splitlines()
+                note = lines_t[-1] if lines_t else (
+                    "test push sent - check the phone" if rc_t == 0 else "test failed")
+            else:
+                note = "herdr-notify not installed"
+        elif raw in ("l", "L"):
+            last = load_last(rows)
+            if last:
+                preferred_id = last["id"]
+                attach(last)
+            else:
+                note = "no remembered workspace yet"
+        else:
+            note = f"unknown: {raw}"
+
+        refreshed = collect()
+        if refreshed is not None:
+            rows = refreshed
+            selected = selection_index(rows, preferred_id, previous_index)
+
+
 def main():
     if "--detect" in sys.argv:
         for cand, ok, detail in HERDR_VERDICTS:
@@ -787,53 +1041,9 @@ def main():
         print(f"{C_RED}cannot reach the Herdr server.{C_RESET} "
               f"{C_GRAY}Is it running? Try: herdr status{C_RESET}")
         return 1
-    note = ""
-    while True:
-        render(rows, note)
-        note = ""
-        try:
-            raw = input("> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return 0
-        if raw == "":
-            continue
-        if raw.isdigit() and 1 <= int(raw) <= len(rows):
-            attach(rows[int(raw) - 1])
-        elif raw in ("q", "Q"):
-            return 0
-        elif raw in ("r", "R"):
-            pass
-        elif raw in ("n", "N"):
-            new_workspace()
-        elif raw in ("p", "P"):
-            project_launcher()
-        elif raw in ("s", "S"):
-            quick_shell()
-        elif raw in ("i", "I"):
-            info()
-        elif raw == "?":
-            help_screen()
-        elif raw in ("t", "T"):
-            nb = NOTIFY_BIN if os.path.isfile(NOTIFY_BIN) else \
-                os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                             "herdr-notify")
-            if os.path.isfile(nb):
-                rc_t, out_t, _ = run([sys.executable, nb, "--test"], 15)
-                lines_t = out_t.strip().splitlines()
-                note = lines_t[-1] if lines_t else (
-                    "test push sent - check the phone" if rc_t == 0 else "test failed")
-            else:
-                note = "herdr-notify not installed"
-        elif raw in ("l", "L"):
-            last = load_last(rows)
-            if last:
-                attach(last)
-            else:
-                note = "no remembered workspace yet"
-        else:
-            note = f"unknown: {raw}"
-        rows = collect() or rows
+    tty_mode = sys.stdin.isatty()
+    fd = sys.stdin.fileno() if tty_mode else None
+    return menu_loop(rows, tty_mode, fd)
 
 
 if __name__ == "__main__":

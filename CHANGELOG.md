@@ -2,6 +2,19 @@
 
 All notable changes to TENDRIL are documented here.
 
+## Unreleased
+
+- The selector supports ↑/↓ highlighting and Enter-to-attach while preserving
+  numeric and command-letter input; raw TTY mode restores terminal settings on
+  every exit path.
+- Detach now recommends Alt+D (tap ALT then D on the phone), with Ctrl+B then D
+  as the fallback. Ctrl+Home remains optional: Herdr 0.9.3 rejects it. The
+  installer validates it before migrating legacy `ctrl+]`, preserves unrelated
+  bindings, and adds only conflict-free shortcuts.
+- New-workspace labels are derived from the selected cwd (the installed CLI's
+  docs do not specify an automatic label default); agent names are sanitized
+  from the resulting label.
+
 ## v0.1.2 — the mark survives phone geometry
 
 - in-session switching that matches the muscle memory: the installer now also
