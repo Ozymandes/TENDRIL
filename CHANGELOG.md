@@ -2,22 +2,26 @@
 
 All notable changes to TENDRIL are documented here.
 
-## v0.1.2 — home-row UX pass
+## v0.1.2 — ⌂ detach button + current-directory defaults
 
-- **Ctrl+Esc** is the new primary detach-to-selector binding: it passes
-  Herdr's verified key grammar and avoids the `]` symbol layer on Termux
-  (`Ctrl+Home` is not expressible — Herdr's parser accepts no home/end keys
-  in any modifier combination, confirmed against `herdr config check` and
-  the v0.9.x config grammar)
-- `Ctrl+]` retained as the legacy single-byte detach; full detach set is now
-  `prefix+d`, `alt+d`, `ctrl+esc`, `ctrl+]`, merged conflict-free by the
-  installer as before
-- **new workspace defaults to the current directory**: `N` and `S` inherit
-  the focused workspace's directory (Enter accepts it, an explicit path
-  overrides it); an empty name reuses Herdr's own default naming (dir
-  basename) instead of forcing input; the full directory menu only appears
-  when no usable current directory exists, and the `P` project flow is
-  unchanged
+- **phone**: new `tendril-keys` helper (Termux) adds a ⌂ button to the
+  extra-keys row; its macro emits `ALT d`, so detaching is one tap:
+  ⌂ → Alt+D → Herdr detach → TENDRIL menu. The helper backs up
+  `~/.termux/termux.properties`, touches only the `extra-keys` value,
+  preserves every existing button, falls back to printed instructions for
+  layouts it cannot parse safely, and reloads via `termux-reload-settings`.
+- **no Herdr key-grammar changes**: the detach set stays
+  `prefix+d`, `alt+d`, `ctrl+]`; `Ctrl+Home` is not expressible in Herdr's
+  verified grammar, so the phone button simply sends an already-supported
+  sequence
+- installer's Android setup block copies/runs `tendril-keys`; its detach
+  merge now skips only the conflicting direct key (token-exact match)
+- **remote-agents**: `N` (new workspace) and `S` (quick shell) inherit the
+  focused workspace's directory — Enter accepts it, an explicit absolute
+  path overrides it; an empty name reuses Herdr's default naming (dir
+  basename); the full directory menu only appears when no usable current
+  directory exists; the `P` project flow is unchanged
+- attach hints, mobile help, and ANDROID docs updated to the ⌂ flow
 
 ## v0.1.1 — reliable Android/Termux detach
 

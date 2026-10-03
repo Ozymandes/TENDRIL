@@ -5,14 +5,16 @@ Run from the repo root:  python3 -m unittest discover -s tests -v
 Herdr-independent: the CLI module is imported against a fake `herdr` stub so
 no live server is needed. The detach key grammar asserted here was verified
 against `herdr config check` (herdr 0.9.1) and the v0.9.x config grammar:
-accepted names include `ctrl+esc`, `ctrl+]`, `alt+d`, `prefix+d`; Herdr's
-parser has no home/end/pageup keys in any modifier combination and rejects
-raw escape sequences, so the detach set must stay within the accepted set
-(otherwise Herdr silently disables the binding and keys leak into sessions).
+accepted names include `ctrl+]`, `alt+d`, `prefix+d`; Herdr's parser has no
+home/end/pageup keys in any modifier combination and rejects raw escape
+sequences. The phone-side detach is therefore a Termux extra-key button (⌂)
+whose macro emits Alt+D — no new host-side key names are introduced (anything
+the parser rejects would be silently disabled and leak into the session).
 """
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import re
 import sys
@@ -35,7 +37,9 @@ def load(path, name):
 
 
 # Verified-accepted Herdr key names for the detach set (see module docstring).
-VERIFIED_DETACH_KEYS = {"prefix+d", "alt+d", "ctrl+esc", "ctrl+]"}
+# No phone keyboard remapping happens on the host: the Termux ⌂ button simply
+# emits Alt+D, which Herdr already binds.
+VERIFIED_DETACH_KEYS = {"prefix+d", "alt+d", "ctrl+]"}
 
 
 def _fake_herdr(tmp):
@@ -197,7 +201,7 @@ class QuickShellTests(unittest.TestCase):
 
 
 class DetachHintTests(unittest.TestCase):
-    def test_help_screen_lists_primary_and_legacy(self):
+    def test_help_screen_lists_phone_button_and_legacy(self):
         orig = MOD._read_key
         MOD._read_key = lambda: " "
         try:
@@ -207,11 +211,13 @@ class DetachHintTests(unittest.TestCase):
         finally:
             MOD._read_key = orig
         out = buf.getvalue()
-        self.assertIn("Ctrl+Esc", out)
+        self.assertIn("\u2302", out)
+        self.assertIn("Alt+D", out)
         self.assertIn("Ctrl+]", out)
         self.assertIn("detach to REMOTE AGENTS", out)
+        self.assertNotIn("Ctrl+Esc", out)
 
-    def test_attach_hints_primary_and_legacy_and_focuses_first(self):
+    def test_attach_hints_phone_button_and_focuses_first(self):
         runs, attached = [], []
         orig_run, orig_sub = MOD.run, MOD.subprocess
         MOD.run = lambda args, timeout=6: (runs.append(args), (0, "", ""))[1]
@@ -226,9 +232,10 @@ class DetachHintTests(unittest.TestCase):
         finally:
             MOD.run, MOD.subprocess = orig_run, orig_sub
         out = buf.getvalue()
-        self.assertIn("Ctrl+Esc", out)
+        self.assertIn("\u2302", out)
         self.assertIn("Ctrl+]", out)
         self.assertIn("menu returns here", out)
+        self.assertNotIn("Ctrl+Esc", out)
         # safety behavior preserved: focus the workspace, then attach session
         self.assertEqual(runs[0][1:], ["workspace", "focus", "w9"])
         self.assertTrue(attached and attached[0][1:3] == ["session", "attach"])
@@ -258,37 +265,49 @@ class InstallerDetachMergeTests(unittest.TestCase):
         self.assertTrue(want <= VERIFIED_DETACH_KEYS,
                         "unverified key name would be disabled by herdr and "
                         "leak into the session: %s" % (want - VERIFIED_DETACH_KEYS))
-        self.assertIn("ctrl+esc", want)   # primary
-        self.assertIn("ctrl+]", want)     # legacy retained
+        self.assertNotIn("ctrl+esc", want)  # no invented host-side bindings
+        self.assertIn("ctrl+]", want)       # original single-byte detach kept
 
-    def test_merge_adds_primary_and_keeps_legacy_and_others(self):
+    def test_merge_adds_alt_d_and_keeps_legacy_and_others(self):
         with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
             f.write('[keys]\nprefix = "ctrl+space"\n'
                     'detach = ["prefix+d"]\nzoom = "prefix+z"\n')
             conf = f.name
         plan = self._run_embedded(conf, "plan")
-        self.assertIn("ctrl+esc", plan)
         self.assertIn("ctrl+]", plan)
+        self.assertIn("alt+d", plan)
         self._run_embedded(conf, "apply")
         with open(conf) as f:
             text = f.read()
-        self.assertIn('detach = ["prefix+d", "alt+d", "ctrl+esc", "ctrl+]"]', text)
+        self.assertIn('detach = ["prefix+d", "alt+d", "ctrl+]"]', text)
         self.assertIn('zoom = "prefix+z"', text)   # unrelated binding untouched
+
+    def test_merge_token_match_ignores_alt_down(self):
+        # "alt+d" must not substring-match "alt+down" and cry conflict
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+            f.write('[keys]\ndetach = ["prefix+d"]\nfoo = "alt+down"\n')
+            conf = f.name
+        plan = self._run_embedded(conf, "plan")
+        self.assertEqual(plan.splitlines()[0], "CONFLICT=")
+        self._run_embedded(conf, "apply")
+        with open(conf) as f:
+            text = f.read()
+        self.assertIn('detach = ["prefix+d", "alt+d", "ctrl+]"]', text)
 
     def test_merge_skips_conflicting_direct_keys(self):
         with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
-            f.write('[keys]\ndetach = ["prefix+d"]\nfoo = "ctrl+esc"\n')
+            f.write('[keys]\ndetach = ["prefix+d"]\nbar = "alt+d"\n')
             conf = f.name
         plan = self._run_embedded(conf, "plan")
-        self.assertIn("CONFLICT=ctrl+esc (used by foo)", plan)
+        self.assertIn("CONFLICT=alt+d (used by bar)", plan)
         self._run_embedded(conf, "apply")
         with open(conf) as f:
             text = f.read()
         m = re.search(r'^detach = \[(.*?)\]$', text, re.M)
         keys = re.findall(r'"([^"]+)"', m.group(1))
-        self.assertNotIn("ctrl+esc", keys)   # never steals a claimed key
+        self.assertNotIn("alt+d", keys)      # never steals a claimed key
         self.assertIn("ctrl+]", keys)        # legacy still added
-        self.assertIn('foo = "ctrl+esc"', text)  # decoy binding untouched
+        self.assertIn('bar = "alt+d"', text)  # decoy binding untouched
 
     def test_merge_skips_only_the_conflicting_key(self):
         with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
@@ -300,12 +319,106 @@ class InstallerDetachMergeTests(unittest.TestCase):
         m = re.search(r'^detach = \[(.*?)\]$', text, re.M)
         keys = re.findall(r'"([^"]+)"', m.group(1))
         self.assertNotIn("ctrl+]", keys)     # v0.1.1 guarantee: never steal
-        self.assertIn("ctrl+esc", keys)      # primary still added
+        self.assertIn("alt+d", keys)         # desktop alternative still added
 
     def test_installer_keeps_config_check_safety_gate(self):
         self.assertIn("config check", INSTALL_SRC)
         self.assertIn("reload-config", INSTALL_SRC)
         self.assertIn("restoring backup", INSTALL_SRC)
+
+
+class TendrilKeysTests(unittest.TestCase):
+    """The Termux helper: ⌂ button -> macro ALT d -> existing Herdr detach."""
+
+    KEYS = os.path.join(REPO, "phone", "tendril-keys")
+
+    def _load(self, home):
+        prev = os.environ.get("HOME")
+        os.environ["HOME"] = home
+        try:
+            return load(self.KEYS, "tendril_keys_%d" % len(self._loaded))
+        finally:
+            if prev is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = prev
+
+    def setUp(self):
+        self._loaded = []
+        self.home = tempfile.mkdtemp(prefix="tendril-keys-")
+        self.props = os.path.join(self.home, ".termux", "termux.properties")
+
+    def _mod(self):
+        mod = self._load(self.home)
+        self._loaded.append(mod)
+        return mod
+
+    def _run(self, mod):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = mod.main()
+        return rc, buf.getvalue()
+
+    def _layout(self):
+        with open(self.props) as f:
+            return json.loads(re.search(r"extra-keys\s*=\s*(.*)", f.read())
+                              .group(1))
+
+    def test_fresh_install_adds_default_rows_with_button(self):
+        rc, out = self._run(self._mod())
+        self.assertEqual(rc, 0)
+        layout = self._layout()
+        buttons = [k for k in layout[0]
+                   if isinstance(k, dict) and k.get("macro") == "ALT d"]
+        self.assertEqual(len(buttons), 1)
+        self.assertEqual(buttons[0].get("display"), "\u2302")
+        self.assertIn("HOME", layout[0])          # stock buttons kept
+        self.assertIn("\u2302", out)
+
+    def test_merge_into_existing_layout_preserves_everything_else(self):
+        os.makedirs(os.path.dirname(self.props))
+        with open(self.props, "w") as f:
+            f.write("bell-character=ignore\n"
+                    "extra-keys = [['ESC','/','-','HOME','UP','END','PGUP'],"
+                    "['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN','BKSP']]\n"
+                    "use-black-ui=true\n")
+        rc, _ = self._run(self._mod())
+        self.assertEqual(rc, 0)
+        with open(self.props) as f:
+            lines = f.read().splitlines()
+        self.assertIn("bell-character=ignore", lines)   # untouched
+        self.assertIn("use-black-ui=true", lines)       # untouched
+        layout = self._layout()
+        self.assertEqual(layout[0][-1]["macro"], "ALT d")   # appended, row 0
+        self.assertEqual(layout[0][3], "HOME")              # plain HOME intact
+        self.assertEqual(layout[1][-1], "BKSP")             # row 1 untouched
+        backups = [f for f in os.listdir(os.path.dirname(self.props))
+                   if f.startswith("termux.properties.bak.")]
+        self.assertEqual(len(backups), 1)               # backup before write
+
+    def test_idempotent_no_duplicate_button(self):
+        mod = self._mod()
+        self.assertEqual(self._run(mod)[0], 0)
+        rc, out = self._run(mod)
+        self.assertEqual(rc, 0)
+        self.assertIn("already present", out)
+        layout = self._layout()
+        n = sum(1 for k in layout[0]
+                if isinstance(k, dict) and k.get("macro") == "ALT d")
+        self.assertEqual(n, 1)
+
+    def test_unparseable_layout_is_left_untouched(self):
+        os.makedirs(os.path.dirname(self.props))
+        weird = ('extra-keys = [[{key: ESC, popup: {macro: "CTRL d", '
+                 'display: exit}}]]\n')
+        with open(self.props, "w") as f:
+            f.write(weird)
+        rc, out = self._run(self._mod())
+        self.assertEqual(rc, 1)
+        with open(self.props) as f:
+            self.assertEqual(f.read(), weird)           # nothing written
+        self.assertIn("could not merge safely", out)
+        self.assertIn("ALT d", out)                     # manual snippet given
 
 
 if __name__ == "__main__":

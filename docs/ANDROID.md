@@ -80,11 +80,33 @@ echo 'TENDRIL_ALIAS=<alias>' >> ~/.bashrc
 Install the [ntfy app](https://ntfy.sh), Subscribe → enter the topic from the
 host's `~/.config/remote-agents/notify.env`. Test from the console with `T`.
 
+## Detach button (⌂)
+
+The console's detach key on a phone keyboard is one tap:
+
+```
+PHONE BUTTON ⌂  →  Termux macro "ALT d"  →  Alt+D  →  Herdr detach  →  TENDRIL menu
+```
+
+Run once inside Termux (the host installer's Android block includes this):
+
+```sh
+pkg install python        # once, for the helper
+scp <host-alias>:/path/to/tendril/phone/tendril-keys ~/bin/tendril-keys
+chmod 700 ~/bin/tendril-keys
+tendril-keys
+```
+
+The helper edits `~/.termux/termux.properties` safely: it backs the file up,
+changes only the `extra-keys` value, keeps every existing button (including a
+plain HOME key), and reloads with `termux-reload-settings`. The ⌂ button is
+appended to the first extra-keys row and sends the Alt+D detach Herdr already
+binds — no Herdr key-grammar changes. Ctrl+] keeps working everywhere.
+
 ## Daily use
 
 ```
-tendril      → workspace menu → number → work → Ctrl+Esc → menu → close Termux
-             (Ctrl+] still works as the legacy single-byte detach)
+tendril      → workspace menu → number → work → ⌂ → menu → close Termux
 tendril ssh  → force SSH if Mosh UDP is blocked
 ```
 

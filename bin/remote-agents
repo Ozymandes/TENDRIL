@@ -430,7 +430,7 @@ def attach(row):
     if os.environ.get("HERDR_ENV") == "1":
         input(f"already inside Herdr — workspace '{row['label']}' focused. Enter...")
         return
-    print(f"{C_GRAY}attaching {row['label']} \u2014 detach: Ctrl+Esc (Termux) \u00b7 Ctrl+] legacy \u00b7 Alt+D desktop - menu returns here{C_RESET}",
+    print(f"{C_GRAY}attaching {row['label']} \u2014 detach: \u2302 (Termux) \u00b7 Alt+D \u00b7 Ctrl+] - menu returns here{C_RESET}",
           flush=True)
     subprocess.run([HERDR, "session", "attach", SESSION], check=False)
 
@@ -674,9 +674,8 @@ def help_screen():
         ("Alt+\u2190/\u2192", "prev / next tab"),
         ("Alt+1..9", "jump directly to tab"),
         ("Alt+\u2191/\u2193", "prev / next workspace"),
-        ("Ctrl+Esc", "detach to REMOTE AGENTS"),
-        ("Ctrl+]", "detach (legacy, one byte)"),
-        ("Alt+D", "detach (desktop alternative)"),
+        ("\u2302 / Alt+D", "detach to REMOTE AGENTS"),
+        ("Ctrl+]", "detach (single byte, preserved)"),
         ("Alt+Enter", "split pane horizontal"),
         ("Alt+Shift+Enter", "split pane vertical"),
         ("Alt+Esc", "close pane"),
@@ -704,9 +703,9 @@ def help_screen():
     out.append(f"{C_LIME}\u251c{line(inner)}\u2524{C_RESET}")
     for note in ("Prefix = Ctrl+Space",
                  "Alt needs an unsplit ESC byte;",
-                 "Ctrl+Esc avoids the ] symbol layer.",
-                 "Detach keeps workspaces, panes,",
-                 "and agents running."):
+                 "Termux \u2302 button sends Alt+D.",
+                 "Ctrl+] is one byte - preserved.",
+                 "Detach keeps everything running."):
         nfit = fit(note, inner - 2)
         out.append(f"{C_LIME}\u2502{C_RESET} {C_GRAY}{nfit}{C_RESET}"
                    + " " * max(0, inner - 1 - len(nfit))

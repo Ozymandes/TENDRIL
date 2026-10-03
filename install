@@ -205,9 +205,8 @@ say ""
 
 # ---------------- 6. herdr detach keybindings ----------------
 say "6) Herdr detach keybindings"
-say "     Ctrl+Esc   primary detach - ESC needs no symbol layer on Termux"
-say "     Ctrl+]     legacy detach, preserved (single byte, never split)"
-say "     Alt+D      desktop-friendly alternative"
+say "     Ctrl+]     Android/Termux detach (single byte, never split)"
+say "     Alt+D      desktop alternative; also what the phone's ⌂ button sends"
 say "     Prefix+D   universal fallback (prefix is Ctrl+Space by default)"
 HERDR_CONF="$HOME/.config/herdr/config.toml"
 
@@ -217,8 +216,8 @@ herdr_detach() {
 import re, sys
 path, mode = sys.argv[1], sys.argv[2]
 text = open(path).read()
-WANT = ["prefix+d", "alt+d", "ctrl+esc", "ctrl+]"]
-CLAIM = ["ctrl+esc", "ctrl+]"]
+WANT = ["prefix+d", "alt+d", "ctrl+]"]
+CLAIM = ["alt+d", "ctrl+]"]
 m = re.search(r'^([ \t]*)detach[ \t]*=[ \t]*(.+?)[ \t]*$', text, re.M)
 existing = re.findall(r'"([^"]+)"', m.group(2)) if m else []
 # never steal a direct key that another action already uses
@@ -230,8 +229,9 @@ for line in text.splitlines():
         continue
     k, v = s.split("=", 1)
     if k.strip() != "detach":
+        tokens = set(re.findall(r'["\']([^"\']+)["\']', v))
         for c in CLAIM:
-            if c in v:
+            if c in tokens:
                 conflict_keys.add(c)
                 conflicts.append("%s (used by %s)" % (c, k.strip()))
 merged, added = list(existing), []
@@ -322,6 +322,10 @@ say "  rm -f ~/bin/tendril ~/bin/agent"
 say "  mv ~/tendril-launchers/tendril ~/bin/tendril"
 say "  mv ~/tendril-launchers/agent ~/bin/agent"
 say "  chmod 700 ~/bin/tendril ~/bin/agent && rmdir ~/tendril-launchers"
+say "  scp $ALIAS:$PKG_DIR/phone/tendril-keys ~/bin/tendril-keys"
+say "  chmod 700 ~/bin/tendril-keys"
+say "  pkg install python -y       # once - needed by tendril-keys"
+say "  tendril-keys                # adds the ⌂ detach button to extra-keys"
 say "  echo 'export PATH=\$HOME/bin:\$PATH' >> ~/.bashrc"
 say "  echo 'TENDRIL_ALIAS=$ALIAS' >> ~/.bashrc && source ~/.bashrc"
 say ""
