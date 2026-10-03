@@ -3,22 +3,27 @@
 Run from the repo root:  python3 -m unittest discover -s tests -v
 
 Herdr-independent: the CLI module is imported against a fake `herdr` stub so
-no live server is needed. The detach key grammar asserted here was verified
-against `herdr config check` (herdr 0.9.1) and the v0.9.x config grammar:
-accepted names include `ctrl+]`, `alt+d`, `prefix+d`; Herdr's parser has no
-home/end/pageup keys in any modifier combination and rejects raw escape
-sequences. The phone-side detach is therefore a Termux extra-key button (⌂)
-whose macro emits Alt+D — no new host-side key names are introduced (anything
-the parser rejects would be silently disabled and leak into the session).
+no live server is needed. Two key facts are pinned here:
+
+- Detach grammar: Herdr accepts `ctrl+]`, `alt+d`, `prefix+d` (verified
+  against `herdr config check`, herdr 0.9.1, and the v0.9.x config docs).
+  Herdr's parser has no home/end/pageup keys in any modifier combination and
+  rejects raw escape sequences — a rejected binding would be disabled and
+  its key would leak into the session.
+- Ctrl+Home therefore cannot be a Herdr config binding. Termux encodes the
+  combo as `ESC [ 1 ; 5 H` (termux-app KeyHandler.getCode +
+  transformForModifiers), and remote-agents bridges exactly those bytes to
+  Herdr's existing Alt+D detach while forwarding everything else — plain
+  HOME included — byte-for-byte.
 """
 import contextlib
 import importlib.util
 import io
-import json
 import os
 import re
 import sys
 import tempfile
+import time
 import unittest
 from importlib.machinery import SourceFileLoader
 
@@ -37,8 +42,8 @@ def load(path, name):
 
 
 # Verified-accepted Herdr key names for the detach set (see module docstring).
-# No phone keyboard remapping happens on the host: the Termux ⌂ button simply
-# emits Alt+D, which Herdr already binds.
+# No phone keyboard remapping happens anywhere: the existing Termux CTRL and
+# HOME buttons work together, and the bridge translates only their combo.
 VERIFIED_DETACH_KEYS = {"prefix+d", "alt+d", "ctrl+]"}
 
 
@@ -201,7 +206,7 @@ class QuickShellTests(unittest.TestCase):
 
 
 class DetachHintTests(unittest.TestCase):
-    def test_help_screen_lists_phone_button_and_legacy(self):
+    def test_help_screen_lists_ctrl_home_primary_and_compat(self):
         orig = MOD._read_key
         MOD._read_key = lambda: " "
         try:
@@ -211,33 +216,48 @@ class DetachHintTests(unittest.TestCase):
         finally:
             MOD._read_key = orig
         out = buf.getvalue()
-        self.assertIn("\u2302", out)
+        self.assertIn("Ctrl+Home", out)
+        self.assertIn("detach to REMOTE AGENTS", out)
         self.assertIn("Alt+D", out)
         self.assertIn("Ctrl+]", out)
-        self.assertIn("detach to REMOTE AGENTS", out)
-        self.assertNotIn("Ctrl+Esc", out)
+        self.assertNotIn("\u2302", out)          # no extra-key button
 
-    def test_attach_hints_phone_button_and_focuses_first(self):
-        runs, attached = [], []
-        orig_run, orig_sub = MOD.run, MOD.subprocess
+    def test_attach_hints_ctrl_home_and_bridges_session(self):
+        runs, bridged = [], []
+        orig_run, orig_bridge = MOD.run, MOD._attach_session
         MOD.run = lambda args, timeout=6: (runs.append(args), (0, "", ""))[1]
-        MOD.subprocess = type("S", (), {
-            "run": staticmethod(lambda args, check=False: attached.append(args)),
-        })
+        MOD._attach_session = lambda: bridged.append(True)
         MOD.save_last = lambda row: None
         try:
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):
                 MOD.attach({"id": "w9", "label": "demo"})
         finally:
-            MOD.run, MOD.subprocess = orig_run, orig_sub
+            MOD.run, MOD._attach_session = orig_run, orig_bridge
         out = buf.getvalue()
-        self.assertIn("\u2302", out)
+        self.assertIn("Ctrl+Home", out)
+        self.assertIn("Alt+D", out)
         self.assertIn("Ctrl+]", out)
         self.assertIn("menu returns here", out)
-        self.assertNotIn("Ctrl+Esc", out)
+        self.assertNotIn("\u2302", out)
         # safety behavior preserved: focus the workspace, then attach session
         self.assertEqual(runs[0][1:], ["workspace", "focus", "w9"])
+        self.assertEqual(bridged, [True])
+
+    def test_attach_session_falls_back_without_tty(self):
+        attached = []
+        orig_sub, orig_stdin = MOD.subprocess, sys.stdin
+        MOD.subprocess = type("S", (), {
+            "run": staticmethod(lambda args, check=False: attached.append(args)),
+        })
+        r, w = os.pipe()
+        sys.stdin = os.fdopen(r, "rb")
+        try:
+            MOD._attach_session()
+        finally:
+            sys.stdin = orig_stdin
+            MOD.subprocess = orig_sub
+            os.close(w)
         self.assertTrue(attached and attached[0][1:3] == ["session", "attach"])
 
 
@@ -327,98 +347,139 @@ class InstallerDetachMergeTests(unittest.TestCase):
         self.assertIn("restoring backup", INSTALL_SRC)
 
 
-class TendrilKeysTests(unittest.TestCase):
-    """The Termux helper: ⌂ button -> macro ALT d -> existing Herdr detach."""
+class CtrlHomeBridgeTests(unittest.TestCase):
+    """CTRL+HOME -> ESC[1;5H -> rewritten to ESC d (Herdr detach).
+    Verified Termux encoding: termux-app KeyHandler.getCode,
+    KEYCODE_MOVE_HOME + transformForModifiers(KEYMOD_CTRL) -> 1;5H."""
 
-    KEYS = os.path.join(REPO, "phone", "tendril-keys")
+    def test_ctrl_home_becomes_detach(self):
+        tail, out = MOD._detach_translate(b"\x1b[1;5H")
+        self.assertEqual(out, b"\x1bd")
+        self.assertEqual(tail, b"")
 
-    def _load(self, home):
-        prev = os.environ.get("HOME")
-        os.environ["HOME"] = home
+    def test_plain_home_passes_through(self):
+        for home in (b"\x1b[H", b"\x1bOH"):     # normal + cursor-app mode
+            tail, out = MOD._detach_translate(home)
+            self.assertEqual(out, home)          # byte-identical
+            self.assertEqual(tail, b"")
+
+    def test_ctrl_end_and_other_sequences_pass_through(self):
+        for seq in (b"\x1b[1;5F", b"\x1b[1;5D", b"\x1b[5~", b"\x1b[A"):
+            tail, out = MOD._detach_translate(seq)
+            self.assertEqual(out, seq)
+            self.assertEqual(tail, b"")
+
+    def test_split_across_reads_still_translates(self):
+        tail, out = MOD._detach_translate(b"ls\r\x1b[1;")
+        self.assertEqual(out, b"ls\r")
+        tail, out = MOD._detach_translate(tail + b"5H pwd\r")
+        self.assertEqual(out, b"\x1bd pwd\r")
+        self.assertEqual(tail, b"")
+
+    def test_ambiguous_tail_is_forwarded_when_cancelled(self):
+        tail, out = MOD._detach_translate(b"\x1b[1;")
+        self.assertEqual(out, b"")
+        self.assertEqual(tail, b"\x1b[1;")
+        tail, out = MOD._detach_translate(tail + b"A")   # not ctrl+home
+        self.assertEqual(out, b"\x1b[1;A")
+        self.assertEqual(tail, b"")
+
+    def test_multiple_sequences_in_one_stream(self):
+        tail, out = MOD._detach_translate(b"a\x1b[1;5Hb\x1b[1;5Hc")
+        self.assertEqual(out, b"a\x1bdb\x1bdc")
+        self.assertEqual(tail, b"")
+
+    def test_pty_roundtrip_home_kept_ctrl_home_detaches(self):
+        """Real PTY round-trip: HOME alone reaches Herdr unchanged;
+        Ctrl+Home reaches it as the ESC d detach."""
+        import pty
+        import select as sel
+        tmp = tempfile.mkdtemp(prefix="tendril-bridge-")
+        stub = os.path.join(tmp, "stub-herdr")
+        with open(stub, "w") as f:
+            f.write(
+                "#!/usr/bin/env python3\n"
+                "import os, sys, termios, tty\n"
+                "old = termios.tcgetattr(0)\n"
+                "tty.setraw(0)\n"
+                "buf = b''\n"
+                "try:\n"
+                "    while True:\n"
+                "        d = os.read(0, 1024)\n"
+                "        if not d:\n"
+                "            break\n"
+                "        buf += d\n"
+                "        if b'\\x1bd' in buf:\n"
+                "            break\n"
+                "finally:\n"
+                "    termios.tcsetattr(0, termios.TCSADRAIN, old)\n"
+                "sys.stdout.write('GOT:' + buf.hex())\n"
+                "sys.stdout.flush()\n")
+        os.chmod(stub, 0o755)
+        driver = os.path.join(tmp, "driver.py")
+        with open(driver, "w") as f:
+            f.write(
+                "from importlib.machinery import SourceFileLoader\n"
+                "import importlib.util\n"
+                "mod = importlib.util.module_from_spec(\n"
+                "    importlib.util.spec_from_loader(\n"
+                "        'ra', SourceFileLoader('ra', %r)))\n" % CLI +
+                "SourceFileLoader('ra', %r).exec_module(mod)\n" % CLI +
+                "mod.HERDR = %r\n" % stub +
+                "mod._attach_session()\n")
+        pid, master = pty.fork()
+        if pid == 0:
+            os.execvp(sys.executable, [sys.executable, driver])
+            os._exit(127)
+        out = b""
         try:
-            return load(self.KEYS, "tendril_keys_%d" % len(self._loaded))
+            time.sleep(0.8)                    # let the bridge go raw
+            os.write(master, b"\x1b[H")         # HOME alone
+            time.sleep(0.3)
+            os.write(master, b"\x1b[1;5H")      # CTRL+HOME
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                r, _, _ = sel.select([master], [], [], 0.4)
+                if not r:
+                    continue
+                try:
+                    chunk = os.read(master, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                out += chunk
+                if b"GOT:" in out and b"1b64" in out.split(b"GOT:")[-1]:
+                    break
         finally:
-            if prev is None:
-                os.environ.pop("HOME", None)
-            else:
-                os.environ["HOME"] = prev
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+            try:
+                os.close(master)
+            except OSError:
+                pass
+        self.assertGreater(out.find(b"GOT:"), -1, out[-400:])
+        got = out.split(b"GOT:", 1)[1][:20]
+        self.assertEqual(got, b"1b5b481b64")   # ESC[H then ESC d
 
-    def setUp(self):
-        self._loaded = []
-        self.home = tempfile.mkdtemp(prefix="tendril-keys-")
-        self.props = os.path.join(self.home, ".termux", "termux.properties")
 
-    def _mod(self):
-        mod = self._load(self.home)
-        self._loaded.append(mod)
-        return mod
+class ExtraKeyRevertTests(unittest.TestCase):
+    """Guard: the ⌂ extra-key experiment stays reverted."""
 
-    def _run(self, mod):
-        buf = io.StringIO()
-        with contextlib.redirect_stdout(buf):
-            rc = mod.main()
-        return rc, buf.getvalue()
+    def test_no_helper_script(self):
+        self.assertFalse(os.path.exists(os.path.join(REPO, "phone",
+                                                     "tendril-keys")))
 
-    def _layout(self):
-        with open(self.props) as f:
-            return json.loads(re.search(r"extra-keys\s*=\s*(.*)", f.read())
-                              .group(1))
+    def test_installer_has_no_button_logic(self):
+        self.assertNotIn("tendril-keys", INSTALL_SRC)
+        self.assertNotIn("\u2302", INSTALL_SRC)
 
-    def test_fresh_install_adds_default_rows_with_button(self):
-        rc, out = self._run(self._mod())
-        self.assertEqual(rc, 0)
-        layout = self._layout()
-        buttons = [k for k in layout[0]
-                   if isinstance(k, dict) and k.get("macro") == "ALT d"]
-        self.assertEqual(len(buttons), 1)
-        self.assertEqual(buttons[0].get("display"), "\u2302")
-        self.assertIn("HOME", layout[0])          # stock buttons kept
-        self.assertIn("\u2302", out)
-
-    def test_merge_into_existing_layout_preserves_everything_else(self):
-        os.makedirs(os.path.dirname(self.props))
-        with open(self.props, "w") as f:
-            f.write("bell-character=ignore\n"
-                    "extra-keys = [['ESC','/','-','HOME','UP','END','PGUP'],"
-                    "['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN','BKSP']]\n"
-                    "use-black-ui=true\n")
-        rc, _ = self._run(self._mod())
-        self.assertEqual(rc, 0)
-        with open(self.props) as f:
-            lines = f.read().splitlines()
-        self.assertIn("bell-character=ignore", lines)   # untouched
-        self.assertIn("use-black-ui=true", lines)       # untouched
-        layout = self._layout()
-        self.assertEqual(layout[0][-1]["macro"], "ALT d")   # appended, row 0
-        self.assertEqual(layout[0][3], "HOME")              # plain HOME intact
-        self.assertEqual(layout[1][-1], "BKSP")             # row 1 untouched
-        backups = [f for f in os.listdir(os.path.dirname(self.props))
-                   if f.startswith("termux.properties.bak.")]
-        self.assertEqual(len(backups), 1)               # backup before write
-
-    def test_idempotent_no_duplicate_button(self):
-        mod = self._mod()
-        self.assertEqual(self._run(mod)[0], 0)
-        rc, out = self._run(mod)
-        self.assertEqual(rc, 0)
-        self.assertIn("already present", out)
-        layout = self._layout()
-        n = sum(1 for k in layout[0]
-                if isinstance(k, dict) and k.get("macro") == "ALT d")
-        self.assertEqual(n, 1)
-
-    def test_unparseable_layout_is_left_untouched(self):
-        os.makedirs(os.path.dirname(self.props))
-        weird = ('extra-keys = [[{key: ESC, popup: {macro: "CTRL d", '
-                 'display: exit}}]]\n')
-        with open(self.props, "w") as f:
-            f.write(weird)
-        rc, out = self._run(self._mod())
-        self.assertEqual(rc, 1)
-        with open(self.props) as f:
-            self.assertEqual(f.read(), weird)           # nothing written
-        self.assertIn("could not merge safely", out)
-        self.assertIn("ALT d", out)                     # manual snippet given
+    def test_selector_has_no_button_hints_or_termux_writes(self):
+        src = open(CLI).read()
+        self.assertNotIn("\u2302", src)
+        self.assertNotIn("termux.properties", src)
 
 
 if __name__ == "__main__":

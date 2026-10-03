@@ -80,33 +80,32 @@ echo 'TENDRIL_ALIAS=<alias>' >> ~/.bashrc
 Install the [ntfy app](https://ntfy.sh), Subscribe → enter the topic from the
 host's `~/.config/remote-agents/notify.env`. Test from the console with `T`.
 
-## Detach button (⌂)
+## Detach: Ctrl+Home
 
-The console's detach key on a phone keyboard is one tap:
+In the extra-keys row, tap CTRL, then HOME — the active Herdr session
+detaches and the TENDRIL selector returns:
 
 ```
-PHONE BUTTON ⌂  →  Termux macro "ALT d"  →  Alt+D  →  Herdr detach  →  TENDRIL menu
+CTRL + HOME  →  ESC [ 1 ; 5 H  →  TENDRIL bridge  →  Alt+D (ESC d)  →  Herdr detach
 ```
 
-Run once inside Termux (the host installer's Android block includes this):
+Termux encodes Ctrl+Home as `ESC [ 1 ; 5 H` (xterm modifier encoding —
+`KeyHandler.getCode` applies `transformForModifiers` for the HOME key).
+Herdr's key grammar has no Home key, so the TENDRIL console runs
+`herdr session attach` behind a small PTY bridge that rewrites exactly those
+six bytes to the Alt+D detach Herdr already binds. Everything else is
+forwarded byte-for-byte: a plain HOME tap (`ESC [ H`) keeps its normal
+meaning, Android's system Home button is never delivered to apps and is not
+touched, and Alt+D / Ctrl+] keep working as compatibility detach keys.
 
-```sh
-pkg install python        # once, for the helper
-scp <host-alias>:/path/to/tendril/phone/tendril-keys ~/bin/tendril-keys
-chmod 700 ~/bin/tendril-keys
-tendril-keys
-```
-
-The helper edits `~/.termux/termux.properties` safely: it backs the file up,
-changes only the `extra-keys` value, keeps every existing button (including a
-plain HOME key), and reloads with `termux-reload-settings`. The ⌂ button is
-appended to the first extra-keys row and sends the Alt+D detach Herdr already
-binds — no Herdr key-grammar changes. Ctrl+] keeps working everywhere.
+Confirm the sequence on the phone (in a plain Termux shell, not inside
+Herdr): run `cat -v`, tap CTRL then HOME — you should see `^[[1;5H`.
+`Ctrl+C` exits.
 
 ## Daily use
 
 ```
-tendril      → workspace menu → number → work → ⌂ → menu → close Termux
+tendril      → workspace menu → number → work → CTRL+HOME → menu → close Termux
 tendril ssh  → force SSH if Mosh UDP is blocked
 ```
 

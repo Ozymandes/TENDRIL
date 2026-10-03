@@ -430,9 +430,130 @@ def attach(row):
     if os.environ.get("HERDR_ENV") == "1":
         input(f"already inside Herdr — workspace '{row['label']}' focused. Enter...")
         return
-    print(f"{C_GRAY}attaching {row['label']} \u2014 detach: \u2302 (Termux) \u00b7 Alt+D \u00b7 Ctrl+] - menu returns here{C_RESET}",
+    print(f"{C_GRAY}attaching {row['label']} \u2014 detach: Ctrl+Home \u00b7 Alt+D \u00b7 Ctrl+] - menu returns here{C_RESET}",
           flush=True)
-    subprocess.run([HERDR, "session", "attach", SESSION], check=False)
+    _attach_session()
+
+
+# ---------- Ctrl+Home detach bridge ----------
+# Termux encodes Ctrl+Home as `ESC [ 1 ; 5 H` (KeyHandler.getCode +
+# transformForModifiers: KEYMOD_CTRL -> xterm modifier 5). Herdr's key
+# grammar has no Home key, so `herdr session attach` runs behind a
+# transparent PTY bridge that rewrites exactly those six bytes to the
+# Alt+D detach (`ESC d`) Herdr already binds. Every other byte - including
+# plain Home (`ESC [ H`) - is forwarded unchanged, so HOME keeps its
+# normal meaning and nothing leaks into the session.
+_CTRL_HOME = b"\x1b[1;5H"
+_ALT_D = b"\x1bd"
+
+
+def _detach_translate(data):
+    """(tail, out): rewrite Ctrl+Home to the detach; hold a trailing byte
+    run that could still complete Ctrl+Home; forward all else unchanged."""
+    out = bytearray()
+    while True:
+        i = data.find(_CTRL_HOME)
+        if i < 0:
+            break
+        out += data[:i]
+        out += _ALT_D
+        data = data[i + len(_CTRL_HOME):]
+    hold = 0
+    for k in range(min(len(data), len(_CTRL_HOME) - 1), 0, -1):
+        if _CTRL_HOME.startswith(data[-k:]):
+            hold = k
+            break
+    cut = len(data) - hold
+    out += data[:cut]
+    return data[cut:], bytes(out)
+
+
+def _write_all(fd, data):
+    while data:
+        data = data[os.write(fd, data):]
+
+
+def _attach_session():
+    """Run `herdr session attach` behind the Ctrl+Home bridge (tty only)."""
+    import fcntl
+    import pty
+    import select
+    import signal
+    import struct
+    import termios
+    import tty
+    if not sys.stdin.isatty():    # no tty (pipes/tests): plain passthrough
+        subprocess.run([HERDR, "session", "attach", SESSION], check=False)
+        return
+    pid, master = pty.fork()
+    if pid == 0:                  # child: Herdr owns the bridge pty
+        try:
+            os.execvp(HERDR, [HERDR, "session", "attach", SESSION])
+        finally:
+            os._exit(127)
+    fd = sys.stdin.fileno()
+    out_fd = sys.stdout.fileno()
+    old = termios.tcgetattr(fd)
+
+    def resize(*_):
+        try:
+            ws = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
+            fcntl.ioctl(master, termios.TIOCSWINSZ, ws)
+        except OSError:
+            pass
+
+    old_winch = signal.signal(signal.SIGWINCH, resize)
+    resize()
+    tty.setraw(fd)
+    tail = b""
+    reaped = False
+    try:
+        while True:
+            r, _, _ = select.select([fd, master], [], [], 1.0)
+            if fd in r:
+                data = os.read(fd, 4096)
+                if not data:
+                    break
+                tail, out = _detach_translate(tail + data)
+                if out:
+                    _write_all(master, out)
+            if master in r:
+                try:
+                    data = os.read(master, 4096)
+                except OSError:   # EIO: child exited
+                    break
+                if not data:
+                    break
+                _write_all(out_fd, data)
+            done, _ = os.waitpid(pid, os.WNOHANG)
+            if done == pid:
+                reaped = True
+                break
+    finally:
+        if tail:                      # flush a held partial sequence
+            _write_all(master, tail)
+        signal.signal(signal.SIGWINCH, old_winch)
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        try:                          # drain Herdr's last output
+            while True:
+                r, _, _ = select.select([master], [], [], 0.2)
+                if not r:
+                    break
+                data = os.read(master, 4096)
+                if not data:
+                    break
+                _write_all(out_fd, data)
+        except OSError:
+            pass
+        try:
+            os.close(master)
+        except OSError:
+            pass
+        if not reaped:
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
 
 
 def ws_create(cwd, label=None, focus=True):
@@ -674,8 +795,8 @@ def help_screen():
         ("Alt+\u2190/\u2192", "prev / next tab"),
         ("Alt+1..9", "jump directly to tab"),
         ("Alt+\u2191/\u2193", "prev / next workspace"),
-        ("\u2302 / Alt+D", "detach to REMOTE AGENTS"),
-        ("Ctrl+]", "detach (single byte, preserved)"),
+        ("Ctrl+Home", "detach to REMOTE AGENTS"),
+        ("Alt+D / Ctrl+]", "detach (compat)"),
         ("Alt+Enter", "split pane horizontal"),
         ("Alt+Shift+Enter", "split pane vertical"),
         ("Alt+Esc", "close pane"),
@@ -703,7 +824,7 @@ def help_screen():
     out.append(f"{C_LIME}\u251c{line(inner)}\u2524{C_RESET}")
     for note in ("Prefix = Ctrl+Space",
                  "Alt needs an unsplit ESC byte;",
-                 "Termux \u2302 button sends Alt+D.",
+                 "CTRL then HOME detaches to the menu.",
                  "Ctrl+] is one byte - preserved.",
                  "Detach keeps everything running."):
         nfit = fit(note, inner - 2)

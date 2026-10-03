@@ -2,26 +2,27 @@
 
 All notable changes to TENDRIL are documented here.
 
-## v0.1.2 — ⌂ detach button + current-directory defaults
+## v0.1.2 — Ctrl+Home detach + current-directory defaults
 
-- **phone**: new `tendril-keys` helper (Termux) adds a ⌂ button to the
-  extra-keys row; its macro emits `ALT d`, so detaching is one tap:
-  ⌂ → Alt+D → Herdr detach → TENDRIL menu. The helper backs up
-  `~/.termux/termux.properties`, touches only the `extra-keys` value,
-  preserves every existing button, falls back to printed instructions for
-  layouts it cannot parse safely, and reloads via `termux-reload-settings`.
-- **no Herdr key-grammar changes**: the detach set stays
-  `prefix+d`, `alt+d`, `ctrl+]`; `Ctrl+Home` is not expressible in Herdr's
-  verified grammar, so the phone button simply sends an already-supported
-  sequence
-- installer's Android setup block copies/runs `tendril-keys`; its detach
-  merge now skips only the conflicting direct key (token-exact match)
+- **Ctrl+Home is the primary detach**: pressing CTRL then HOME on Termux's
+  extra-keys row returns to the TENDRIL selector. Termux encodes the combo
+  as `ESC [ 1 ; 5 H` (verified in termux-app's `KeyHandler`); Herdr's key
+  grammar has no Home key in any modifier combination (verified via
+  `herdr config check` and the v0.9.x config docs), so remote-agents runs
+  `herdr session attach` behind a transparent PTY bridge that rewrites
+  exactly those six bytes to Herdr's existing Alt+D detach. All other bytes
+  are forwarded unchanged — plain HOME (`ESC [ H`) keeps its normal
+  meaning, Android's system Home is untouched, and Alt+D / Ctrl+] remain
+  working compatibility bindings. Herdr's own config is unchanged
+  (`prefix+d`, `alt+d`, `ctrl+]`).
+- installer's detach merge now skips only the conflicting direct key
+  (token-exact match, so `alt+d` no longer substring-matches `alt+down`)
 - **remote-agents**: `N` (new workspace) and `S` (quick shell) inherit the
   focused workspace's directory — Enter accepts it, an explicit absolute
   path overrides it; an empty name reuses Herdr's default naming (dir
   basename); the full directory menu only appears when no usable current
   directory exists; the `P` project flow is unchanged
-- attach hints, mobile help, and ANDROID docs updated to the ⌂ flow
+- attach hints, mobile help, and ANDROID docs updated to the Ctrl+Home flow
 
 ## v0.1.1 — reliable Android/Termux detach
 
