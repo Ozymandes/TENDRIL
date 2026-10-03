@@ -4,30 +4,29 @@ All notable changes to TENDRIL are documented here.
 
 ## Unreleased
 
-- Ctrl+Home detaches on Termux without any Herdr config change: when attached
-  from `remote-agents` on Termux (auto; `TENDRIL_DETACH_BRIDGE=1` to force,
-  `=0` to disable), `herdr session attach` runs behind a transparent PTY
-  bridge that rewrites exactly Termux's `ESC [ 1 ; 5 H` to the Alt+D detach
-  Herdr already binds. Every other byte is forwarded unchanged — plain HOME
-  (`ESC [ H`), Ctrl+], Alt+D, mouse, paste, resize (SIGWINCH is propagated),
-  EOF, and the child's exit are all preserved; termios is restored on every
-  exit path including SIGTERM/SIGHUP. Alt+D / Ctrl+B d remain the documented,
-  always-working detach keys; the bridge only adds a key Herdr cannot natively
-  express (0.9.3 rejects `ctrl+home`).
-- `N` (new workspace) and `S` (quick shell) now default to the selected or
-  focused workspace's directory: Enter accepts it, an explicit absolute path
-  overrides it, and the full directory menu only appears when no usable
-  directory exists. An explicit name is used verbatim; an empty name keeps
-  the derived directory label (the CLI does not promise a label default).
-  The `P` project flow is unchanged.
+- For host TTY attachments, `remote-agents` enables the Ctrl+Home PTY bridge
+  by default, independently of `TERMUX_VERSION` or phone environment
+  forwarding. It rewrites only `ESC [ 1 ; 5 H` to Herdr's Alt+D detach key;
+  other input passes through, and non-TTY attachments keep direct passthrough.
+  Set host-side `TENDRIL_DETACH_BRIDGE=0` to disable it. The bridge does not
+  change Herdr config or require a phone-launcher update; translated detach
+  depends on Alt+D still being bound to detach.
+- The selector footer is `N New`, `I Info`, `? Help`, `R Refresh`, `Q Quit`.
+  These actions dispatch immediately on one TTY keypress, without Enter; Enter
+  remains for workspace selection and text fields. Info returns on any key;
+  Help paginates to the phone screen with any-key advance/return. Workspace
+  paths yield when needed to fit the menu and prompt with the keyboard open.
+  `N` opens the creation chooser, including shell-only creation, and keeps
+  the selected/focused workspace-directory defaults. Use `herdr-notify --test`
+  on the host to send a test notification.
 
 - The selector supports ↑/↓ highlighting and Enter-to-attach while preserving
-  numeric and command-letter input; raw TTY mode restores terminal settings on
+  numeric workspace selection; raw TTY mode restores terminal settings on
   every exit path.
-- Detach now recommends Alt+D (tap ALT then D on the phone), with Ctrl+B then D
-  as the fallback. Ctrl+Home remains optional: Herdr 0.9.3 rejects it. The
-  installer validates it before migrating legacy `ctrl+]`, preserves unrelated
-  bindings, and adds only conflict-free shortcuts.
+- Detach recommends Alt+D (tap ALT then D on the phone), with Ctrl+B then D as
+  the fallback. Native Ctrl+Home bindings remain optional; the installer
+  validates them where supported, preserves unrelated bindings, and adds only
+  conflict-free shortcuts.
 - New-workspace labels are derived from the selected cwd (the installed CLI's
   docs do not specify an automatic label default); agent names are sanitized
   from the resulting label.

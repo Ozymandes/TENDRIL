@@ -371,15 +371,12 @@ def render(rows, note="", selected=None):
         if cur:
             grouped.append(cur)
         return grouped
-    feet = foot_lines(["N New", "P Project", "S Shell", "I Info", "? Help"]) \
-        + foot_lines(["L Last", "T TestPush", "R Refresh", "Q Quit"])
+    feet = foot_lines(["N New", "I Info", "? Help", "R Refresh", "Q Quit"])
 
     compact = len(rows) > 6
-    # Phone geometry (31 rows keyboard-closed, ~22 open): the menu always wins,
-    # so decide before building whether the per-row path lines must yield. They
-    # do when dropping them buys the compact mark a slot; if even the dense
-    # layout can't fit the mark, keep the paths (the caption tier in masthead()
-    # degrades on its own from there).
+    # Paths yield when needed to keep the menu and prompt on screen, or when
+    # dropping them buys the compact mark a slot. Otherwise preserve paths;
+    # masthead() can fall back to its caption tiers independently.
     term_rows = shutil.get_terminal_size(fallback=(52, 24)).lines
     est = 4 + len(feet) + 2
     with_paths = est + sum(1 + (1 if r["path"] else 0) + (0 if compact else 1)
@@ -389,8 +386,8 @@ def render(rows, note="", selected=None):
         with_paths += 1
         without += 1
     mark = 7 + 1                                # compact tier + blank separator
-    show_paths = mark + with_paths + 1 <= term_rows \
-        or mark + without + 1 > term_rows
+    show_paths = with_paths + 1 <= term_rows and (
+        mark + with_paths + 1 <= term_rows or mark + without + 1 > term_rows)
 
     lines = []
     edge = f"{C_LIME}\u250c{line(inner)}\u2510{C_RESET}"
@@ -477,15 +474,14 @@ def load_last(rows):
 
 
 def _bridge_enabled():
-    """Ctrl+Home bridge: automatic on Termux, opt-in elsewhere.
+    """Enable the Ctrl+Home bridge by default for host TTY attachments.
 
-    TENDRIL_DETACH_BRIDGE=1 forces it on, =0 (or false/no/off) disables it
-    everywhere — the plain `herdr session attach` path is then byte-identical
-    to the pre-bridge behavior."""
+    TENDRIL_DETACH_BRIDGE=1 explicitly enables it; =0 (or false/no/off/empty)
+    opts out and restores the direct `herdr session attach` path."""
     raw = os.environ.get("TENDRIL_DETACH_BRIDGE")
     if raw is not None:
         return raw.strip().lower() not in ("", "0", "false", "no", "off")
-    return bool(os.environ.get("TERMUX_VERSION"))
+    return True
 
 
 def attach(row):
@@ -504,15 +500,15 @@ def attach(row):
         subprocess.run([HERDR, "session", "attach", SESSION], check=False)
 
 
-# ---------- Ctrl+Home detach bridge (optional TENDRIL convenience) ----------
+# ---------- Ctrl+Home detach bridge (default-on TENDRIL convenience) ----------
 # Termux encodes Ctrl+Home as `ESC [ 1 ; 5 H` (termux-app KeyHandler.getCode +
 # transformForModifiers: KEYMOD_CTRL -> xterm modifier 5). Herdr's key grammar
 # has no Home key in any modifier combination, so `herdr session attach` runs
 # behind a transparent PTY bridge that rewrites exactly those six bytes to the
 # Alt+D detach (`ESC d`) Herdr already binds. Every other byte — including
 # plain Home (`ESC [ H`) — is forwarded unchanged. Herdr's config is untouched;
-# Alt+D and Ctrl+B d keep working, and TENDRIL_DETACH_BRIDGE=0 turns the whole
-# bridge off.
+# Alt+D and Ctrl+B d keep working. The host TTY bridge is enabled by default;
+# TENDRIL_DETACH_BRIDGE=0 turns it off.
 _CTRL_HOME = b"\x1b[1;5H"
 _ALT_D = b"\x1bd"
 
@@ -962,8 +958,8 @@ def read_menu_action(tty_mode, fd=None):
 
 
 def _read_tty_action(fd):
-    prompt = "↑/↓ select · Enter attach · number / command> "
-    sys.stdout.write(C_GRAY + chr(10) + prompt + C_RESET)
+    prompt = "↑/↓ · number + Enter · key> "
+    sys.stdout.write(C_GRAY + prompt + C_RESET)
     sys.stdout.flush()
     text = ""
     while True:
@@ -980,6 +976,9 @@ def _read_tty_action(fd):
                 sys.stdout.write(chr(13) + C_GRAY + prompt + text + chr(27) + "[K" + C_RESET)
                 sys.stdout.flush()
             continue
+        if key == "?" or (isinstance(key, str) and len(key) == 1
+                           and key.lower() in ("n", "i", "r", "q")):
+            return "line", key
         if isinstance(key, str) and len(key) == 1 and key.isprintable():
             text += key
             sys.stdout.write(key)
@@ -1028,15 +1027,22 @@ def help_screen():
         return s if len(s) <= n else s[: max(1, n - 1)] + "\u2026"
 
     rows = [
+        ("N", "new workspace"),
+        ("I", "host/workspace info"),
+        ("?", "show this help"),
+        ("R", "refresh workspaces"),
+        ("Q", "quit selector"),
+        ("number + Enter", "attach workspace"),
+        ("up/down + Enter", "select and attach"),
+        ("Alt+D", "detach to selector"),
+        ("Ctrl+B d", "detach fallback"),
+        ("Ctrl+Home", "detach (host bridge)"),
         ("Ctrl+B 1..9", "jump to workspace"),
-        ("Alt+1..9", "jump to workspace (no prefix)"),
-        ("Ctrl+B w", "workspace picker (digits work)"),
-        ("Ctrl+B n/p", "next / previous tab (phone-safe)"),
-        ("Alt+\u2190/\u2192", "prev / next tab (desktop encoding)"),
-        ("Alt+\u2191/\u2193", "prev / next workspace (desktop)"),
-        ("Alt+D", "detach to REMOTE AGENTS"),
-        ("Ctrl+B d", "detach (fallback)"),
-        ("Ctrl+Home", "detach (TENDRIL bridge; Termux default)"),
+        ("Alt+1..9", "jump without prefix"),
+        ("Ctrl+B w", "workspace picker"),
+        ("Ctrl+B n/p", "next / previous tab"),
+        ("Alt+\u2190/\u2192", "previous / next tab"),
+        ("Alt+\u2191/\u2193", "previous / next workspace"),
         ("Alt+Enter", "split pane horizontal"),
         ("Alt+Shift+Enter", "split pane vertical"),
         ("Alt+Esc", "close pane"),
@@ -1062,23 +1068,30 @@ def help_screen():
         out.append(f"{C_LIME}\u2502{C_RESET}" + body + " " * padn
                    + f" {C_LIME}\u2502{C_RESET}")
     out.append(f"{C_LIME}\u251c{line(inner)}\u2524{C_RESET}")
-    for note in ("Prefix = Ctrl+B; Ctrl+B 1..9 = workspace",
-                 "Alt needs the xterm modifier form -",
-                 "phones: Ctrl+B chords, ALT+digit.",
-                 "Phone: tap ALT then D to detach.",
-                 "Fallback: Ctrl+B then D.",
-                 "Ctrl+Home: TENDRIL bridges it; no",
-                 "Herdr config change. Set",
-                 "TENDRIL_DETACH_BRIDGE=0 to disable.",
+    for note in ("Menu letters: no Enter needed.",
+                 "Ctrl+Home bridge: default on.",
+                 "Alt+arrows: desktop only.",
+                 "Phone: Ctrl+B; ALT+digit.",
+                 "Disable on host with:",
+                 "TENDRIL_DETACH_BRIDGE=0",
+                 "(false/no/off/empty also disable).",
+                 "Alt+D or Ctrl+B then D detaches.",
                  "Detach keeps workspaces and agents."):
         nfit = fit(note, inner - 2)
         out.append(f"{C_LIME}\u2502{C_RESET} {C_GRAY}{nfit}{C_RESET}"
                    + " " * max(0, inner - 1 - len(nfit))
                    + f"{C_LIME}\u2502{C_RESET}")
     out.append(f"{C_LIME}\u2514{line(inner)}\u2518{C_RESET}")
-    print("\033[H\033[2J" + "\n".join(out), flush=True)
-    print(f"{C_GRAY}press any key to return...{C_RESET}", end="", flush=True)
-    wait_for_key()
+    # Keep the complete reference readable with the phone keyboard open.
+    # Reserve three header rows, a bottom border, and one prompt row.
+    page_size = max(1, shutil.get_terminal_size(fallback=(48, 24)).lines - 5)
+    body = out[3:-1]
+    for start in range(0, len(body), page_size):
+        page = out[:3] + body[start:start + page_size] + out[-1:]
+        print("\033[H\033[2J" + "\n".join(page), flush=True)
+        action = "for more" if start + page_size < len(body) else "to return"
+        print(f"{C_GRAY}press any key {action}...{C_RESET}", end="", flush=True)
+        wait_for_key()
 
 
 def info():
@@ -1119,7 +1132,8 @@ def info():
     rc_n, _, _ = run(["systemctl", "--user", "is-active", "herdr-notify"], 3)
     watch = f"{C_TEAL}RUNNING{C_RESET}" if rc_n == 0 else f"{C_GRAY}STOPPED{C_RESET}"
     print(f"{C_GRAY}Push       {push}{C_RESET}   {C_GRAY}Watcher    {watch}{C_RESET}")
-    input(f"{C_GRAY}Enter to continue...{C_RESET}")
+    print(f"{C_GRAY}press any key to continue...{C_RESET}", end="", flush=True)
+    wait_for_key()
 
 
 def workspace_number(raw, count):
@@ -1172,38 +1186,16 @@ def menu_loop(rows, tty_mode=False, fd=None):
             else:
                 preferred_id = rows[index]["id"]
                 attach(rows[index])
-        elif raw in ("q", "Q"):
+        elif raw.lower() == "q":
             return 0
-        elif raw in ("r", "R"):
+        elif raw.lower() == "r":
             pass
-        elif raw in ("n", "N"):
+        elif raw.lower() == "n":
             preferred_id = new_workspace(rows, selected) or preferred_id
-        elif raw in ("p", "P"):
-            preferred_id = project_launcher() or preferred_id
-        elif raw in ("s", "S"):
-            preferred_id = quick_shell(rows, selected) or preferred_id
-        elif raw in ("i", "I"):
+        elif raw.lower() == "i":
             info()
         elif raw == "?":
             help_screen()
-        elif raw in ("t", "T"):
-            nb = (NOTIFY_BIN if os.path.isfile(NOTIFY_BIN) else
-                  os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "herdr-notify"))
-            if os.path.isfile(nb):
-                rc_t, out_t, _ = run([sys.executable, nb, "--test"], 15)
-                lines_t = out_t.strip().splitlines()
-                note = lines_t[-1] if lines_t else (
-                    "test push sent - check the phone" if rc_t == 0 else "test failed")
-            else:
-                note = "herdr-notify not installed"
-        elif raw in ("l", "L"):
-            last = load_last(rows)
-            if last:
-                preferred_id = last["id"]
-                attach(last)
-            else:
-                note = "no remembered workspace yet"
         else:
             note = f"unknown: {raw}"
 

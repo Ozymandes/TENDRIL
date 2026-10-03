@@ -71,17 +71,116 @@ class KeyReader(unittest.TestCase):
             self.assertEqual(ra.read_menu_action(True, self.slave), ("line", "124"))
         self.assertEqual(termios.tcgetattr(self.slave), original)
 
-    def test_enter_and_command_keys_are_distinct_actions(self):
+    def test_enter_and_footer_keys_are_distinct_actions(self):
         with mock.patch.object(ra.sys, "stdout", io.StringIO()):
-            os.write(self.master, bytes([13]))
-            self.assertEqual(ra.read_menu_action(True, self.slave), ("enter", ""))
-            os.write(self.master, b"N" + bytes([13]))
-            self.assertEqual(ra.read_menu_action(True, self.slave), ("line", "N"))
+            with ra.raw_terminal(self.slave):
+                os.write(self.master, bytes([13]))
+                self.assertEqual(ra._read_tty_action(self.slave), ("enter", ""))
+                for key in (b"n", b"N", b"i", b"I", b"?", b"r", b"R", b"q", b"Q"):
+                    with self.subTest(key=key):
+                        os.write(self.master, key)
+                        self.assertEqual(ra._read_tty_action(self.slave),
+                                         ("line", key.decode()))
+
+    def test_footer_key_dispatches_after_buffered_digits_without_enter(self):
+        with mock.patch.object(ra.sys, "stdout", io.StringIO()):
+            with ra.raw_terminal(self.slave):
+                for key in (b"n", b"N", b"i", b"I", b"?", b"r", b"R", b"q", b"Q"):
+                    with self.subTest(key=key):
+                        os.write(self.master, b"123" + key)
+                        self.assertEqual(ra._read_tty_action(self.slave),
+                                         ("line", key.decode()))
+
+    def test_prompt_fits_narrow_screen_without_an_extra_blank_row(self):
+        output = io.StringIO()
+        with mock.patch.object(ra.sys, "stdout", output):
+            os.write(self.master, b"q")
+            self.assertEqual(ra.read_menu_action(True, self.slave), ("line", "q"))
+        plain = ra.re.sub(r"\x1b\[[0-9;]*m", "", output.getvalue())
+        self.assertNotIn("\n", plain)
+        self.assertLessEqual(len(plain), 34)
+        self.assertIn("number + Enter", plain)
+
+    def test_wait_for_key_accepts_any_tty_key_without_enter(self):
+        stdin = mock.Mock()
+        stdin.isatty.return_value = True
+        stdin.fileno.return_value = self.slave
+        with mock.patch.object(ra.sys, "stdin", stdin):
+            with ra.raw_terminal(self.slave):
+                os.write(self.master, b"x")
+                ra.wait_for_key()
 
     def test_non_tty_keeps_line_input(self):
         with mock.patch("builtins.input", return_value="12") as read_line:
             self.assertEqual(ra.read_menu_action(False), ("line", "12"))
         read_line.assert_called_once_with("> ")
+
+
+class Panels(unittest.TestCase):
+    def test_help_lists_selector_keys_default_bridge_and_opt_out(self):
+        output = io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(output))
+            stack.enter_context(mock.patch.object(ra, "wait_for_key"))
+            ra.help_screen()
+        text = output.getvalue()
+        for expected in ("new workspace", "host/workspace info", "quit selector",
+                         "detach (host bridge)", "Ctrl+Home bridge: default on.",
+                         "TENDRIL_DETACH_BRIDGE=0", "false/no/off/empty"):
+            self.assertIn(expected, text)
+
+    def test_help_pages_fit_phone_screen_including_any_key_prompt(self):
+        for height in (22, 31):
+            with self.subTest(height=height):
+                output = io.StringIO()
+                with contextlib.ExitStack() as stack:
+                    stack.enter_context(contextlib.redirect_stdout(output))
+                    stack.enter_context(mock.patch.object(
+                        ra.shutil, "get_terminal_size",
+                        return_value=os.terminal_size((34, height))))
+                    wait = stack.enter_context(mock.patch.object(ra, "wait_for_key"))
+                    ra.help_screen()
+                pages = output.getvalue().split("\033[H\033[2J")[1:]
+                self.assertGreater(len(pages), 1)
+                self.assertEqual(wait.call_count, len(pages))
+                for page in pages:
+                    plain = ra.re.sub(r"\x1b\[[0-9;]*m", "", page)
+                    self.assertLessEqual(len(plain.splitlines()), height)
+                    for line in plain.splitlines():
+                        self.assertLessEqual(len(line), 34)
+                self.assertIn("press any key for more", pages[0])
+                self.assertIn("press any key to return", pages[-1])
+                self.assertIn("TENDRIL_DETACH_BRIDGE=0", output.getvalue())
+
+    def test_info_returns_via_any_key_wait(self):
+        def fake_run(args, timeout=6):
+            command = args[0]
+            if command == "tailscale":
+                return 1, "", ""
+            if command == "uptime":
+                return 0, "up 1 hour\n", ""
+            if command == "df":
+                return 0, "Filesystem Size Used Avail Use% Mounted on\n/dev/root 100G 20G 80G 20% /\n", ""
+            if command == "systemctl":
+                return 1, "", ""
+            self.fail(f"unexpected command: {args}")
+
+        def fake_open(path, *args, **kwargs):
+            if path == "/proc/loadavg":
+                return io.StringIO("0.1 0.2 0.3 4/100 1\n")
+            if path == "/proc/meminfo":
+                return io.StringIO("MemAvailable: 1024 kB\nMemTotal: 4096 kB\n")
+            raise OSError(path)
+
+        with contextlib.ExitStack() as stack:
+            wait = stack.enter_context(mock.patch.object(ra, "wait_for_key"))
+            stack.enter_context(mock.patch.object(ra, "run", side_effect=fake_run))
+            stack.enter_context(mock.patch.object(ra, "collect", return_value=[]))
+            stack.enter_context(mock.patch("builtins.open", side_effect=fake_open))
+            stack.enter_context(mock.patch("builtins.input", side_effect=AssertionError("line input used")))
+            with contextlib.redirect_stdout(io.StringIO()):
+                ra.info()
+        wait.assert_called_once_with()
 
 
 class Selection(unittest.TestCase):
@@ -281,6 +380,30 @@ class DirectoryInheritance(unittest.TestCase):
         self.assertEqual(events[1], ("create", cwd, os.path.basename(cwd)))
         self.assertEqual(events[2], ("attach", "w-auto"))
 
+    def test_n_shell_only_creation_inherits_selected_workspace_cwd(self):
+        created = {"result": {"workspace": {"workspace_id": "w-shell"}}}
+        with tempfile_directory() as cwd:
+            rows = [{"id": "w0", "focused": True, "path": cwd}]
+            created_rows = rows + [{"id": "w-shell", "label": "shell-inherited",
+                                    "focused": False, "path": cwd}]
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(ra, "render"))
+                stack.enter_context(mock.patch.object(
+                    ra, "read_menu_action",
+                    side_effect=[("line", "N"), ("line", "q")]))
+                stack.enter_context(mock.patch.object(ra, "ask_agent", return_value="shell"))
+                stack.enter_context(mock.patch.object(ra, "confirm", return_value=True))
+                create = stack.enter_context(mock.patch.object(
+                    ra, "ws_create", return_value=(created, None)))
+                started = stack.enter_context(mock.patch.object(ra, "start_agent"))
+                stack.enter_context(mock.patch.object(ra, "collect", return_value=created_rows))
+                attach = stack.enter_context(mock.patch.object(ra, "attach"))
+                stack.enter_context(mock.patch("builtins.input", side_effect=["shell-inherited", ""]))
+                self.assertEqual(ra.menu_loop(rows, tty_mode=True, fd=0), 0)
+            create.assert_called_once_with(cwd, "shell-inherited")
+            started.assert_not_called()
+            attach.assert_called_once_with(created_rows[1])
+
     def test_explicit_absolute_path_overrides_inherited_default(self):
         created = {"result": {
             "workspace": {"workspace_id": "w2"},
@@ -335,23 +458,38 @@ class DirectoryInheritance(unittest.TestCase):
         for path, label in creates:
             self.assertRegex(label, r"^shell-\d{6}$")
 
-    def test_menu_passes_selection_into_n_and_s_flows(self):
-        rows = [{"id": "w1", "focused": True}]
-        calls = []
+    def test_menu_passes_selection_into_n_flow_only(self):
+        rows = [{"id": "w1", "focused": True}, {"id": "w2", "focused": False}]
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(ra, "render"))
             stack.enter_context(mock.patch.object(
                 ra, "read_menu_action",
-                side_effect=[("line", "n"), ("line", "s"), ("line", "q")]))
+                side_effect=[("navigate", "down"), ("line", "n"), ("line", "q")]))
+            new_workspace = stack.enter_context(mock.patch.object(ra, "new_workspace"))
+            quick_shell = stack.enter_context(mock.patch.object(ra, "quick_shell"))
+            stack.enter_context(mock.patch.object(ra, "collect", return_value=rows))
+            ra.menu_loop(rows, tty_mode=True, fd=0)
+        new_workspace.assert_called_once_with(rows, 1)
+        quick_shell.assert_not_called()
+
+    def test_removed_p_s_l_t_keys_do_not_dispatch_menu_actions(self):
+        rows = [{"id": "w1", "focused": True}]
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(mock.patch.object(ra, "render"))
             stack.enter_context(mock.patch.object(
-                ra, "new_workspace",
-                side_effect=lambda r, s: calls.append(("n", r, s))))
-            stack.enter_context(mock.patch.object(
-                ra, "quick_shell",
-                side_effect=lambda r, s: calls.append(("s", r, s))))
+                ra, "read_menu_action",
+                side_effect=[("line", key) for key in ("P", "p", "S", "s", "L", "l", "T", "t")]
+                + [("line", "q")]))
+            project = stack.enter_context(mock.patch.object(ra, "project_launcher"))
+            shell = stack.enter_context(mock.patch.object(ra, "quick_shell"))
+            last = stack.enter_context(mock.patch.object(ra, "load_last"))
+            run = stack.enter_context(mock.patch.object(ra, "run"))
             stack.enter_context(mock.patch.object(ra, "collect", return_value=rows))
             ra.menu_loop(rows, tty_mode=False)
-        self.assertEqual(calls, [("n", rows, 0), ("s", rows, 0)])
+        project.assert_not_called()
+        shell.assert_not_called()
+        last.assert_not_called()
+        run.assert_not_called()
 
 
 class CtrlHomeBridge(unittest.TestCase):
@@ -405,9 +543,10 @@ class CtrlHomeBridge(unittest.TestCase):
 
     # ---- real-PTY harness: driver runs _attach_session with our pty slave
 
-    def _bridge_session(self, stub_body):
-        """Start `python driver.py` with stdin/stdout on a fresh pty.
-        Returns (process, master, slave, tmpdir)."""
+    def _bridge_session(self, stub_body, through_attach=False):
+        """Start a clean-host driver with stdin/stdout on a fresh pty.
+        Optionally exercise attach()'s real gate, with focus/cache side effects
+        stubbed. Returns (process, master, slave, original termios, tmpdir)."""
         tmp = tempfile.mkdtemp(prefix="tendril-bridge-")
         stub = os.path.join(tmp, "stub-herdr")
         with open(stub, "w") as f:
@@ -423,12 +562,18 @@ class CtrlHomeBridge(unittest.TestCase):
                 "        'ra', SourceFileLoader('ra', %r)))\n" % CLI +
                 "SourceFileLoader('ra', %r).exec_module(mod)\n" % CLI +
                 "mod.HERDR = %r\n" % stub +
-                "mod._attach_session()\n")
+                ("mod.run = lambda *a, **kw: (0, '', '')\n"
+                 "mod.save_last = lambda row: None\n"
+                 "mod.attach({'id': 'w-test', 'label': 'test'})\n"
+                 if through_attach else "mod._attach_session()\n"))
         master, slave = pty.openpty()
         orig = termios.tcgetattr(slave)   # before the driver can go raw
+        env = dict(os.environ)
+        for key in ("TERMUX_VERSION", "TENDRIL_DETACH_BRIDGE", "HERDR_ENV"):
+            env.pop(key, None)
         proc = subprocess.Popen(
             [sys.executable, driver_path], stdin=slave, stdout=slave,
-            stderr=slave, close_fds=True)
+            stderr=slave, close_fds=True, env=env)
         return proc, master, slave, orig, tmp
 
     def _read_until(self, master, predicate, timeout=8.0):
@@ -485,6 +630,20 @@ class CtrlHomeBridge(unittest.TestCase):
         self.assertIn(b"1b5b48", out)        # HOME forwarded verbatim
         self.assertIn(b"1b5b481b64", out)    # ...then ESC d (the detach)
         self.assertEqual(proc.wait(10), 0)   # session exit reaped cleanly
+        self.assertEqual(termios.tcgetattr(slave), orig)
+
+    def test_clean_host_attach_uses_real_bridge_and_translates_ctrl_home(self):
+        stub = self.ECHO_STUB.replace("buf = b''\n",
+                                      "print('BRIDGE_READY', flush=True)\nbuf = b''\n")
+        proc, master, slave, orig, tmp = self._bridge_session(stub, through_attach=True)
+        self.addCleanup(self._cleanup, proc, master, slave, tmp)
+        ready = self._read_until(master, lambda data: b"BRIDGE_READY" in data)
+        self.assertIn(b"BRIDGE_READY", ready)
+        self.assertIn(b"Ctrl+Home", ready)
+        os.write(master, b"\x1b[1;5H")
+        out = self._read_until(master, lambda data: b"1b64" in data)
+        self.assertIn(b"1b64", out)
+        self.assertEqual(proc.wait(10), 0)
         self.assertEqual(termios.tcgetattr(slave), orig)
 
     def test_held_partial_sequence_flushes_when_input_goes_idle(self):
@@ -554,8 +713,7 @@ class CtrlHomeBridge(unittest.TestCase):
 
 
 class DetachGate(unittest.TestCase):
-    """The bridge is a TENDRIL convenience: automatic on Termux, opt-in
-    elsewhere, TENDRIL_DETACH_BRIDGE=0 disables it everywhere."""
+    """The host TTY bridge is enabled by default; false-like values opt out."""
 
     ENV_KEYS = ("TERMUX_VERSION", "TENDRIL_DETACH_BRIDGE")
 
@@ -564,9 +722,13 @@ class DetachGate(unittest.TestCase):
         try:
             for env, want in (
                     ({"TERMUX_VERSION": "0.118"}, True),
-                    ({}, False),
-                    ({"TERMUX_VERSION": "0.118", "TENDRIL_DETACH_BRIDGE": "0"}, False),
+                    ({}, True),
                     ({"TENDRIL_DETACH_BRIDGE": "1"}, True),
+                    ({"TENDRIL_DETACH_BRIDGE": "0"}, False),
+                    ({"TENDRIL_DETACH_BRIDGE": "false"}, False),
+                    ({"TENDRIL_DETACH_BRIDGE": "no"}, False),
+                    ({"TENDRIL_DETACH_BRIDGE": "off"}, False),
+                    ({"TENDRIL_DETACH_BRIDGE": ""}, False),
                     ({"TERMUX_VERSION": "x", "TENDRIL_DETACH_BRIDGE": "off"}, False),
             ):
                 for k in self.ENV_KEYS:
@@ -583,6 +745,7 @@ class DetachGate(unittest.TestCase):
         row = {"id": "w9", "label": "demo"}
         for enabled in (True, False):
             with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(os.environ, {"HERDR_ENV": "0"}))
                 stack.enter_context(mock.patch.object(
                     ra, "_bridge_enabled", return_value=enabled))
                 run = stack.enter_context(mock.patch.object(ra, "run"))
@@ -597,11 +760,24 @@ class DetachGate(unittest.TestCase):
             self.assertIn("Ctrl+Home" if enabled else "Alt+D", buf.getvalue())
             self.assertIn("menu returns here", buf.getvalue())
 
+    def test_clean_host_environment_attaches_through_default_bridge(self):
+        row = {"id": "w9", "label": "demo"}
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with contextlib.ExitStack() as stack:
+                bridge = stack.enter_context(mock.patch.object(ra, "_attach_session"))
+                stack.enter_context(mock.patch.object(ra, "run"))
+                stack.enter_context(mock.patch.object(ra, "save_last"))
+                stack.enter_context(mock.patch.object(ra.subprocess, "run"))
+                with contextlib.redirect_stdout(io.StringIO()):
+                    ra.attach(row)
+        bridge.assert_called_once_with()
+
     def test_attach_session_falls_back_without_tty(self):
         attached = []
         orig_stdin = sys.stdin
         r, w = os.pipe()
-        sys.stdin = os.fdopen(r, "rb")
+        test_stdin = os.fdopen(r, "rb")
+        sys.stdin = test_stdin
         with mock.patch.object(
                 ra.subprocess, "run",
                 staticmethod(lambda args, check=False: attached.append(args))):
@@ -609,6 +785,7 @@ class DetachGate(unittest.TestCase):
                 ra._attach_session()
             finally:
                 sys.stdin = orig_stdin
+                test_stdin.close()
                 os.close(w)
         self.assertTrue(attached and attached[0][1:3] == ["session", "attach"])
 

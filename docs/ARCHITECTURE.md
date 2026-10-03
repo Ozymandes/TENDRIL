@@ -25,18 +25,26 @@ Android Termux                            Linux + systemd (user)
 - Attach = `herdr workspace focus <id>` + `herdr session attach`; when the
   client exits (detach `Alt+D`, fallback Ctrl+B then D, lost connection,
   closed terminal) the menu redraws. Panes survive everything short of
-  `herdr server stop`. The installer adds only conflict-free bindings;
-  Ctrl+Home is optional on clients that validate it (not Herdr 0.9.3).
+  `herdr server stop`. For TTY attachments, the host enables a PTY bridge by
+  default, translating only `ESC [ 1 ; 5 H` to Alt+D. This does not depend on
+  `TERMUX_VERSION` being forwarded and works over SSH or Mosh; host-side
+  `TENDRIL_DETACH_BRIDGE=0` disables it. Non-TTY attachments use direct
+  passthrough. This bridge is separate from optional native Herdr bindings.
 - The selector reads TTY keys in raw mode with guaranteed terminal restoration,
   decodes CSI and SS3 arrows for selection, and restores the chosen workspace
-  across refreshes and attach returns. Non-TTY input keeps its line-based menu.
-- New-workspace creation derives its label from the selected initial-tab cwd
-  (the directory basename), because the installed CLI documents `--label` as
-  optional but does not specify an automatic label default. The label is also
-  sanitized into a valid agent name when starting an agent.
-- New workspace (`N`) / project launcher (`P`) / quick shell (`S`) create
-  workspaces via the socket API, start agents with `herdr agent start`
-  (waits for `interactive_ready`), then attach.
+  across refreshes and attach returns. Its footer is exactly `N New`, `I Info`,
+  `? Help`, `R Refresh`, and `Q Quit`; each action dispatches on one TTY key,
+  without Enter. Enter remains for workspace selection and text prompts. Info
+  returns on any key; Help paginates to terminal height with any-key advance
+  and return. Paths yield when needed to keep the menu and prompt visible.
+  Non-TTY input keeps its line-based menu.
+- `N` opens the new-workspace chooser, including a shell-only option. Creation
+  keeps the selected/focused existing workspace directory as its default when
+  available; an explicit absolute path can override it, with the directory
+  chooser as fallback when no usable cwd exists. New-workspace labels derive
+  from the selected initial-tab cwd (the directory basename), because the
+  installed CLI does not specify an automatic label default; agent names are
+  sanitized from the resulting label.
 - Herdr client selection: PATH → explicit config → mise installs, newest
   first; every candidate is probed (`--version` + `status`) and only a
   client whose protocol is **compatible with the running server** is chosen.
