@@ -150,24 +150,49 @@ ICON = {"working": "\u25cf", "blocked": "\u25c6", "done": "\u2713",
 SHORT = {"pi": "PI", "claude": "CL", "codex": "CX", "gemini": "GE",
          "cursor": "CU", "opencode": "OC", "copilot": "CP"}
 
+# ---------- terminal capability model (deliberately small) ----------
+def terminal_name(env=None):
+    """'termux' | 'blink' | generic terminal family name.
+
+    Termux self-identifies (TERMUX_VERSION, forwarded by its ssh).
+    Everything else is opt-in: users who want terminal-aware hints set
+    TENDRIL_TERMINAL=blink (Blink Shell) — Blink sends no distinguishing
+    env over SSH. Unknown values pass through as-is so future clients
+    need no code change."""
+    if env is None:
+        env = os.environ
+    if env.get("TERMUX_VERSION"):
+        return "termux"                        # self-identified; wins
+    custom = (env.get("TENDRIL_TERMINAL") or "").strip().lower()
+    if re.match(r"^[a-z0-9_-]{1,24}$", custom):
+        return custom
+    return "generic"
+
+
+def pick_palette(colorterm):
+    """(lime, teal, gray, red): truecolor where the terminal advertises it
+    (COLORTERM), else the nearest 256-colour approximations. mosh < 1.4
+    silently drops 38;2;r;g;b sequences (Ubuntu 22.04 ships 1.3.2), which
+    rendered the whole phone UI monochrome; the 256-colour entries survive
+    every transport."""
+    if (colorterm or "").lower() in ("truecolor", "24bit"):
+        return ("\033[38;2;203;253;117m", "\033[38;2;47;179;196m",
+                "\033[38;2;112;128;136m", "\033[38;2;232;92;111m")
+    return ("\033[38;5;191m", "\033[38;5;73m",           # #d7ff87 ~ #CBFD75
+            "\033[38;5;244m", "\033[38;5;203m")         # #808080 ~ #708088, #ff5f5f ~ #E85C6F
+
+
+def color_enabled(isatty, no_color, term):
+    """Colour on real ttys only: NO_COLOR disables, so does TERM=dumb."""
+    return isatty and no_color is None and term != "dumb"
+
+
 C_RESET = "\033[0m"
 C_WHITE = "\033[97m"
-# Truecolour only where the terminal advertises it (COLORTERM). mosh < 1.4
-# silently drops 38;2;r;g;b sequences (Ubuntu 22.04 ships 1.3.2), which
-# rendered the whole phone UI monochrome; the 256-colour entries are the
-# nearest approximations and survive every transport.
-_PALETTE = (
-    ("\033[38;2;203;253;117m", "\033[38;2;47;179;196m",
-     "\033[38;2;112;128;136m", "\033[38;2;232;92;111m")
-    if os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit")
-    else
-    ("\033[38;5;191m", "\033[38;5;73m",           # #d7ff87 ~ #CBFD75
-     "\033[38;5;244m", "\033[38;5;203m")         # #808080 ~ #708088, #ff5f5f ~ #E85C6F
-)
+_PALETTE = pick_palette(os.environ.get("COLORTERM"))
 C_LIME, C_TEAL, C_GRAY, C_RED = _PALETTE
-COLOR = (sys.stdout.isatty()
-         and os.environ.get("NO_COLOR") is None
-         and os.environ.get("TERM", "") != "dumb")
+COLOR = color_enabled(sys.stdout.isatty(), os.environ.get("NO_COLOR"),
+                      os.environ.get("TERM", ""))
 if not COLOR:
     C_RESET = C_LIME = C_TEAL = C_GRAY = C_WHITE = C_RED = ""
 
@@ -489,11 +514,12 @@ def _bridge_enabled():
 
     TENDRIL_DETACH_BRIDGE=1 forces it on, =0 (or false/no/off) disables it
     everywhere — the plain `herdr session attach` path is then byte-identical
-    to the pre-bridge behavior."""
+    to the pre-bridge behavior. Blink (and every non-Termux client) never
+    gets it by default: Blink's on-screen keyboard cannot produce Ctrl+Home."""
     raw = os.environ.get("TENDRIL_DETACH_BRIDGE")
     if raw is not None:
         return raw.strip().lower() not in ("", "0", "false", "no", "off")
-    return bool(os.environ.get("TERMUX_VERSION"))
+    return terminal_name() == "termux"
 
 
 def attach(row):
@@ -1044,7 +1070,6 @@ def help_screen():
         ("Alt+\u2191/\u2193", "prev / next workspace (desktop)"),
         ("Alt+D", "detach to REMOTE AGENTS"),
         ("Ctrl+B d", "detach (fallback)"),
-        ("Ctrl+Home", "detach (TENDRIL bridge; Termux default)"),
         ("Alt+Enter", "split pane horizontal"),
         ("Alt+Shift+Enter", "split pane vertical"),
         ("Alt+Esc", "close pane"),
@@ -1055,6 +1080,8 @@ def help_screen():
     ]
     kcol = 18
     dbudget = inner - 4 - kcol
+    if terminal_name() == "blink":           # no on-screen Home key there:
+        rows = [r for r in rows if r[0] != "Ctrl+Home"]   # unproducible combo
     out = [f"{C_LIME}\u250c{line(inner)}\u2510{C_RESET}"]
     t = " HERDR // MOBILE KEYS"
     out.append(f"{C_LIME}\u2502{C_RESET}"
@@ -1070,15 +1097,22 @@ def help_screen():
         out.append(f"{C_LIME}\u2502{C_RESET}" + body + " " * padn
                    + f" {C_LIME}\u2502{C_RESET}")
     out.append(f"{C_LIME}\u251c{line(inner)}\u2524{C_RESET}")
-    for note in ("Prefix = Ctrl+B; Ctrl+B 1..9 = workspace",
-                 "Alt needs the xterm modifier form -",
-                 "phones: Ctrl+B chords, ALT+digit.",
-                 "Phone: tap ALT then D to detach.",
-                 "Fallback: Ctrl+B then D.",
-                 "Ctrl+Home: TENDRIL bridges it; no",
-                 "Herdr config change. Set",
-                 "TENDRIL_DETACH_BRIDGE=0 to disable.",
-                 "Detach keeps workspaces and agents."):
+    notes = ["Prefix = Ctrl+B; Ctrl+B 1..9 = workspace",
+             "Alt needs the xterm modifier form -",
+             "phones: Ctrl+B chords, ALT+digit.",
+             "Phone: tap ALT then D to detach.",
+             "Fallback: Ctrl+B then D."]
+    if terminal_name() == "blink":       # no on-screen Home key in Blink
+        notes += ["Blink: no Home key on screen;",
+                  "detach = tap ALT then D;",
+                  "TENDRIL_TERMINAL=blink selects",
+                  "these hints."]
+    else:
+        notes += ["Ctrl+Home: TENDRIL bridges it; no",
+                  "Herdr config change. Set",
+                  "TENDRIL_DETACH_BRIDGE=0 to disable."]
+    notes.append("Detach keeps workspaces and agents.")
+    for note in notes:
         nfit = fit(note, inner - 2)
         out.append(f"{C_LIME}\u2502{C_RESET} {C_GRAY}{nfit}{C_RESET}"
                    + " " * max(0, inner - 1 - len(nfit))
