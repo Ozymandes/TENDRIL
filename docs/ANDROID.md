@@ -119,6 +119,43 @@ directory — Enter accepts it, an absolute path overrides it, an empty name
 keeps the directory-based label. `S` opens a shell in that directory too.
 The `P` project picker is unchanged.
 
+## Deep links: tap a notification, land in the session
+
+Termux registers no URL schemes, so a bare notification tap cannot open
+Termux. What Termux does reliably: when a URL is **shared** to the Termux
+app it runs `~/bin/termux-url-opener <url>`. The repo ships that script —
+`phone/termux-url-opener` — and it recognizes TENDRIL links like
+`https://…/.tendril/w15` (also `?id=…`/`?p=…` pairs), validates the id and
+runs `tendril attach <id>` for you.
+
+Install it on the phone (`HOST` = ssh alias, `REPO` = host checkout path,
+as in step 5 above):
+
+```sh
+set -e
+HOST=home
+REPO=/path/to/tendril
+mkdir -p "$HOME/bin"
+scp "$HOST:$REPO/phone/termux-url-opener" "$HOME/bin/termux-url-opener"
+chmod 700 "$HOME/bin/termux-url-opener"
+```
+
+Two ways in:
+
+1. **Share flow (works today, zero setup beyond the install):** share any
+   `https://…/.tendril/<id>` URL from any app → Termux → the session opens.
+2. **One-tap flow (needs MacroDroid or Tasker):** the ntfy app broadcasts
+   `io.heckel.ntfy.MESSAGE_RECEIVED` per message (enable "broadcast
+   messages" in ntfy settings); MacroDroid turns that into a SEND intent
+   to Termux (no extra permission) or a RUN_COMMAND call of
+   `~/bin/tendril attach <id>` (needs `allow-external-apps=true` and the
+   `RUN_COMMAND` permission grant). Exact intent fields are in
+   **docs/DEEPLINK.md**.
+
+On iOS the equivalent is an ntfy tap → Shortcut → `remote-agents focus`
+over SSH → Blink; the full recipe and the canonical `tendril://` link
+format also live in docs/DEEPLINK.md.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -130,3 +167,4 @@ The `P` project picker is unchanged.
 | `Alt+D` does not detach | Tap ALT then D; if the keyboard encoding or a custom binding prevents it, use Ctrl+B then D. The installer adds these bindings only when conflict-free. |
 | `Ctrl+Home` does not detach | On Termux the TENDRIL bridge rewrites `ESC [ 1 ; 5 H` to Alt+D — check `cat -v` shows `^[[1;5H` for the combo, and that you attached from `remote-agents` (the bridge lives there). `TENDRIL_DETACH_BRIDGE=0` turns the bridge off; then use Alt+D. Herdr itself rejects `ctrl+home`, so the installer only adds it natively on versions that validate it. |
 | garbled glyphs | `pkg install font-firas-mono` or any Nerd Font, and ensure UTF-8 locale |
+| tapped the notification and nothing happened | Termux cannot be opened by URL tap; use the share flow or the MacroDroid recipe — see docs/DEEPLINK.md |

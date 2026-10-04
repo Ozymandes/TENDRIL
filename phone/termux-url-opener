@@ -1,0 +1,159 @@
+#!/data/data/com.termux/files/usr/bin/sh
+# termux-url-opener — TENDRIL deep-link entry point for Android/Termux.
+#
+# Termux runs ~/bin/termux-url-opener <url> when a URL is SHARED to the
+# Termux app (ACTION_SEND + EXTRA_TEXT, text matching Android's WEB_URL
+# pattern). ACTION_VIEW does NOT trigger it and Termux registers no URL
+# schemes, so notification taps alone cannot reach this script — that is
+# what the MacroDroid recipe in docs/DEEPLINK.md is for.
+#
+# Two trigger paths:
+#   1. Share sheet: in any app, Share -> Termux on a TENDRIL URL below.
+#   2. MacroDroid/Tasker: trigger io.heckel.ntfy.MESSAGE_RECEIVED, then a
+#      SEND intent to com.termux/.app.api.file.FileShareReceiverActivity
+#      with EXTRA_TEXT=<the ntfy `click` extra>. (RUN_COMMAND bypasses this
+#      script entirely and calls ~/bin/tendril directly — also documented.)
+#
+# Install (one-time, on the phone; HOST/REPO as in docs/ANDROID.md step 5):
+#   HOST=home                       # ssh alias of your host
+#   REPO=/path/to/tendril           # checkout path on that host
+#   mkdir -p ~/bin
+#   scp "$HOST:$REPO/phone/termux-url-opener" ~/bin/termux-url-opener
+#   chmod 700 ~/bin/termux-url-opener
+# It must be a REGULAR executable file at exactly ~/bin/termux-url-opener
+# (not a symlink, not a directory). See docs/DEEPLINK.md for the full spec.
+#
+# Recognized TENDRIL URL forms (workspace id = [A-Za-z0-9._:-]{1,128}):
+#   https://<anything>/.tendril/<workspace-id>          (recommended carrier)
+#   https://<anything>/.tendril/<workspace-id>?<junk>
+#   any query or fragment pair:  p=<workspace-id>  or  id=<workspace-id>
+#   tendril://<h>/workspace/<workspace-id>              (accepted, but a bare
+#     tendril:// tap cannot reach Termux on Android — no scheme handler)
+# On a match: exec `tendril attach <id>` (PATH, then $HOME/bin), so
+# $TENDRIL_ALIAS is respected naturally by the phone launcher. Anything
+# else passes through to termux-open-url / termux-open.
+#
+# Safety: ids are validated, never decoded and never evaluated. Valid ids
+# are [A-Za-z0-9._:-] so URL-decoding has nothing to add; a percent-encoded
+# id simply fails validation and is rejected. Known-form-with-bad-id is an
+# error (exit 2), NOT a passthrough. No eval anywhere; the id reaches
+# `tendril` as a single argv element.
+
+set -u
+
+# valid_id <candidate> — non-empty, <=128 chars, A-Z a-z 0-9 . _ : - only.
+valid_id() {
+    case "$1" in
+        "" | *[!A-Za-z0-9._:-]*) return 1 ;;
+    esac
+    [ "${#1}" -le 128 ]
+}
+
+# scan_pairs <k=v&k=v...> — set $CANDIDATE to the value of the first pair
+# whose key is exactly `p` or `id` (value ends at & or end of string).
+scan_pairs() {
+    _rest="$1"
+    CANDIDATE=""
+    while [ -n "$_rest" ]; do
+        _pair="${_rest%%&*}"
+        case "$_pair" in
+            p=* | id=*)
+                CANDIDATE="${_pair#*=}"
+                CANDIDATE="${CANDIDATE%%\?*}"
+                CANDIDATE="${CANDIDATE%%\#*}"
+                return 0
+                ;;
+        esac
+        [ "$_pair" = "$_rest" ] && _rest="" || _rest="${_rest#*&}"
+    done
+    return 1
+}
+
+# classify <url> — set $KNOWN (0|1) and $ID (candidate; may be invalid).
+# Path carriers win; then query pairs, then fragment pairs.
+classify() {
+    KNOWN=0
+    ID=""
+    case "$1" in
+        */.tendril/*)
+            KNOWN=1
+            ID="${1##*/.tendril/}"                # text after the LAST /.tendril/
+            ID="${ID%%\?*}"
+            ID="${ID%%\#*}"
+            ;;
+        tendril://host/*/workspace/*)
+            KNOWN=1
+            ID="${1##*/workspace/}"
+            ID="${ID%%\?*}"
+            ID="${ID%%\#*}"
+            ;;
+        *)
+            case "$1" in
+                *\?*)
+                    _nofrag="${1%%\#*}"
+                    if scan_pairs "${_nofrag#*\?}"; then
+                        KNOWN=1
+                        ID="$CANDIDATE"
+                    fi
+                    ;;
+            esac
+            if [ "$KNOWN" -eq 0 ]; then
+                case "$1" in
+                    *\#*)
+                        if scan_pairs "${1##*#}"; then
+                            KNOWN=1
+                            ID="$CANDIDATE"
+                        fi
+                        ;;
+                esac
+            fi
+            ;;
+    esac
+}
+
+# find_tendril — print the launcher path, or return 1 when absent.
+find_tendril() {
+    if command -v tendril >/dev/null 2>&1; then
+        command -v tendril
+    elif [ -x "${HOME:-}/bin/tendril" ]; then
+        printf '%s\n' "${HOME}/bin/tendril"
+    else
+        return 1
+    fi
+}
+
+# Pass 1: first recognized TENDRIL URL wins (valid -> attach, invalid ->
+# reject); pass 2 only happens when no argument was a TENDRIL URL.
+for url in "$@"; do
+    classify "$url"
+    if [ "$KNOWN" -eq 1 ]; then
+        if valid_id "$ID"; then
+            printf '[tendril-url-opener] attach %s\n' "$ID" >&2
+            TENDRIL_BIN="$(find_tendril)" || {
+                printf '%s\n' "[tendril-url-opener] 'tendril' launcher not found in PATH or \$HOME/bin." >&2
+                printf '%s\n' "  install it: docs/ANDROID.md step 5 (scp phone/tendril to ~/bin/tendril)" >&2
+                exit 127
+            }
+            exec "$TENDRIL_BIN" attach "$ID"
+        fi
+        printf '%s\n' "[tendril-url-opener] looks like a TENDRIL link but the session id is malformed." >&2
+        printf '%s\n' "  ids: A-Z a-z 0-9 . _ : - only, 1..128 chars. Nothing was executed." >&2
+        exit 2
+    fi
+done
+
+# Pass 2: no TENDRIL link here — open the URL(s) the normal way.
+for url in "$@"; do
+    if command -v termux-open-url >/dev/null 2>&1; then
+        exec termux-open-url "$url"
+    fi
+    if command -v termux-open >/dev/null 2>&1; then
+        exec termux-open "$url"
+    fi
+    printf '%s\n' "[tendril-url-opener] '$url' is not a TENDRIL link and no opener is installed." >&2
+    printf '%s\n' "  pkg install termux-tools termux-api   # provides termux-open(-url)" >&2
+    printf '%s\n' "  see docs/DEEPLINK.md" >&2
+    exit 127
+done
+
+exit 0
