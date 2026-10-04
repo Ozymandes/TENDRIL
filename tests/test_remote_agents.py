@@ -583,6 +583,10 @@ class DetachGate(unittest.TestCase):
         row = {"id": "w9", "label": "demo"}
         for enabled in (True, False):
             with contextlib.ExitStack() as stack:
+                # Sessions launched inside Herdr set HERDR_ENV=1; the test
+                # must exercise the launcher paths, not that passthrough.
+                stack.enter_context(mock.patch.dict(os.environ))
+                os.environ.pop("HERDR_ENV", None)
                 stack.enter_context(mock.patch.object(
                     ra, "_bridge_enabled", return_value=enabled))
                 run = stack.enter_context(mock.patch.object(ra, "run"))
