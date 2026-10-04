@@ -202,6 +202,17 @@ class HerdrCapabilityProbe(unittest.TestCase):
         self.assertIn('no $HERDR_CONF yet; a minimal config will be proposed', source)
         self.assertIn('REMOVED=$(printf', source)
 
+    def test_installer_does_not_provision_previous_workspace_alt_up(self):
+        source = read_text(INSTALL)
+        start = source.index("herdr_switch() {")
+        end = source.index("\n}\n", start)
+        switch = source[start:end]
+        self.assertNotRegex(
+            switch,
+            r'(?m)^text,\s*did\s*=\s*set_scalar\(text,\s*"keys",\s*"previous_workspace"')
+        self.assertNotIn('"alt+up"', switch)
+        self.assertNotIn("previous_workspace=alt+up", switch)
+
 
 if __name__ == "__main__":
     unittest.main()

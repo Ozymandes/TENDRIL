@@ -303,16 +303,17 @@ def collect():
         wid = w.get("workspace_id")
         ags = by_ws.get(wid, [])
         path = ""
-        for a in ags:
-            c = a.get("cwd") or a.get("foreground_cwd")
-            if c:
-                path = c
+        active_panes = [p for p in snap.get("panes", [])
+                        if p.get("tab_id") == w.get("active_tab_id")]
+        active_panes.sort(key=lambda p: not p.get("focused", False))
+        for p in active_panes:
+            path = p.get("foreground_cwd") or p.get("cwd") or ""
+            if path:
                 break
         if not path:
-            atab = w.get("active_tab_id")
-            for p in snap.get("panes", []):
-                if p.get("tab_id") == atab and p.get("cwd"):
-                    path = p["cwd"]
+            for a in ags:
+                path = a.get("foreground_cwd") or a.get("cwd") or ""
+                if path:
                     break
         best = min((RANK.get(a.get("agent_status"), 4) for a in ags), default=4)
         rows.append({
@@ -404,15 +405,12 @@ def render(rows, note="", selected=None):
         if cur:
             grouped.append(cur)
         return grouped
-    feet = foot_lines(["N New", "P Project", "S Shell", "I Info", "? Help"]) \
-        + foot_lines(["L Last", "T TestPush", "R Refresh", "Q Quit"])
+    feet = foot_lines(["N New", "I Info", "? Help", "R Refresh", "Q Quit"])
 
     compact = len(rows) > 6
-    # Phone geometry (31 rows keyboard-closed, ~22 open): the menu always wins,
-    # so decide before building whether the per-row path lines must yield. They
-    # do when dropping them buys the compact mark a slot; if even the dense
-    # layout can't fit the mark, keep the paths (the caption tier in masthead()
-    # degrades on its own from there).
+    # Paths yield when needed to keep the menu and prompt on screen, or when
+    # dropping them buys the compact mark a slot. Otherwise preserve paths;
+    # masthead() can fall back to its caption tiers independently.
     term_rows = shutil.get_terminal_size(fallback=(52, 24)).lines
     est = 4 + len(feet) + 2
     with_paths = est + sum(1 + (1 if r["path"] else 0) + (0 if compact else 1)
@@ -422,8 +420,8 @@ def render(rows, note="", selected=None):
         with_paths += 1
         without += 1
     mark = 7 + 1                                # compact tier + blank separator
-    show_paths = mark + with_paths + 1 <= term_rows \
-        or mark + without + 1 > term_rows
+    show_paths = with_paths + 1 <= term_rows and (
+        mark + with_paths + 1 <= term_rows or mark + without + 1 > term_rows)
 
     lines = []
     edge = f"{C_LIME}\u250c{line(inner)}\u2510{C_RESET}"
@@ -510,16 +508,14 @@ def load_last(rows):
 
 
 def _bridge_enabled():
-    """Ctrl+Home bridge: automatic on Termux, opt-in elsewhere.
+    """Enable the Ctrl+Home bridge by default for host TTY attachments.
 
-    TENDRIL_DETACH_BRIDGE=1 forces it on, =0 (or false/no/off) disables it
-    everywhere — the plain `herdr session attach` path is then byte-identical
-    to the pre-bridge behavior. Blink (and every non-Termux client) never
-    gets it by default: Blink's on-screen keyboard cannot produce Ctrl+Home."""
+    TENDRIL_DETACH_BRIDGE=1 explicitly enables it; =0 (or false/no/off/empty)
+    opts out and restores the direct `herdr session attach` path."""
     raw = os.environ.get("TENDRIL_DETACH_BRIDGE")
     if raw is not None:
         return raw.strip().lower() not in ("", "0", "false", "no", "off")
-    return terminal_name() == "termux"
+    return True
 
 
 def attach(row):
@@ -538,15 +534,15 @@ def attach(row):
         subprocess.run([HERDR, "session", "attach", SESSION], check=False)
 
 
-# ---------- Ctrl+Home detach bridge (optional TENDRIL convenience) ----------
+# ---------- Ctrl+Home detach bridge (default-on TENDRIL convenience) ----------
 # Termux encodes Ctrl+Home as `ESC [ 1 ; 5 H` (termux-app KeyHandler.getCode +
 # transformForModifiers: KEYMOD_CTRL -> xterm modifier 5). Herdr's key grammar
 # has no Home key in any modifier combination, so `herdr session attach` runs
 # behind a transparent PTY bridge that rewrites exactly those six bytes to the
 # Alt+D detach (`ESC d`) Herdr already binds. Every other byte — including
 # plain Home (`ESC [ H`) — is forwarded unchanged. Herdr's config is untouched;
-# Alt+D and Ctrl+B d keep working, and TENDRIL_DETACH_BRIDGE=0 turns the whole
-# bridge off.
+# Alt+D and Ctrl+B d keep working. The host TTY bridge is enabled by default;
+# TENDRIL_DETACH_BRIDGE=0 turns it off.
 _CTRL_HOME = b"\x1b[1;5H"
 _ALT_D = b"\x1bd"
 
@@ -776,62 +772,27 @@ def current_ws_dir(rows, selected=None):
 
 
 def new_workspace(rows=None, selected=None):
+    """Open a shell immediately; Herdr derives the workspace name from cwd."""
     if rows is None:
         rows = collect() or []
-    name = input("name> ").strip()
     d = current_ws_dir(rows, selected)
-    if d:
-        raw = input(f"dir> [Enter = {short_path(d)}] ").strip()
-        if raw:
-            cand = os.path.expanduser(raw)
-            if not cand.startswith("/") or not os.path.isdir(cand):
-                print(f"{C_RED}no such directory: {cand}{C_RESET}")
-                return None
-            d = cand
-    else:
-        d = ask_dir()
-        if not d:
-            print(f"{C_RED}cancelled{C_RESET}")
-            return None
-    kind = ask_agent()
-    if kind is None:
-        print(f"{C_RED}cancelled{C_RESET}")
-        return None
-    disp = name or os.path.basename(d.rstrip("/")) + " (auto)"
-    if not confirm(f"create '{disp}' @ {short_path(d)} + {kind}?"):
-        return None
-    # An explicit name is used verbatim; an empty name falls back to the
-    # derived cwd label (the installed CLI does not promise a label default,
-    # so the initial-tab label is computed here rather than trusted).
-    label = name or _created_workspace_label({}, d)
-    data, err = ws_create(d, label)
+    if not d:
+        try:
+            d = os.getcwd()
+        except OSError:
+            d = os.path.expanduser("~")
+    # No --label or agent command: retain native directory-based naming and
+    # launch the user's normal shell, without any wizard or confirmation.
+    data, err = ws_create(d)
     if data is None:
         print(f"{C_RED}{err}{C_RESET}")
         return None
     wid = find_key(data, "workspace_id")
-    pane = find_key(data, "pane_id")
-    if kind != "shell":
-        if not pane and wid:
-            snap = snapshot()
-            for p in (snap or {}).get("panes", []):
-                if p.get("workspace_id") == wid and p.get("pane_id"):
-                    pane = p["pane_id"]
-                    break
-        if not pane:
-            print(f"{C_RED}could not locate new pane; start {kind} manually{C_RESET}")
-            return None
-        name = agent_name_for_workspace(
-            _created_workspace_label(data, d) or label, d, wid or pane)
-        ok, msg = start_agent(name, kind, pane)
-        if not ok:
-            print(f"{C_RED}agent start: {trunc(msg.strip() or 'failed', 60)}{C_RESET}")
-            return None
-    rows = collect() or []
-    for r in rows:
+    for r in (collect() or []):
         if r["id"] == wid:
             attach(r)
             return wid
-    print(f"{C_GRAY}workspace created; it will appear in the menu{C_RESET}")
+    print(f"{C_GRAY}shell workspace created; it will appear in the menu{C_RESET}")
     return wid
 
 
@@ -996,8 +957,8 @@ def read_menu_action(tty_mode, fd=None):
 
 
 def _read_tty_action(fd):
-    prompt = "↑/↓ select · Enter attach · number / command> "
-    sys.stdout.write(C_GRAY + chr(10) + prompt + C_RESET)
+    prompt = "↑/↓ · number + Enter · key> "
+    sys.stdout.write(C_GRAY + prompt + C_RESET)
     sys.stdout.flush()
     text = ""
     while True:
@@ -1014,6 +975,9 @@ def _read_tty_action(fd):
                 sys.stdout.write(chr(13) + C_GRAY + prompt + text + chr(27) + "[K" + C_RESET)
                 sys.stdout.flush()
             continue
+        if key == "?" or (isinstance(key, str) and len(key) == 1
+                           and key.lower() in ("n", "i", "r", "q")):
+            return "line", key
         if isinstance(key, str) and len(key) == 1 and key.isprintable():
             text += key
             sys.stdout.write(key)
@@ -1062,14 +1026,22 @@ def help_screen():
         return s if len(s) <= n else s[: max(1, n - 1)] + "\u2026"
 
     rows = [
+        ("N", "new shell in cwd"),
+        ("I", "host/workspace info"),
+        ("?", "show this help"),
+        ("R", "refresh workspaces"),
+        ("Q", "quit selector"),
+        ("number + Enter", "attach workspace"),
+        ("up/down + Enter", "select and attach"),
+        ("Alt+D", "detach to selector"),
+        ("Ctrl+B d", "detach fallback"),
+        ("Ctrl+Home", "detach (host bridge)"),
         ("Ctrl+B 1..9", "jump to workspace"),
-        ("Alt+1..9", "jump to workspace (no prefix)"),
-        ("Ctrl+B w", "workspace picker (digits work)"),
-        ("Ctrl+B n/p", "next / previous tab (phone-safe)"),
-        ("Alt+\u2190/\u2192", "prev / next tab (desktop encoding)"),
-        ("Alt+\u2191/\u2193", "prev / next workspace (desktop)"),
-        ("Alt+D", "detach to REMOTE AGENTS"),
-        ("Ctrl+B d", "detach (fallback)"),
+        ("Alt+1..9", "jump without prefix"),
+        ("Ctrl+B w", "workspace picker"),
+        ("Ctrl+B n/p", "next / previous tab"),
+        ("Alt+\u2190/\u2192", "previous / next tab"),
+        ("Alt+\u2193", "next workspace (desktop)"),
         ("Alt+Enter", "split pane horizontal"),
         ("Alt+Shift+Enter", "split pane vertical"),
         ("Alt+Esc", "close pane"),
@@ -1097,30 +1069,38 @@ def help_screen():
         out.append(f"{C_LIME}\u2502{C_RESET}" + body + " " * padn
                    + f" {C_LIME}\u2502{C_RESET}")
     out.append(f"{C_LIME}\u251c{line(inner)}\u2524{C_RESET}")
-    notes = ["Prefix = Ctrl+B; Ctrl+B 1..9 = workspace",
-             "Alt needs the xterm modifier form -",
-             "phones: Ctrl+B chords, ALT+digit.",
-             "Phone: tap ALT then D to detach.",
-             "Fallback: Ctrl+B then D."]
-    if terminal_name() == "blink":       # no on-screen Home key in Blink
-        notes += ["Blink: no Home key on screen;",
-                  "detach = tap ALT then D;",
-                  "TENDRIL_TERMINAL=blink selects",
-                  "these hints."]
+    notes = ["Menu letters: no Enter needed.",
+             "Alt+arrows: desktop only.",
+             "Alt+Up: reserved for Pi.",
+             "Phone: Ctrl+B; ALT+digit.",
+             "Alt+D or Ctrl+B then D detaches.",
+             "Detach keeps workspaces and agents."]
+    if terminal_name() == "blink":       # no on-screen Home key in Blink:
+        notes[0:0] = ["Blink: no Home key on screen;",   # unproducible combo
+                      "detach = tap ALT then D;",
+                      "TENDRIL_TERMINAL=blink selects",
+                      "these hints."]
     else:
-        notes += ["Ctrl+Home: TENDRIL bridges it; no",
-                  "Herdr config change. Set",
-                  "TENDRIL_DETACH_BRIDGE=0 to disable."]
-    notes.append("Detach keeps workspaces and agents.")
+        notes[1:1] = ["Ctrl+Home bridge: default on.",
+                      "Disable on host with:",
+                      "TENDRIL_DETACH_BRIDGE=0",
+                      "(false/no/off/empty also disable)."]
     for note in notes:
         nfit = fit(note, inner - 2)
         out.append(f"{C_LIME}\u2502{C_RESET} {C_GRAY}{nfit}{C_RESET}"
                    + " " * max(0, inner - 1 - len(nfit))
                    + f"{C_LIME}\u2502{C_RESET}")
     out.append(f"{C_LIME}\u2514{line(inner)}\u2518{C_RESET}")
-    print("\033[H\033[2J" + "\n".join(out), flush=True)
-    print(f"{C_GRAY}press any key to return...{C_RESET}", end="", flush=True)
-    wait_for_key()
+    # Keep the complete reference readable with the phone keyboard open.
+    # Reserve three header rows, a bottom border, and one prompt row.
+    page_size = max(1, shutil.get_terminal_size(fallback=(48, 24)).lines - 5)
+    body = out[3:-1]
+    for start in range(0, len(body), page_size):
+        page = out[:3] + body[start:start + page_size] + out[-1:]
+        print("\033[H\033[2J" + "\n".join(page), flush=True)
+        action = "for more" if start + page_size < len(body) else "to return"
+        print(f"{C_GRAY}press any key {action}...{C_RESET}", end="", flush=True)
+        wait_for_key()
 
 
 def info():
@@ -1161,7 +1141,8 @@ def info():
     rc_n, _, _ = run(["systemctl", "--user", "is-active", "herdr-notify"], 3)
     watch = f"{C_TEAL}RUNNING{C_RESET}" if rc_n == 0 else f"{C_GRAY}STOPPED{C_RESET}"
     print(f"{C_GRAY}Push       {push}{C_RESET}   {C_GRAY}Watcher    {watch}{C_RESET}")
-    input(f"{C_GRAY}Enter to continue...{C_RESET}")
+    print(f"{C_GRAY}press any key to continue...{C_RESET}", end="", flush=True)
+    wait_for_key()
 
 
 def workspace_number(raw, count):
@@ -1214,38 +1195,16 @@ def menu_loop(rows, tty_mode=False, fd=None):
             else:
                 preferred_id = rows[index]["id"]
                 attach(rows[index])
-        elif raw in ("q", "Q"):
+        elif raw.lower() == "q":
             return 0
-        elif raw in ("r", "R"):
+        elif raw.lower() == "r":
             pass
-        elif raw in ("n", "N"):
+        elif raw.lower() == "n":
             preferred_id = new_workspace(rows, selected) or preferred_id
-        elif raw in ("p", "P"):
-            preferred_id = project_launcher() or preferred_id
-        elif raw in ("s", "S"):
-            preferred_id = quick_shell(rows, selected) or preferred_id
-        elif raw in ("i", "I"):
+        elif raw.lower() == "i":
             info()
         elif raw == "?":
             help_screen()
-        elif raw in ("t", "T"):
-            nb = (NOTIFY_BIN if os.path.isfile(NOTIFY_BIN) else
-                  os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                               "herdr-notify"))
-            if os.path.isfile(nb):
-                rc_t, out_t, _ = run([sys.executable, nb, "--test"], 15)
-                lines_t = out_t.strip().splitlines()
-                note = lines_t[-1] if lines_t else (
-                    "test push sent - check the phone" if rc_t == 0 else "test failed")
-            else:
-                note = "herdr-notify not installed"
-        elif raw in ("l", "L"):
-            last = load_last(rows)
-            if last:
-                preferred_id = last["id"]
-                attach(last)
-            else:
-                note = "no remembered workspace yet"
         else:
             note = f"unknown: {raw}"
 

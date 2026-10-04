@@ -4,6 +4,27 @@ All notable changes to TENDRIL are documented here.
 
 ## Unreleased
 
+- For host TTY attachments, `remote-agents` enables the Ctrl+Home PTY bridge
+  by default, independently of `TERMUX_VERSION` or phone environment
+  forwarding. It rewrites only `ESC [ 1 ; 5 H` to Herdr's Alt+D detach key;
+  other input passes through, and non-TTY attachments keep direct passthrough.
+  Set host-side `TENDRIL_DETACH_BRIDGE=0` to disable it. The bridge does not
+  change Herdr config or require a phone-launcher update; translated detach
+  depends on Alt+D still being bound to detach.
+- The selector footer is `N New`, `I Info`, `? Help`, `R Refresh`, `Q Quit`.
+  These actions dispatch immediately on one TTY keypress, without Enter; Enter
+  remains for workspace selection and text fields. Info returns on any key;
+  Help paginates to the phone screen with any-key advance/return. Workspace
+  paths yield when needed to fit the menu and prompt with the keyboard open.
+  `N` immediately opens a shell in the selected/focused workspace directory,
+  with Herdr's native directory-based name: no wizard, prompts, confirmation,
+  or automatic agent startup. Active-pane cwd takes priority over cached agent
+  cwd, with the console cwd as fallback. Use `herdr-notify --test` on the host
+  to send a test notification.
+- Stop provisioning Herdr's Alt+Up previous-workspace binding so Pi can use the
+  key to edit steering messages. Existing installs must remove the old binding
+  and reload Herdr config; workspace digits/picker remain available.
+
 - Sessions are addressable end to end. `remote-agents attach <id>` (and
   `tendril [alias] attach <id>` on the phone) attach directly by canonical
   Herdr workspace id (`w15`), pane id (`w15:p1` → parent), workspace number,
@@ -23,8 +44,8 @@ All notable changes to TENDRIL are documented here.
 - iPhone via Blink Shell is first-class (docs/IOS_BLINK.md): Alt+D detach
   verified against Blink's key encoding, Mosh hosts with a `tendril`
   startup command, automatic 256-colour palette, and a deliberately small
-  terminal capability model (`terminal_name()`; the Ctrl+Home bridge stays
-  Termux-only; Blink-specific help via opt-in `TENDRIL_TERMINAL=blink`).
+  terminal capability model (`terminal_name()`; Blink-specific help via
+  opt-in `TENDRIL_TERMINAL=blink`; the default-on Ctrl+Home bridge is harmless there — Blink cannot produce the combo).
 - Android deep links: `phone/termux-url-opener` handles shared
   `https://…/.tendril/<id>` URLs under Termux's verified share contract;
   docs/DEEPLINK.md documents the honest one-tap recipes (MacroDroid/Tasker
@@ -49,15 +70,14 @@ All notable changes to TENDRIL are documented here.
   The `P` project flow is unchanged.
 
 - The selector supports ↑/↓ highlighting and Enter-to-attach while preserving
-  numeric and command-letter input; raw TTY mode restores terminal settings on
+  numeric workspace selection; raw TTY mode restores terminal settings on
   every exit path.
-- Detach now recommends Alt+D (tap ALT then D on the phone), with Ctrl+B then D
-  as the fallback. Ctrl+Home remains optional: Herdr 0.9.3 rejects it. The
-  installer validates it before migrating legacy `ctrl+]`, preserves unrelated
-  bindings, and adds only conflict-free shortcuts.
-- New-workspace labels are derived from the selected cwd (the installed CLI's
-  docs do not specify an automatic label default); agent names are sanitized
-  from the resulting label.
+- Detach recommends Alt+D (tap ALT then D on the phone), with Ctrl+B then D as
+  the fallback. Native Ctrl+Home bindings remain optional; the installer
+  validates them where supported, preserves unrelated bindings, and adds only
+  conflict-free shortcuts.
+- New shell workspaces leave `--label` unset, using Herdr's native cwd-based
+  name. Users can start agents directly from the shell.
 
 ## v0.1.2 — the mark survives phone geometry
 

@@ -121,6 +121,23 @@ class Selector(unittest.TestCase):
         head = new[len(CLEAR):len(new) - len(body)]
         return head.split("\n")[:-1] if head else []
 
+    def footer_items(self, text):
+        lines = SGR.sub("", text[len(CLEAR):]).splitlines()
+        dividers = [i for i, line in enumerate(lines) if line.startswith("\u251c")]
+        bottom = next(i for i, line in enumerate(lines) if line.startswith("\u2514"))
+        return [line[2:-1].rstrip() for line in lines[dividers[-1] + 1:bottom]]
+
+    def test_footer_has_exactly_the_five_supported_actions(self):
+        wide = frame(self.new, 48, 50, 0)
+        narrow = frame(self.new, 34, 50, 0)
+        self.assertEqual(self.footer_items(wide), [
+            "N New   I Info   ? Help   R Refresh   Q Quit"])
+        self.assertEqual(self.footer_items(narrow), [
+            "N New   I Info   ? Help", "R Refresh   Q Quit"])
+        for text in (wide, narrow):
+            for removed in ("P Project", "S Shell", "L Last", "T TestPush"):
+                self.assertNotIn(removed, text)
+
     def test_selector_is_byte_identical_below_the_masthead(self):
         for cols in (34, 40, 43, 44, 45, 48, 49, 50, 53, 54, 56, 60, 80):
             for n in (0, 1, 3, 6, 7, 10):
@@ -181,19 +198,28 @@ class Selector(unittest.TestCase):
                 if body.count("\n") + 1 <= lines:                # + input prompt line
                     self.assertLessEqual(out.count("\n") + 1, lines, f"{lines} rows, {n} ws")
 
-    def test_phone_height_yields_paths_and_keeps_the_mark(self):
-        """Phone, keyboard closed (48x31, 11 workspaces): the menu alone is 30
-        lines, so path lines yield and the compact mark still renders. With
-        the keyboard open (22 rows) only the paths yield; the menu wins."""
+    def test_phone_height_yields_paths_only_when_needed_to_fit(self):
+        """Check actual phone geometry instead of requiring path suppression
+        at a fixed workspace count: one extra row can preserve paths and art."""
         for n in (8, 11, 13):
             out = frame(self.new, 48, 31, n)[len(CLEAR):]
             self.assertIn("\u2580", out, f"{n} ws: compact mark missing at 48x31")
-            self.assertNotIn("project-0", out, f"{n} ws: paths should yield at 48x31")
             self.assertLessEqual(out.count("\n") + 1, 31, f"{n} ws: overflows 48x31")
+            if "project-0" not in out:
+                self.assertGreater(out.count("\n") + 1 + n, 31,
+                                   f"{n} ws: restoring paths should exceed phone height")
             open_out = frame(self.new, 48, 22, n)[len(CLEAR):]
-            old_out = frame(self.old, 48, 22, n)[len(CLEAR):]
-            self.assertLessEqual(open_out.count("\n") + 1, old_out.count("\n") + 1,
-                                 f"{n} ws: never taller than before at 48x22")
+            # Include the input-prompt row, not just the rendered box. Paths
+            # must yield even when only the caption (or no mark) can fit.
+            self.assertLessEqual(open_out.count("\n") + 1, 22,
+                                 f"{n} ws: menu and prompt overflow keyboard-open height")
+            self.assertNotIn("project-0", open_out,
+                             f"{n} ws: paths must yield to the menu and prompt")
+
+        one_more_row = frame(self.new, 48, 32, 8)[len(CLEAR):]
+        self.assertIn("\u2580", one_more_row)
+        self.assertIn("project-0", one_more_row)
+        self.assertLessEqual(one_more_row.count("\n") + 1, 32)
 
     def test_path_yield_never_fires_when_there_is_room(self):
         """Generous height: body below the masthead is unchanged."""
@@ -269,22 +295,29 @@ class Palette(unittest.TestCase):
 
 @unittest.skipUnless(origin_main_cli(), "origin/main already contains the masthead")
 class AgainstOriginMain(unittest.TestCase):
-    def test_selector_is_byte_identical_to_origin_main(self):
+    @staticmethod
+    def without_footer(output):
+        lines = SGR.sub("", output[len(CLEAR):]).splitlines()
+        dividers = [i for i, line in enumerate(lines) if line.startswith("\u251c")]
+        bottom = next(i for i, line in enumerate(lines) if line.startswith("\u2514"))
+        return lines[:dividers[-1] + 1] + lines[bottom:]
+
+    def test_selector_body_except_footer_matches_origin_main(self):
         with tempfile.NamedTemporaryFile("w", suffix="-remote-agents", delete=False) as t:
             t.write(origin_main_cli())
         try:
             old, new = load(t.name, "ra_origin_main"), load(CLI, "ra_branch")
-            # 36 rows keeps every tier the old binary had. n=10 at 36 rows is
-            # intentionally excluded: the path-yield for the compact mark buys
-            # a tier there, which changes the body by design. It is pinned at
-            # 50 rows below, where paths stay.
+            # The footer is intentionally different now. Compare the remaining
+            # selector body, including path/masthead fit, against origin/main.
             for cols in (34, 44, 50, 54, 56, 80):
                 for n in (0, 3, 7):
                     o, w = frame(old, cols, 36, n), frame(new, cols, 36, n)
-                    self.assertTrue(w.endswith(o[len(CLEAR):]), f"{cols} cols, {n} ws")
+                    self.assertEqual(self.without_footer(w), self.without_footer(o),
+                                     f"{cols} cols, {n} ws")
                 for n in (10, 13):
                     o, w = frame(old, cols, 50, n), frame(new, cols, 50, n)
-                    self.assertTrue(w.endswith(o[len(CLEAR):]), f"{cols} cols, {n} ws @50")
+                    self.assertEqual(self.without_footer(w), self.without_footer(o),
+                                     f"{cols} cols, {n} ws @50")
         finally:
             os.unlink(t.name)
 

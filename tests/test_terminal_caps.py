@@ -84,20 +84,25 @@ class TerminalName(unittest.TestCase):
 
 
 class BridgeGate(unittest.TestCase):
-    """Ctrl+Home bridge defaults ONLY on Termux — never on Blink or generic
-    (Blink's on-screen keyboard cannot produce Ctrl+Home). TENDRIL_DETACH_BRIDGE
-    is checked first and wins both ways, exactly as before the refactor."""
+    """Ctrl+Home bridge defaults ON for host TTY attachments (Dad's fix:
+    independent of TERMUX_VERSION or any terminal detection — Blink cannot
+    produce the combo on-screen, so default-on is harmless there).
+    TENDRIL_DETACH_BRIDGE is checked first and wins both ways; empty-string
+    also opts out."""
 
     def test_gate_matrix(self):
         for env, want in (
+                ({}, True),
                 ({"TERMUX_VERSION": "0.118"}, True),
-                ({}, False),
-                ({"TENDRIL_TERMINAL": "blink"}, False),
+                ({"TENDRIL_TERMINAL": "blink"}, True),
                 ({"TENDRIL_TERMINAL": "blink", "TENDRIL_DETACH_BRIDGE": "1"}, True),
+                ({"TENDRIL_DETACH_BRIDGE": "0"}, False),
+                ({"TENDRIL_DETACH_BRIDGE": "false"}, False),
+                ({"TENDRIL_DETACH_BRIDGE": "no"}, False),
+                ({"TENDRIL_DETACH_BRIDGE": "off"}, False),
+                ({"TENDRIL_DETACH_BRIDGE": ""}, False),
                 ({"TERMUX_VERSION": "0.118", "TENDRIL_DETACH_BRIDGE": "0"}, False),
-                ({"TERMUX_VERSION": "0.118", "TENDRIL_DETACH_BRIDGE": "false"}, False),
-                ({"TERMUX_VERSION": "0.118", "TENDRIL_DETACH_BRIDGE": "no"}, False),
-                ({"TERMUX_VERSION": "x", "TENDRIL_DETACH_BRIDGE": "off"}, False),
+                ({"TENDRIL_TERMINAL": "blink", "TENDRIL_DETACH_BRIDGE": "0"}, False),
                 ({"TERMUX_VERSION": "0.118", "TENDRIL_DETACH_BRIDGE": "1"}, True),
         ):
             with mock.patch.dict(os.environ, env, clear=True):
@@ -106,8 +111,8 @@ class BridgeGate(unittest.TestCase):
 
 class BlinkHelp(unittest.TestCase):
     """help_screen() swaps the Ctrl+Home bridge notes for the Blink block
-    only when TENDRIL_TERMINAL=blink; generic and Termux keep the bridge
-    notes."""
+    only when TENDRIL_TERMINAL=blink; generic and Termux keep Dad's bridge
+    notes (default-on, opt-out)."""
 
     def help_text(self, env):
         with contextlib.ExitStack() as stack:
@@ -129,8 +134,9 @@ class BlinkHelp(unittest.TestCase):
     def test_generic_and_termux_keep_the_bridge_notes(self):
         for env in ({}, {"TERMUX_VERSION": "0.118"}):
             out = self.help_text(env)
-            self.assertIn("Ctrl+Home", out, env)
+            self.assertIn("Ctrl+Home bridge: default on.", out, env)
             self.assertIn("TENDRIL_DETACH_BRIDGE=0", out, env)
+            self.assertIn("Alt+Up: reserved for Pi.", out, env)
             self.assertNotIn("TENDRIL_TERMINAL=blink selects", out, env)
             self.assertIn("Detach keeps workspaces and agents.", out)
 

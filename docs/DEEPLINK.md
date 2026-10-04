@@ -27,7 +27,7 @@ order: exact workspace id → pane id (parent workspace) → pure digits
 
 | command | behavior | exit codes |
 |---|---|---|
-| `attach <token>` | resolve, print `found session '<label>' (<id>)`, then the same interactive attach the selector uses (`herdr workspace focus` + `herdr session attach`; the Termux Ctrl+Home bridge applies) | 0 ok · 1 Herdr unreachable · 2 unknown/stale token or usage · 3 ambiguous |
+| `attach <token>` | resolve, print `found session '<label>' (<id>)`, then the same interactive attach the selector uses (`herdr workspace focus` + `herdr session attach`; the default-on Ctrl+Home host bridge applies, `TENDRIL_DETACH_BRIDGE=0` opts out) | 0 ok · 1 Herdr unreachable · 2 unknown/stale token or usage · 3 ambiguous |
 | `resolve <token>` | one-line JSON: `host, workspace_id, label, number, cwd, agent, agent_status, agents[], focused, link, payload_b64, herdr_status` | same |
 | `focus <token>` | identical JSON plus `herdr workspace focus <id>` — no session attach; built for SSH one-shots (iOS Shortcut) | same |
 | `link <token>` | prints the `tendril://` URI only | same |

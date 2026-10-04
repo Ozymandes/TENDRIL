@@ -207,13 +207,15 @@ say ""
 say "6) Herdr keybindings"
 say "     Alt+D         recommended detach (phone: tap ALT then D)"
 say "     Ctrl+Home     optional native detach (only when this Herdr CLI validates it)"
-say "                   remote-agents on Termux also bridges Ctrl+Home to Alt+D"
-say "                   itself (TENDRIL_DETACH_BRIDGE, no config change)"
+say "                   remote-agents bridges Ctrl+Home to Alt+D on TTY attaches"
+say "                   by default (SSH/Mosh too; no phone env forwarding)"
+say "                   host opt-out: TENDRIL_DETACH_BRIDGE=0"
 say "     Prefix+D      universal fallback (prefix is Ctrl+B by default)"
 say "     Ctrl+B 1..9   jump to workspace (needs the switching bindings below)"
 say "     Alt+1..9      jump to workspace, no prefix (Termux: tap ALT then digit)"
 say "     Ctrl+B n / p  next / previous tab (phone-safe)"
 say "     Alt+←/→       next / previous tab (desktop modifier encoding)"
+say "     Alt+Up        left unbound so Pi can edit steering messages"
 HERDR_CONF="$HOME/.config/herdr/config.toml"
 DETACH_HELPER="$PKG_DIR/bin/herdr-bindings.py"
 
@@ -343,8 +345,7 @@ text, did = merge_list(text, "keys", "previous_tab", ["prefix+p", "alt+left"], [
 if did: added.append("previous_tab+=alt+left")
 text, did = set_scalar(text, "keys", "next_workspace", '"alt+down"')
 if did: added.append("next_workspace=alt+down")
-text, did = set_scalar(text, "keys", "previous_workspace", '"alt+up"')
-if did: added.append("previous_workspace=alt+up")
+# Leave Alt+Up to applications (Pi uses it to edit steering messages).
 text, did = set_scalar(text, "keys.indexed", "tabs", '"ctrl"')
 if did: added.append("indexed.tabs=ctrl")
 text, did = set_scalar(text, "keys.indexed", "workspaces", '"alt"')

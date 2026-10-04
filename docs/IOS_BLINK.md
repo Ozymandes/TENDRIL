@@ -69,9 +69,12 @@ a hardware keyboard. Inside TENDRIL:
 | Move in the selector | ↑/↓ arrows + Enter, or type a number |
 | Commands | N new · P project · S shell · I info · L last · ? help |
 
-There is no Ctrl+Home on iOS: the on-screen keyboard cannot produce it, so
-the Ctrl+Home detach bridge (a Termux-only feature) never activates here.
-Alt+D is the primary detach on Blink — it sends the standard `ESC d`.
+There is no Ctrl+Home on the on-screen keyboard: the combo cannot be
+produced by tapping, so the default-on Ctrl+Home host bridge never fires
+from it. (The bridge is enabled host-side for all TTY attachments;
+`TENDRIL_DETACH_BRIDGE=0` disables it. A hardware keyboard that does send
+`ESC [ 1 ; 5 H` will detach.) Alt+D is the primary detach on Blink — it
+sends the standard `ESC d`.
 
 ## 6. Terminal hints (opt-in)
 
@@ -123,7 +126,8 @@ To get push notifications and one-tap attach, see docs/DEEPLINK.md.
 - No host-side Blink detection: Blink sends no distinguishing environment,
   so Blink-aware help is opt-in via `TENDRIL_TERMINAL=blink`.
 - No Home/End/PgUp/PgDn on the on-screen keyboard (hardware keyboard only),
-  and no Ctrl+Home at all — the detach bridge is Termux-only.
+  and no on-screen Ctrl+Home (the default-on host bridge is harmless
+  there; `TENDRIL_DETACH_BRIDGE=0` disables it).
 - `blinkshell://` external-command URLs (x-callback `run`) have been
   removed by Blink upstream as of this research on blinksh/blink master;
   `ssh://user@host` links still work.

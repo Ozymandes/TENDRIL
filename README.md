@@ -25,7 +25,7 @@ control, simplicity, and openness I wanted from the start.
 - `tendril` connects from Termux to your Linux host, preferring Mosh and falling
   back to SSH.
 - `remote-agents` presents Herdr's live workspaces in a terminal selector. Pick
-  a workspace to attach, create one, open a project, or check host status.
+  a workspace to attach, open a shell, or view host info.
 - Sessions are addressable: `remote-agents attach <id>` (and
   `tendril attach <id>` on the phone) jumps straight to a workspace by
   Herdr workspace id, pane id, number, or exact label — no selector needed.
@@ -68,6 +68,19 @@ cd TENDRIL
 ./install
 ```
 
+To update only the host selector from the checkout root, replace its executable:
+
+```sh
+install -m 755 bin/remote-agents "$HOME/.local/bin/remote-agents.new" &&
+mv -f "$HOME/.local/bin/remote-agents.new" "$HOME/.local/bin/remote-agents"
+```
+
+This changes only `remote-agents`; it leaves host configuration and ntfy
+subscriptions alone. Do not rerun the interactive installer just to update the
+binary. An already-running Mosh selector keeps using its old process until you
+quit and start `tendril` again; see the [Android guide](docs/ANDROID.md) for the
+safe exit sequence.
+
 ### Android / Termux
 
 Install OpenSSH and Mosh, configure an SSH host alias, and add the phone's key
@@ -98,18 +111,25 @@ of view.
 `AGENT_ALIAS` setting also continues to work.
 
 In the selector, use ↑/↓ to highlight a workspace and Enter to attach; typing
-its number followed by Enter still works, including multi-digit numbers.
-`Alt+D` detaches back to the menu: on the phone, tap ALT then D.
-`Ctrl+B` then `D` is the fallback. Detaching leaves workspaces and agents running.
-The installer preserves existing bindings and only adds conflict-free shortcuts.
-`Ctrl+Home` is optional on Herdr versions that accept it; Herdr 0.9.3 does not.
-On Termux, `remote-agents` bridges the gap itself: when attached from the menu,
-`CTRL`+`HOME` rewrites to Alt+D inside a transparent PTY bridge (no Herdr
-config change; `TENDRIL_DETACH_BRIDGE=0` disables it).
-Inside a workspace, `Ctrl+B 1..9` jumps to a workspace, `Ctrl+B w` opens the
-picker, and `Ctrl+B n`/`p` cycles tabs. `N`, `P`, `S`, and `I` open the
-new-workspace, project, shell, and host-status flows. See the [Android guide](docs/ANDROID.md)
-for Termux key behavior and setup details.
+its number followed by Enter still works, including multi-digit numbers. The
+footer actions are `N New`, `I Info`, `? Help`, `R Refresh`, and `Q Quit`; each
+runs on a single keypress, without Enter. Enter remains for workspace selection
+and text fields. Help pages fit the screen; any key advances or returns.
+`N` immediately opens a shell in the selected/focused workspace's directory.
+Herdr names it after that directory; there are no name, directory, agent, or
+confirmation prompts. Without a usable workspace directory, it uses the
+console's current directory.
+
+`Alt+D` detaches back to the menu (tap ALT then D on the phone); `Ctrl+B` then
+`D` is the fallback. Detaching leaves workspaces and agents running. The host
+console's Ctrl+Home bridge translates `ESC [ 1 ; 5 H` to Alt+D by default for
+TTY attachments, including over Mosh or SSH. It does not require `TERMUX_VERSION`
+to be forwarded from the phone. Set host-side `TENDRIL_DETACH_BRIDGE=0` to
+disable it; non-TTY attachments pass input through unchanged. Inside a
+workspace, `Ctrl+B 1..9` jumps to a workspace, `Ctrl+B w` opens the picker, and
+`Ctrl+B n`/`p` cycles tabs. Alt+Up is left to Pi for editing steering messages,
+not bound to Herdr workspace switching. Run `herdr-notify --test` on the host to send a test
+notification. See the [Android guide](docs/ANDROID.md) for setup and troubleshooting.
 
 Sessions are addressable objects. `remote-agents attach|resolve|focus|link <id>`
 attach directly and expose machine-readable metadata plus canonical
