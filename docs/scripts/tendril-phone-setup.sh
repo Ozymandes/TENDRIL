@@ -51,18 +51,11 @@ verify() {
     fi
     if remote 'command -v remote-agents' >/dev/null; then
         ok "remote-agents (the menu) installed"
-        v=$(remote 'remote-agents --detect' | sed -n 's/^chosen: //p')
+        v=$(remote 'remote-agents --detect' | sed -n 's/^chosen: //p' | grep -vx NONE)
         [ -n "$v" ] && ok "menu found a compatible herdr ($v)" \
             || bad "menu cannot use herdr" "on the computer: remote-agents --detect"
     else
         bad "remote-agents not installed on the computer" "on the computer: cd ~/TENDRIL && ./install"
-    fi
-    # tendril's SSH fallback uses a non-login shell, which may lack ~/.local/bin
-    if ! ssh -o BatchMode=yes "$A" 'command -v remote-agents' >/dev/null 2>&1 \
-       && remote 'test -x $HOME/.local/bin/remote-agents'; then
-        sed -i '/^export REMOTE_AGENTS_BIN=/d' ~/.bashrc 2>/dev/null
-        echo "export REMOTE_AGENTS_BIN='\$HOME/.local/bin/remote-agents'" >> ~/.bashrc
-        ok "set REMOTE_AGENTS_BIN so 'tendril ssh' finds the menu too"
     fi
     if remote 'test -f ~/.config/remote-agents/notify.env'; then
         ok "notifications configured (notify.env)"
@@ -187,7 +180,7 @@ if [ -x "$HOME/.local/bin/remote-agents" ]; then
     systemctl --user try-restart herdr-notify 2>/dev/null || true
     say "menu (remote-agents) refreshed"
 else
-    say "running the TENDRIL installer (press Enter to accept defaults; say y to ntfy for alerts)"
+    say "running the TENDRIL installer (press Enter for text questions; type y for every yes/no question)"
     echo
     (cd "$REPO" && ./install)
 fi
@@ -223,11 +216,12 @@ echo "export REMOTE_AGENTS_BIN='\$HOME/.local/bin/remote-agents'" >> ~/.bashrc
 
 echo; echo "7) Home-screen shortcut (needs the Termux:Widget app)..."
 mkdir -p ~/.shortcuts
-printf '#!/data/data/com.termux/files/usr/bin/bash\nexec ~/bin/tendril %s\n' "$ALIAS" > ~/.shortcuts/tendril
+# Widgets don't read ~/.bashrc, so set the menu path here too (for the SSH fallback)
+printf '#!/data/data/com.termux/files/usr/bin/bash\nexport REMOTE_AGENTS_BIN='\''$HOME/.local/bin/remote-agents'\''\nexec ~/bin/tendril %s\n' "$ALIAS" > ~/.shortcuts/tendril
 chmod 700 ~/.shortcuts/tendril
 
 echo
-echo "Setup done. Or add the Termux:Widget to your home screen and tap 'tendril'."
+echo "Tip: add the Termux:Widget to your home screen and tap 'tendril'."
 
 echo; echo "8) Checking everything..."
 verify "$ALIAS"

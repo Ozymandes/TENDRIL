@@ -52,6 +52,31 @@ user-local with Python's standard library.
 
 ## Quick start
 
+### Guided setup (recommended for beginners)
+
+[`docs/scripts/tendril-phone-setup.sh`](docs/scripts/tendril-phone-setup.sh)
+sets up both sides from the phone. It installs SSH and Mosh in Termux, creates
+the phone's key and `~/.ssh/config` alias, copies the key to the host, installs
+Herdr and TENDRIL on the host (no `sudo`), adds the `tendril` command and a
+Termux:Widget shortcut, then checks the whole chain. The
+[setup guide](docs/TENDRIL-SETUP-GUIDE.md) covers every step.
+
+```sh
+bash tendril-phone-setup.sh            # first run, and later updates
+bash tendril-phone-setup.sh --check    # read-only check
+```
+
+Notes:
+
+- Run host steps as your normal user, not root.
+- When the host installer runs, press Enter for the text questions, but type
+  `y` for every yes/no question. They default to No, and skipping the
+  keybinding questions leaves Alt+D unbound.
+- Install Termux and Termux:Widget from F-Droid. Termux:Widget is not on
+  Google Play.
+- On a server or VPS, run `sudo loginctl enable-linger $USER` so the
+  notification watcher keeps running after you log out.
+
 ### Host installation
 
 On Linux, install Herdr first, then clone TENDRIL and run its interactive
@@ -130,6 +155,7 @@ notification. See the [Android guide](docs/ANDROID.md) for setup and troubleshoo
 
 ## Further reading
 
+- [Beginner setup guide](docs/TENDRIL-SETUP-GUIDE.md)
 - [Android / Termux setup](docs/ANDROID.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Security model](docs/SECURITY.md)

@@ -63,15 +63,10 @@ The agents run on your Linux computer. Your phone is only the remote control.
 
 ### Who talks to whom
 
-1. **You** type `tendril` on the phone.
-2. **tendril** connects to the computer with **Mosh**. If Mosh fails, it uses **SSH**.
-3. The connection travels over **Tailscale**. Nothing is open to the public internet.
-4. On the computer, the connection starts **remote-agents** (the menu).
-5. **remote-agents** asks **Herdr** for the list of workspaces. It shows them on your phone.
-6. You pick a workspace. Now you see the **agent's** screen and can type to it.
-7. You leave. **Herdr** keeps the agent running.
-8. **herdr-notify** watches the agents. When one finishes or needs you, it sends a message to **ntfy**.
-9. The **ntfy app** shows the alert on your phone.
+1. You type `tendril` on the phone. It connects over **Tailscale** with **Mosh** (or **SSH** if Mosh fails).
+2. The computer starts **remote-agents**, which lists your **Herdr** workspaces.
+3. You pick one and type to the agent. When you leave, Herdr keeps it running.
+4. **herdr-notify** sends an alert through **ntfy** when an agent finishes or needs you.
 
 > 💡 **Key idea:** The phone never runs the agent. Closing the phone, losing signal, or turning off Termux does **not** stop your work.
 
@@ -87,9 +82,9 @@ The agents run on your Linux computer. Your phone is only the remote control.
 
 ### On the phone
 - [ ] An Android phone
-- [ ] The **Termux** app (from F-Droid or Google Play)
+- [ ] The **Termux** app (from **F-Droid**)
 - [ ] The **Tailscale** app (Google Play)
-- [ ] Optional: **Termux:Widget** (from the **same store** as Termux)
+- [ ] Optional: **Termux:Widget** (also from **F-Droid**; it is not on Google Play)
 - [ ] Optional: **ntfy** app (Google Play), for notifications
 
 ### Files
@@ -175,6 +170,14 @@ sudo ufw allow in on tailscale0 to any port 60000:61000 proto udp
 Rule added
 ```
 
+### Step A6 (only on a server or VPS)
+
+Keep the notification watcher running after you log out:
+
+```sh
+sudo loginctl enable-linger $USER
+```
+
 ---
 
 ## 5. Part B: Prepare the phone
@@ -193,6 +196,7 @@ Typing on a phone is slow. So we will type only **5 short commands** on the phon
 ### Step B2: Turn on the phone's SSH server (type in Termux)
 
 ```sh
+pkg update -y
 pkg install -y openssh
 passwd
 whoami
@@ -201,6 +205,7 @@ sshd
 
 | Command | What it does | What you do |
 |---|---|---|
+| `pkg update -y` | Refreshes the package list. | Wait. If it asks about a config file, press **Enter**. |
 | `pkg install -y openssh` | Installs SSH tools. | Wait until it finishes. |
 | `passwd` | Sets a password for Termux. | Type a simple password twice. |
 | `whoami` | Shows the Termux username. | 📝 Write it down. It looks like `u0_a123`. |
@@ -216,11 +221,13 @@ Now go back to the **computer**. Replace `u0_a123` and `100.x.x.x` with **your p
 
 ### Step C1: Send the script to the phone
 
+Run this from the folder that contains the script:
+
 ```sh
 scp -P 8022 tendril-phone-setup.sh u0_a123@100.x.x.x:
 ```
 
-It asks for the **Termux password** from Step B2.
+Type `yes` if asked "Are you sure…". Then type the **Termux password** from Step B2.
 
 **Expected:** no error. The file is now on the phone.
 
@@ -256,8 +263,8 @@ The script asks 4 questions:
 | 1 | Installs SSH and Mosh on the phone. | Wait. |
 | 2 | Creates the phone's SSH key. | Wait. |
 | 3 | Saves the computer as `home`. | Wait. |
-| 4 | Copies the key to the computer. | Type `yes` if asked "Are you sure…". Then type your **computer** password **once**. |
-| 5 | Sets up the computer: installs Herdr, downloads TENDRIL, runs the TENDRIL installer. | Press **Enter** for each default. Type `y` for ntfy if you want alerts. |
+| 4 | Copies the key to the computer. | Type your **computer** password **once**. |
+| 5 | Sets up the computer: installs Herdr, downloads TENDRIL, runs the TENDRIL installer. | Press **Enter** for the 3 text questions. Type `y` for **every** yes/no question (ntfy, watcher, keybindings). |
 | 6 | Installs the `tendril` command on the phone. | Wait. |
 | 7 | Creates a home-screen shortcut. | Wait. |
 | 8 | Checks everything. | Read the results. |
@@ -292,6 +299,8 @@ The script asks 4 questions:
 
 > 💡 The "Herdr server is not running" warning is normal right now. You start Herdr in Part D.
 
+> ⚠️ Yes/no questions default to **No**. Pressing Enter skips them, and **ALT then D** will not work.
+
 > 💡 You can run the script again at any time. It is safe. It also updates TENDRIL.
 
 ### Step C4: Turn off the phone's SSH server
@@ -300,8 +309,9 @@ You do not need it anymore. Still in the same session, type:
 
 ```sh
 pkill sshd
-exit
 ```
+
+The connection closes. That is expected.
 
 ---
 
@@ -320,7 +330,7 @@ herdr
 Inside Herdr, start Claude in a project folder:
 
 ```sh
-mkdir -p ~/my-project && cd ~/my-project
+mkdir -p ~/Projects/my-project && cd ~/Projects/my-project
 claude
 ```
 
@@ -406,7 +416,7 @@ This only checks. It does not change anything.
 
 ### Add the home-screen button
 
-1. Install **Termux:Widget** (from the same store as Termux).
+1. Install **Termux:Widget** from F-Droid.
 2. Long-press your home screen → **Widgets** → **Termux:Widget**.
 3. Tap **tendril** in the widget. The menu opens with no typing.
 
