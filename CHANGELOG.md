@@ -4,6 +4,33 @@ All notable changes to TENDRIL are documented here.
 
 ## Unreleased
 
+- Sessions are addressable end to end. `remote-agents attach <id>` (and
+  `tendril [alias] attach <id>` on the phone) attach directly by canonical
+  Herdr workspace id (`w15`), pane id (`w15:p1` → parent), workspace number,
+  or exact unique label — no selector. Unknown/stale ids exit 2 with
+  closest-match hints; ambiguous labels exit 3 with the candidates.
+  `resolve`/`focus`/`link` print canonical JSON and tendril-link payloads
+  (`bin/tendril_link.py`: host + workspace id + label ONLY, strict decode,
+  URL-safe) for notification deep links.
+- `herdr-notify` sends composed operator alerts built from snapshot state
+  only — zero LLM/API cost by default: "PI needs input · 18m · ~/research"
+  (priority high), "PI finished · 22m · …" (default), and a once-per-stint
+  "still working" nudge after `NTFY_WORKING_NUDGE_MINUTES` (45, 0 disables).
+  `NTFY_CLICK_TEMPLATE` renders ntfy Click/Actions headers from the
+  canonical payload so a tap can land on the exact session
+  (docs/DEEPLINK.md). Optional `NTFY_SUMMARIZER_BIN` local plugin, off by
+  default; no API keys, no network beyond the ntfy POST.
+- iPhone via Blink Shell is first-class (docs/IOS_BLINK.md): Alt+D detach
+  verified against Blink's key encoding, Mosh hosts with a `tendril`
+  startup command, automatic 256-colour palette, and a deliberately small
+  terminal capability model (`terminal_name()`; the Ctrl+Home bridge stays
+  Termux-only; Blink-specific help via opt-in `TENDRIL_TERMINAL=blink`).
+- Android deep links: `phone/termux-url-opener` handles shared
+  `https://…/.tendril/<id>` URLs under Termux's verified share contract;
+  docs/DEEPLINK.md documents the honest one-tap recipes (MacroDroid/Tasker
+  via ntfy's message broadcast on Android, iOS Shortcuts → `focus` → Blink
+  on iPhone) and the platform limits (Termux registers no URL schemes;
+  Blink removed its x-callback scheme).
 - Ctrl+Home detaches on Termux without any Herdr config change: when attached
   from `remote-agents` on Termux (auto; `TENDRIL_DETACH_BRIDGE=1` to force,
   `=0` to disable), `herdr session attach` runs behind a transparent PTY

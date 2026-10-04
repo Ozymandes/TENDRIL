@@ -5,10 +5,10 @@ A TENDRIL session is an addressable object. The canonical id is the Herdr
 A deep link carries exactly three facts — host, workspace id, optional
 human label — and nothing else (never keys, tokens, topics or commands).
 Serialization is centralized in `bin/tendril_link.py` (installed as
-`tendril-link` next to `remote-agents`):
+`~/.local/bin/tendril_link.py` next to `remote-agents`):
 
 ```
-tendril-link encode home w15 my-proj
+tendril_link.py encode home w15 my-proj
   uri:         tendril://host/home/workspace/w15?label=my-proj
   payload_b64: eyJoIjoiaG9tZSIsImwiOiJteS1wcm9qIiwidiI6MSwidyI6IncxNSJ9
                (= {"h":"home","l":"my-proj","v":1,"w":"w15"})

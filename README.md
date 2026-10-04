@@ -26,6 +26,9 @@ control, simplicity, and openness I wanted from the start.
   back to SSH.
 - `remote-agents` presents Herdr's live workspaces in a terminal selector. Pick
   a workspace to attach, create one, open a project, or check host status.
+- Sessions are addressable: `remote-agents attach <id>` (and
+  `tendril attach <id>` on the phone) jumps straight to a workspace by
+  Herdr workspace id, pane id, number, or exact label — no selector needed.
 - `herdr-notify` can watch session state and send an ntfy alert when work
   finishes or an agent needs input.
 
@@ -107,6 +110,14 @@ Inside a workspace, `Ctrl+B 1..9` jumps to a workspace, `Ctrl+B w` opens the
 picker, and `Ctrl+B n`/`p` cycles tabs. `N`, `P`, `S`, and `I` open the
 new-workspace, project, shell, and host-status flows. See the [Android guide](docs/ANDROID.md)
 for Termux key behavior and setup details.
+
+Sessions are addressable objects. `remote-agents attach|resolve|focus|link <id>`
+attach directly and expose machine-readable metadata plus canonical
+tendril-link payloads (host + workspace id + label, nothing else) for
+notification deep links — see [docs/DEEPLINK.md](docs/DEEPLINK.md). iPhone
+via Blink Shell is a first-class client ([docs/IOS_BLINK.md](docs/IOS_BLINK.md)):
+Alt+D detach, Mosh hosts with a `tendril` startup command, and the automatic
+256-colour palette. Notifications stay deterministic — no LLM, no API cost.
 
 ## Further reading
 

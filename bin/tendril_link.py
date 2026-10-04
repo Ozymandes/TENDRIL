@@ -28,8 +28,8 @@ payload is safe to log, safe to embed in a URL and safe to treat as data
 Import path: lives next to remote-agents / herdr-notify in ~/.local/bin.
 
 CLI (for debugging on phone or host):
-    tendril-link encode <host> <workspace-id> [label]
-    tendril-link decode <payload-or-uri>
+    tendril_link.py encode <host> <workspace-id> [label]
+    tendril_link.py decode <payload-or-uri>
 """
 import base64
 import binascii
@@ -167,8 +167,8 @@ def describe(host, workspace_id, label=None):
 
 
 def main(argv):
-    usage = ("usage: tendril-link encode <host> <workspace-id> [label]\n"
-             "       tendril-link decode <payload-or-uri>")
+    usage = ("usage: tendril_link.py encode <host> <workspace-id> [label]\n"
+             "       tendril_link.py decode <payload-or-uri>")
     if len(argv) >= 4 and argv[1] == "encode":
         try:
             link = describe(argv[2], argv[3],
