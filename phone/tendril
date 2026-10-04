@@ -14,18 +14,51 @@
 #   tendril              connect using $TENDRIL_ALIAS (or $AGENT_ALIAS)
 #   tendril <alias>      connect using <alias>
 #   tendril ssh <alias>  force plain SSH (skip Mosh)
+#   tendril attach <id>          direct-attach session <id> on the default alias
+#   tendril <alias> attach <id>  direct-attach session <id> via an explicit alias
+#
+# <id> is anything `remote-agents attach` resolves on the host: the canonical
+# workspace id (w15), a pane id (w15:p1), the workspace number or an exact
+# label. Only A-Z a-z 0-9 . _ : - are accepted (max 128 chars), so the id can
+# be embedded single-quoted in the mosh/ssh remote command injection-proof.
 
 DEFAULT_ALIAS="${TENDRIL_ALIAS:-${AGENT_ALIAS:-}}"
 ALIAS="${1:-$DEFAULT_ALIAS}"
+MODE=""
+ATTACH_ID=""
 FORCE_SSH=""
 if [ "$1" = "ssh" ]; then
     ALIAS="${2:-$DEFAULT_ALIAS}"
     FORCE_SSH=1
+elif [ "$1" = "attach" ]; then
+    MODE=attach
+    ALIAS="$DEFAULT_ALIAS"
+    ATTACH_ID="$2"
+elif [ "${2:-}" = "attach" ]; then
+    MODE=attach
+    ALIAS="$1"
+    ATTACH_ID="$3"
 fi
 REMOTE_BIN="${REMOTE_AGENTS_BIN:-remote-agents}"   # resolved on the HOST (login shell)
+REMOTE_CMD="$REMOTE_BIN"
+
+if [ "$MODE" = "attach" ]; then
+    BAD=""
+    case "$ATTACH_ID" in
+        "" | *[!A-Za-z0-9._:-]*) BAD=1 ;;
+    esac
+    [ "${#ATTACH_ID}" -le 128 ] || BAD=1
+    if [ "$BAD" = "1" ]; then
+        echo "usage: tendril [<alias>] attach <session-id>"
+        echo "  <session-id>: workspace id (w15), pane id (w15:p1), workspace number"
+        echo "  or exact label; characters A-Z a-z 0-9 . _ : - only, max 128"
+        exit 2
+    fi
+    REMOTE_CMD="$REMOTE_BIN attach '$ATTACH_ID'"
+fi
 
 if [ -z "$ALIAS" ]; then
-    echo "usage: tendril <ssh-alias>"
+    echo "usage: tendril [<alias>] [attach <session-id>] | tendril ssh <alias>"
     echo "first time: see docs/ANDROID.md — create a key, then: ssh-copy-id <alias>"
     exit 1
 fi
@@ -36,11 +69,11 @@ if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$ALIAS" true 2>/dev/null; then
     echo "  - first time? run: ssh $ALIAS   (accept host key, password once)"
     echo "  - then: ssh-copy-id $ALIAS"
     echo "[tendril] attempting interactive SSH anyway..."
-    exec ssh -t "$ALIAS" "$REMOTE_BIN"
+    exec ssh -t "$ALIAS" "$REMOTE_CMD"
 fi
 
 if [ -z "$FORCE_SSH" ] && command -v mosh >/dev/null 2>&1; then
-    mosh "$ALIAS" -- sh -lc "exec $REMOTE_BIN" && exit 0
+    mosh "$ALIAS" -- sh -lc "exec $REMOTE_CMD" && exit 0
     echo "[tendril] mosh failed - falling back to ssh"
 fi
-exec ssh -t "$ALIAS" "$REMOTE_BIN"
+exec ssh -t "$ALIAS" "$REMOTE_CMD"

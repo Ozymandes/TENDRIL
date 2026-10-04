@@ -145,7 +145,7 @@ else
     printf '%s\n' "$CONF_BODY" > "$CONFIG"
     chmod 600 "$CONFIG"
 fi
-for f in remote-agents herdr-notify; do
+for f in remote-agents herdr-notify tendril_link.py; do
     [ -f "$BIN_DIR/$f" ] && backup "$BIN_DIR/$f"
     act "install $BIN_DIR/$f" install -m 755 "$PKG_DIR/bin/$f" "$BIN_DIR/$f"
 done
