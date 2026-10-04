@@ -25,6 +25,50 @@ All notable changes to TENDRIL are documented here.
   key to edit steering messages. Existing installs must remove the old binding
   and reload Herdr config; workspace digits/picker remain available.
 
+- Sessions are addressable end to end. `remote-agents attach <id>` (and
+  `tendril [alias] attach <id>` on the phone) attach directly by canonical
+  Herdr workspace id (`w15`), pane id (`w15:p1` → parent), workspace number,
+  or exact unique label — no selector. Unknown/stale ids exit 2 with
+  closest-match hints; ambiguous labels exit 3 with the candidates.
+  `resolve`/`focus`/`link` print canonical JSON and tendril-link payloads
+  (`bin/tendril_link.py`: host + workspace id + label ONLY, strict decode,
+  URL-safe) for notification deep links.
+- `herdr-notify` sends composed operator alerts built from snapshot state
+  only — zero LLM/API cost by default: "PI needs input · 18m · ~/research"
+  (priority high), "PI finished · 22m · …" (default), and a once-per-stint
+  "still working" nudge after `NTFY_WORKING_NUDGE_MINUTES` (45, 0 disables).
+  `NTFY_CLICK_TEMPLATE` renders ntfy Click/Actions headers from the
+  canonical payload so a tap can land on the exact session
+  (docs/DEEPLINK.md). Optional `NTFY_SUMMARIZER_BIN` local plugin, off by
+  default; no API keys, no network beyond the ntfy POST.
+- iPhone via Blink Shell is first-class (docs/IOS_BLINK.md): Alt+D detach
+  verified against Blink's key encoding, Mosh hosts with a `tendril`
+  startup command, automatic 256-colour palette, and a deliberately small
+  terminal capability model (`terminal_name()`; Blink-specific help via
+  opt-in `TENDRIL_TERMINAL=blink`; the default-on Ctrl+Home bridge is harmless there — Blink cannot produce the combo).
+- Android deep links: `phone/termux-url-opener` handles shared
+  `https://…/.tendril/<id>` URLs under Termux's verified share contract;
+  docs/DEEPLINK.md documents the honest one-tap recipes (MacroDroid/Tasker
+  via ntfy's message broadcast on Android, iOS Shortcuts → `focus` → Blink
+  on iPhone) and the platform limits (Termux registers no URL schemes;
+  Blink removed its x-callback scheme).
+- Ctrl+Home detaches on Termux without any Herdr config change: when attached
+  from `remote-agents` on Termux (auto; `TENDRIL_DETACH_BRIDGE=1` to force,
+  `=0` to disable), `herdr session attach` runs behind a transparent PTY
+  bridge that rewrites exactly Termux's `ESC [ 1 ; 5 H` to the Alt+D detach
+  Herdr already binds. Every other byte is forwarded unchanged — plain HOME
+  (`ESC [ H`), Ctrl+], Alt+D, mouse, paste, resize (SIGWINCH is propagated),
+  EOF, and the child's exit are all preserved; termios is restored on every
+  exit path including SIGTERM/SIGHUP. Alt+D / Ctrl+B d remain the documented,
+  always-working detach keys; the bridge only adds a key Herdr cannot natively
+  express (0.9.3 rejects `ctrl+home`).
+- `N` (new workspace) and `S` (quick shell) now default to the selected or
+  focused workspace's directory: Enter accepts it, an explicit absolute path
+  overrides it, and the full directory menu only appears when no usable
+  directory exists. An explicit name is used verbatim; an empty name keeps
+  the derived directory label (the CLI does not promise a label default).
+  The `P` project flow is unchanged.
+
 - The selector supports ↑/↓ highlighting and Enter-to-attach while preserving
   numeric workspace selection; raw TTY mode restores terminal settings on
   every exit path.

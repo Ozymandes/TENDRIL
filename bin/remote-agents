@@ -5,6 +5,7 @@ One call to `herdr api snapshot` powers the whole menu. No config files,
 no daemon, no tmux. Built for narrow Android screens (Termux + Mosh/SSH).
 """
 import contextlib
+import difflib
 import hashlib
 import json
 import os
@@ -52,6 +53,13 @@ PROJECT_ROOTS = _root_list("PROJECT_ROOTS",
 NOTIFY_BIN = os.path.expanduser(CONFIG.get("NOTIFY_BIN")
                                 or "~/.local/bin/herdr-notify")
 HOST_LABEL = CONFIG.get("TAILSCALE_HOST") or os.uname().nodename
+
+# ---------- canonical deep links (tendril-link, installed next to us) ----------
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import tendril_link          # payload/uri codec for session addresses
+except ImportError:              # stale install: the selector keeps working
+    tendril_link = None
 
 
 # ---------- Herdr client detection (protocol-verified, newest-compatible) ----------
@@ -142,24 +150,49 @@ ICON = {"working": "\u25cf", "blocked": "\u25c6", "done": "\u2713",
 SHORT = {"pi": "PI", "claude": "CL", "codex": "CX", "gemini": "GE",
          "cursor": "CU", "opencode": "OC", "copilot": "CP"}
 
+# ---------- terminal capability model (deliberately small) ----------
+def terminal_name(env=None):
+    """'termux' | 'blink' | generic terminal family name.
+
+    Termux self-identifies (TERMUX_VERSION, forwarded by its ssh).
+    Everything else is opt-in: users who want terminal-aware hints set
+    TENDRIL_TERMINAL=blink (Blink Shell) — Blink sends no distinguishing
+    env over SSH. Unknown values pass through as-is so future clients
+    need no code change."""
+    if env is None:
+        env = os.environ
+    if env.get("TERMUX_VERSION"):
+        return "termux"                        # self-identified; wins
+    custom = (env.get("TENDRIL_TERMINAL") or "").strip().lower()
+    if re.match(r"^[a-z0-9_-]{1,24}$", custom):
+        return custom
+    return "generic"
+
+
+def pick_palette(colorterm):
+    """(lime, teal, gray, red): truecolor where the terminal advertises it
+    (COLORTERM), else the nearest 256-colour approximations. mosh < 1.4
+    silently drops 38;2;r;g;b sequences (Ubuntu 22.04 ships 1.3.2), which
+    rendered the whole phone UI monochrome; the 256-colour entries survive
+    every transport."""
+    if (colorterm or "").lower() in ("truecolor", "24bit"):
+        return ("\033[38;2;203;253;117m", "\033[38;2;47;179;196m",
+                "\033[38;2;112;128;136m", "\033[38;2;232;92;111m")
+    return ("\033[38;5;191m", "\033[38;5;73m",           # #d7ff87 ~ #CBFD75
+            "\033[38;5;244m", "\033[38;5;203m")         # #808080 ~ #708088, #ff5f5f ~ #E85C6F
+
+
+def color_enabled(isatty, no_color, term):
+    """Colour on real ttys only: NO_COLOR disables, so does TERM=dumb."""
+    return isatty and no_color is None and term != "dumb"
+
+
 C_RESET = "\033[0m"
 C_WHITE = "\033[97m"
-# Truecolour only where the terminal advertises it (COLORTERM). mosh < 1.4
-# silently drops 38;2;r;g;b sequences (Ubuntu 22.04 ships 1.3.2), which
-# rendered the whole phone UI monochrome; the 256-colour entries are the
-# nearest approximations and survive every transport.
-_PALETTE = (
-    ("\033[38;2;203;253;117m", "\033[38;2;47;179;196m",
-     "\033[38;2;112;128;136m", "\033[38;2;232;92;111m")
-    if os.environ.get("COLORTERM", "").lower() in ("truecolor", "24bit")
-    else
-    ("\033[38;5;191m", "\033[38;5;73m",           # #d7ff87 ~ #CBFD75
-     "\033[38;5;244m", "\033[38;5;203m")         # #808080 ~ #708088, #ff5f5f ~ #E85C6F
-)
+_PALETTE = pick_palette(os.environ.get("COLORTERM"))
 C_LIME, C_TEAL, C_GRAY, C_RED = _PALETTE
-COLOR = (sys.stdout.isatty()
-         and os.environ.get("NO_COLOR") is None
-         and os.environ.get("TERM", "") != "dumb")
+COLOR = color_enabled(sys.stdout.isatty(), os.environ.get("NO_COLOR"),
+                      os.environ.get("TERM", ""))
 if not COLOR:
     C_RESET = C_LIME = C_TEAL = C_GRAY = C_WHITE = C_RED = ""
 
@@ -1019,6 +1052,8 @@ def help_screen():
     ]
     kcol = 18
     dbudget = inner - 4 - kcol
+    if terminal_name() == "blink":           # no on-screen Home key there:
+        rows = [r for r in rows if r[0] != "Ctrl+Home"]   # unproducible combo
     out = [f"{C_LIME}\u250c{line(inner)}\u2510{C_RESET}"]
     t = " HERDR // MOBILE KEYS"
     out.append(f"{C_LIME}\u2502{C_RESET}"
@@ -1034,16 +1069,23 @@ def help_screen():
         out.append(f"{C_LIME}\u2502{C_RESET}" + body + " " * padn
                    + f" {C_LIME}\u2502{C_RESET}")
     out.append(f"{C_LIME}\u251c{line(inner)}\u2524{C_RESET}")
-    for note in ("Menu letters: no Enter needed.",
-                 "Ctrl+Home bridge: default on.",
-                 "Alt+arrows: desktop only.",
-                 "Alt+Up: reserved for Pi.",
-                 "Phone: Ctrl+B; ALT+digit.",
-                 "Disable on host with:",
-                 "TENDRIL_DETACH_BRIDGE=0",
-                 "(false/no/off/empty also disable).",
-                 "Alt+D or Ctrl+B then D detaches.",
-                 "Detach keeps workspaces and agents."):
+    notes = ["Menu letters: no Enter needed.",
+             "Alt+arrows: desktop only.",
+             "Alt+Up: reserved for Pi.",
+             "Phone: Ctrl+B; ALT+digit.",
+             "Alt+D or Ctrl+B then D detaches.",
+             "Detach keeps workspaces and agents."]
+    if terminal_name() == "blink":       # no on-screen Home key in Blink:
+        notes[0:0] = ["Blink: no Home key on screen;",   # unproducible combo
+                      "detach = tap ALT then D;",
+                      "TENDRIL_TERMINAL=blink selects",
+                      "these hints."]
+    else:
+        notes[1:1] = ["Ctrl+Home bridge: default on.",
+                      "Disable on host with:",
+                      "TENDRIL_DETACH_BRIDGE=0",
+                      "(false/no/off/empty also disable)."]
+    for note in notes:
         nfit = fit(note, inner - 2)
         out.append(f"{C_LIME}\u2502{C_RESET} {C_GRAY}{nfit}{C_RESET}"
                    + " " * max(0, inner - 1 - len(nfit))
@@ -1172,6 +1214,171 @@ def menu_loop(rows, tty_mode=False, fd=None):
             selected = selection_index(rows, preferred_id, previous_index)
 
 
+# ---------- direct addressing: attach/resolve/focus/link <token> ----------
+# A TENDRIL session is addressable without the selector. The canonical token
+# is the herdr workspace_id ("w15"); pane ids ("w15:p1") resolve to their
+# parent workspace, pure digits to the workspace number, and an exact
+# case-sensitive label as the last resort. The subcommands are the machine
+# interface (phone shortcuts, deep links): non-interactive, safe over SSH.
+PANE_RE = re.compile(r"^[A-Za-z0-9]+:[A-Za-z0-9]+$")
+MAX_TOKEN = 129                             # beyond this the token is junk
+SUBCOMMANDS = ("attach", "resolve", "focus", "link")
+_RANK_NAME = {rank: name for name, rank in RANK.items()}
+
+
+def resolve_token(rows, token):
+    """(row, None) or (None, ("unknown"|"ambiguous", matching rows)).
+
+    Pure over `rows` — no I/O. Token order: exact workspace_id (canonical,
+    case-sensitive), pane id -> parent workspace, pure digits -> workspace
+    number, then an exact unique label. Empty/oversized tokens and unknown
+    (possibly stale) ids come back as ("unknown", []); a label shared by
+    several workspaces as ("ambiguous", hits)."""
+    token = token or ""
+    if not token or len(token) > MAX_TOKEN:
+        return None, ("unknown", [])
+    for r in rows:
+        if r["id"] == token:
+            return r, None
+    if PANE_RE.match(token):                # "w15:p1" -> workspace "w15"
+        parent = token.split(":", 1)[0]
+        for r in rows:
+            if r["id"] == parent:
+                return r, None
+    if token.isascii() and token.isdigit():
+        hits = [r for r in rows if r.get("number") == int(token)]
+        if len(hits) == 1:
+            return hits[0], None
+        if len(hits) > 1:
+            return None, ("ambiguous", hits)
+    hits = [r for r in rows if r.get("label") == token]
+    if len(hits) == 1:
+        return hits[0], None
+    if len(hits) > 1:
+        return None, ("ambiguous", hits)
+    return None, ("unknown", [])
+
+
+def _reachable_rows():
+    """(rows, 0) or (None, 1) — the shared 'can we talk to Herdr?' gate."""
+    if not HERDR:
+        print(f"{C_RED}no compatible herdr client found{C_RESET}")
+        for cand, ok, detail in HERDR_VERDICTS:
+            print(f"  [{'ok' if ok else 'REJECT'}] {cand}: {detail}")
+        return None, 1
+    rows = collect()
+    if rows is None:
+        print(f"{C_RED}cannot reach the Herdr server.{C_RESET} "
+              f"{C_GRAY}Is it running? Try: herdr status{C_RESET}")
+        return None, 1
+    return rows, 0
+
+
+def _close_rows(rows, token):
+    """Up to 5 near-miss rows (matched on id or label) for unknown tokens."""
+    names = {}
+    for r in rows:
+        names.setdefault(r["id"], r)
+        names.setdefault(r["label"], r)
+    near = difflib.get_close_matches(token, list(names), n=5, cutoff=0.5)
+    if not near:
+        low = token.lower()
+        near = [n for n in names if low in n.lower()][:5]
+    return [names[n] for n in near]
+
+
+def _resolve_session(rows, token):
+    """(row, 0) or (None, exit-code), with a diagnostic on stderr."""
+    row, failure = resolve_token(rows, token)
+    if row is not None:
+        return row, 0
+    kind, hits = failure
+    if kind == "ambiguous":
+        print(f"{C_RED}'{token}' matches several sessions:{C_RESET}", file=sys.stderr)
+        for r in hits[:5]:
+            print(f"  {r['id']}  {r['label']}", file=sys.stderr)
+        return None, 3
+    print(f"{C_RED}no session matches '{token}' on {HOST_LABEL} "
+          f"(stale id? the workspace may be gone){C_RESET}", file=sys.stderr)
+    for r in _close_rows(rows, token):
+        print(f"{C_GRAY}  closest: {r['id']}  {r['label']}{C_RESET}", file=sys.stderr)
+    return None, 2
+
+
+def _session_link(row):
+    """tendril_link.describe() for a row, or None with a diagnostic."""
+    if tendril_link is None:
+        print(f"{C_RED}tendril_link missing next to remote-agents - re-run install{C_RESET}",
+              file=sys.stderr)
+        return None
+    try:
+        return tendril_link.describe(HOST_LABEL, row["id"], row["label"])
+    except tendril_link.LinkError as exc:
+        print(f"{C_RED}link error: {exc}{C_RESET}", file=sys.stderr)
+        return None
+
+
+def _herdr_running():
+    '"running" when `herdr status` says so, "unknown" otherwise (best effort).'
+    rc, out, err = run([HERDR, "status"], 6)
+    if rc == 0 and re.search(r"status:\s*running", (out or "") + (err or "")):
+        return "running"
+    return "unknown"
+
+
+def session_json(row):
+    """One-line canonical JSON for resolve/focus: everything a notification
+    or deep-link consumer needs. link/payload_b64 come from tendril_link."""
+    link = _session_link(row)
+    if link is None:
+        return None
+    doc = {
+        "host": HOST_LABEL,
+        "workspace_id": row["id"],
+        "label": row["label"],
+        "number": row["number"],
+        "cwd": row["path"] or "",
+        "agent": (row["agents"][0].get("agent") or "") if row["agents"] else "",
+        "agent_status": _RANK_NAME.get(row.get("rank", 4), "unknown"),
+        "agents": [{"agent": a.get("agent") or "",
+                    "agent_status": a.get("agent_status") or "unknown",
+                    "pane_id": a.get("pane_id") or ""} for a in row["agents"]],
+        "focused": bool(row.get("focused")),
+        "link": link["uri"],
+        "payload_b64": link["payload_b64"],
+        "herdr_status": _herdr_running(),
+    }
+    return json.dumps(doc, separators=(",", ":"))
+
+
+def _run_subcommand(cmd, token):
+    """attach/resolve/focus/link: never interactive, safe over plain SSH.
+    Exit codes: 0 ok, 1 Herdr unreachable, 2 unknown/stale token, 3 ambiguous."""
+    rows, code = _reachable_rows()
+    if rows is None:
+        return code
+    row, code = _resolve_session(rows, token)
+    if row is None:
+        return code
+    if cmd == "attach":
+        print(f"{C_GRAY}found session '{row['label']}' ({row['id']}){C_RESET}", flush=True)
+        attach(row)
+        return 0
+    if cmd == "link":
+        link = _session_link(row)
+        if link is None:
+            return 2
+        print(link["uri"])
+        return 0
+    doc = session_json(row)                 # resolve and focus print the same body
+    if doc is None:
+        return 2
+    if cmd == "focus":                      # headless hook: focus only, no session attach
+        run([HERDR, "workspace", "focus", row["id"]], 6)
+    print(doc)
+    return 0
+
+
 def main():
     if "--detect" in sys.argv:
         for cand, ok, detail in HERDR_VERDICTS:
@@ -1179,16 +1386,20 @@ def main():
             print(f"[{tag}] {cand}\n        {detail}")
         print("chosen:", HERDR or "NONE")
         return 0
-    if not HERDR:
-        print(f"{C_RED}no compatible herdr client found{C_RESET}")
-        for cand, ok, detail in HERDR_VERDICTS:
-            print(f"  [{'ok' if ok else 'REJECT'}] {cand}: {detail}")
-        return 1
-    rows = collect()
+    args = sys.argv[1:]
+    if len(args) == 2 and args[0] in SUBCOMMANDS:
+        return _run_subcommand(args[0], args[1])
+    if args:
+        print("usage: remote-agents [attach|resolve|focus|link] <session-token>",
+              file=sys.stderr)
+        print("       <session-token>: workspace id (w15), pane id (w15:p1),",
+              file=sys.stderr)
+        print("       workspace number or exact label; no args opens the selector",
+              file=sys.stderr)
+        return 2
+    rows, code = _reachable_rows()
     if rows is None:
-        print(f"{C_RED}cannot reach the Herdr server.{C_RESET} "
-              f"{C_GRAY}Is it running? Try: herdr status{C_RESET}")
-        return 1
+        return code
     tty_mode = sys.stdin.isatty()
     fd = sys.stdin.fileno() if tty_mode else None
     return menu_loop(rows, tty_mode, fd)
