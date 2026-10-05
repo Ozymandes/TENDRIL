@@ -87,6 +87,15 @@ HOST_USER=$(ask "Your Linux username on that computer" "")
 ALIAS=$(ask "Short name for this computer" "home")
 REPO=$(ask "TENDRIL folder on the computer" "TENDRIL")
 
+# These values are embedded in remote SSH commands below; spaces or quotes
+# would break the hand-off (or the ssh config). Keep them simple.
+case "$ALIAS$HOST_USER$REPO" in
+    *[!A-Za-z0-9._/-]*)
+        echo "Alias, username and folder must be simple: letters, digits,"
+        echo "dot, dash, underscore, slash - no spaces or quotes. Got: '$ALIAS' / '$HOST_USER' / '$REPO'"
+        exit 1 ;;
+esac
+
 echo; echo "1) Installing openssh + mosh..."
 pkg update -y && pkg install -y openssh mosh
 
@@ -173,7 +182,7 @@ fi
 
 if [ -x "$HOME/.local/bin/remote-agents" ]; then
     # Already installed: refresh the programs only, keep config (per TENDRIL README)
-    for f in remote-agents herdr-notify; do
+    for f in remote-agents herdr-notify tendril_link.py; do
         install -m 755 "$REPO/bin/$f" "$HOME/.local/bin/$f.new" \
             && mv -f "$HOME/.local/bin/$f.new" "$HOME/.local/bin/$f"
     done
@@ -198,15 +207,18 @@ rm -f "$HOST_SCRIPT"
 ssh -t "$ALIAS" "bash ~/.tendril-host-setup.sh '$REPO'; rc=\$?; rm -f ~/.tendril-host-setup.sh; exit \$rc" \
     || { echo "   computer setup failed - see the messages above"; exit 1; }
 
-echo; echo "6) Installing the tendril command..."
+echo; echo "6) Installing the phone launchers and deep-link helper..."
 mkdir -p ~/bin
-if scp -q "$ALIAS:$REPO/phone/tendril" ~/bin/tendril 2>/dev/null; then
+if scp -q "$ALIAS:$REPO/phone/tendril" "$ALIAS:$REPO/phone/agent" \
+        "$ALIAS:$REPO/phone/termux-url-opener" ~/bin/ 2>/dev/null; then
     echo "   copied from $ALIAS:$REPO"
 else
     echo "   not found at $ALIAS:~/$REPO - downloading from GitHub instead"
-    curl -fsSL https://raw.githubusercontent.com/Ozymandes/TENDRIL/main/phone/tendril -o ~/bin/tendril
+    for f in tendril agent termux-url-opener; do
+        curl -fsSL "https://raw.githubusercontent.com/Ozymandes/TENDRIL/main/phone/$f" -o ~/bin/$f
+    done
 fi
-chmod 700 ~/bin/tendril
+chmod 700 ~/bin/tendril ~/bin/agent ~/bin/termux-url-opener
 grep -q 'HOME/bin' ~/.bashrc 2>/dev/null || echo 'export PATH=$HOME/bin:$PATH' >> ~/.bashrc
 sed -i '/^export TENDRIL_ALIAS=/d' ~/.bashrc 2>/dev/null || true
 echo "export TENDRIL_ALIAS=$ALIAS" >> ~/.bashrc

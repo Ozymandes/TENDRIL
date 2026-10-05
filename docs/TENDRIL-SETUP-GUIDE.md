@@ -265,7 +265,7 @@ The script asks 4 questions:
 | 3 | Saves the computer as `home`. | Wait. |
 | 4 | Copies the key to the computer. | Type your **computer** password **once**. |
 | 5 | Sets up the computer: installs Herdr, downloads TENDRIL, runs the TENDRIL installer. | Press **Enter** for the 3 text questions. Type `y` for **every** yes/no question (ntfy, watcher, keybindings). |
-| 6 | Installs the `tendril` command on the phone. | Wait. |
+| 6 | Installs the `tendril` and `agent` commands and the deep-link helper on the phone. | Wait. |
 | 7 | Creates a home-screen shortcut. | Wait. |
 | 8 | Checks everything. | Read the results. |
 
@@ -463,6 +463,17 @@ herdr-notify --test
 | anything → blocked | **Input required** |
 
 Alerts contain only these words and the workspace name. They never contain your code or prompts.
+
+### Tap an alert to jump into that session (deep links)
+
+The setup script already copied the deep-link helper to
+`~/bin/termux-url-opener`. Android cannot open Termux from a bare
+notification tap, so today there are two supported paths: **share** any
+TENDRIL URL (like `https://…/.tendril/w15`) to the Termux app from any
+share sheet (works right away, no extra setup), or set up Tasker or
+MacroDroid for real one-tap behavior (needs the ntfy "broadcast
+messages" setting). What each path can and cannot do is documented in
+[docs/DEEPLINK.md](DEEPLINK.md).
 
 ---
 

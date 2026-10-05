@@ -60,8 +60,9 @@ user-local with Python's standard library.
 [`docs/scripts/tendril-phone-setup.sh`](docs/scripts/tendril-phone-setup.sh)
 sets up both sides from the phone. It installs SSH and Mosh in Termux, creates
 the phone's key and `~/.ssh/config` alias, copies the key to the host, installs
-Herdr and TENDRIL on the host (no `sudo`), adds the `tendril` command and a
-Termux:Widget shortcut, then checks the whole chain. The
+Herdr and TENDRIL on the host (no `sudo`), adds the `tendril` and `agent`
+commands, a Termux:Widget shortcut and the deep-link helper
+(`termux-url-opener`), then checks the whole chain. The
 [setup guide](docs/TENDRIL-SETUP-GUIDE.md) covers every step.
 
 ```sh

@@ -4,6 +4,14 @@ All notable changes to TENDRIL are documented here.
 
 ## Unreleased
 
+- Guided phone-first setup (PR #1 by @bakrianoo): a one-shot Termux script
+  (`docs/scripts/tendril-phone-setup.sh`) bootstraps both ends from the
+  phone — SSH key and alias, host-side Herdr/TENDRIL install or atomic
+  binary refresh (including `tendril_link.py`), `tendril`/`agent`
+  launchers, the `termux-url-opener` deep-link helper, and a Termux:Widget
+  shortcut — with `--check` verification of the whole chain. A beginner
+  walkthrough with expected output and troubleshooting lives in
+  `docs/TENDRIL-SETUP-GUIDE.md`.
 - For host TTY attachments, `remote-agents` enables the Ctrl+Home PTY bridge
   by default, independently of `TERMUX_VERSION` or phone environment
   forwarding. It rewrites only `ESC [ 1 ; 5 H` to Herdr's Alt+D detach key;
