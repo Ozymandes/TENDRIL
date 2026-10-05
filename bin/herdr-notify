@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
-"""herdr-notify — Herdr agent state transitions -> ntfy push (Android).
+"""herdr-notify — Herdr agent state -> ntfy operator alerts (Android).
 
-Polls `herdr api snapshot` (same explicit 0.9.1 client as remote-agents),
-notifies ONLY on meaningful transitions into done/blocked. Baselines on
-start and after any Herdr outage so restarts never cause notification
-storms. Credentials live in ~/.config/remote-agents/notify.env (chmod 600).
+Polls `herdr api snapshot` (same explicit 0.9.1 client as remote-agents)
+and pushes short, deterministic alerts composed only from snapshot state:
+agent kind, time in the current status, home-collapsed cwd, workspace
+label. Classes: input required (high), task finished (default), and a
+once-per-stint "still working" nudge (min). Optional deep-link plumbing
+renders an ntfy Click URL (plus an Attach action button) from canonical
+tendril-link payloads so a tap can open the right workspace on the phone.
+Zero LLM/API cost by default: no external services, no API keys, and no
+network traffic beyond the ntfy POST itself. Baselines on start and after
+any Herdr outage so restarts never cause notification storms. Credentials
+live in ~/.config/remote-agents/notify.env (chmod 600).
 """
 import json
 import os
@@ -15,6 +22,10 @@ import subprocess
 import sys
 import time
 import urllib.request
+from urllib.parse import quote
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import tendril_link  # canonical deep-link payloads; lives next to this file
 
 # ---------- portable configuration + Herdr client detection ----------
 CONFIG_SEARCH = [
@@ -112,22 +123,154 @@ ENV_FILE = (os.environ.get("NOTIFY_ENV")
             or os.path.expanduser("~/.config/remote-agents/notify.env"))
 POLL_SECONDS = 8
 MIN_REPEAT = 90  # min seconds between pushes for the same pane
+NUDGE_DEFAULT_MINUTES = 45  # "still working" nudge threshold (0 disables)
+MAX_TITLE_LABEL = 60        # title label cap (… suffix past this)
+MAX_CWD_CHARS = 28          # keep short cwds whole, else last two components
 
 # Herdr semantics (official docs): `idle` and `done` BOTH mean the agent is
 # ready for input; screen-detected agents (e.g. Pi) settle to `idle` after a
 # turn, integration-tracked agents may report `done`. `blocked` = approval or
 # question UI. Herdr exposes no distinct "error" state.
-COMPLETE = ("Task complete", "default", "white_check_mark")
-BLOCKED = ("Input required", "high", "rotating_light")
+NEEDS_INPUT = "needs_input"
+DONE = "done"
+NUDGE = "nudge"
+
+# class -> (body verb after <KIND>, ntfy Priority, ntfy Tags emoji shortcode)
+CLASS_STYLE = {
+    NEEDS_INPUT: ("needs input", "high", "rotating_light"),
+    DONE: ("finished", "default", "white_check_mark"),
+    NUDGE: ("still working", "min", "hourglass"),
+}
 
 
 def classify(prev_st, new_st):
-    """Meaningful transition -> (body, priority, tags); None = stay silent."""
+    """Meaningful transition -> alert class (NEEDS_INPUT/DONE); None silent."""
     if new_st == "blocked":
-        return BLOCKED
+        return NEEDS_INPUT
     if prev_st == "working" and new_st in ("idle", "done"):
-        return COMPLETE
+        return DONE
     return None
+
+
+# ---------- deterministic alert composition (pure, unit-testable) ----------
+
+def human_elapsed(seconds):
+    """Compact human duration: 45s / 18m / 1h02m (minutes zero-padded)."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    if seconds < 3600:
+        return f"{seconds // 60}m"
+    return f"{seconds // 3600}h{seconds % 3600 // 60:02d}m"
+
+
+def short_cwd(path):
+    """~/-collapsed cwd, whole if <=28 chars, else '…/<last-two-components>'.
+    Empty/missing -> "" (the body simply omits the cwd segment)."""
+    if not path:
+        return ""
+    path = str(path)
+    home = os.path.expanduser("~")
+    if home and home != "/":
+        if path == home:
+            return "~"
+        if path.startswith(home + "/"):
+            path = "~" + path[len(home):]
+    if len(path) <= MAX_CWD_CHARS:
+        return path
+    parts = [p for p in path.split("/") if p]
+    if not parts:  # only possible for paths that already fit the cap
+        return path
+    return "…/" + "/".join(parts[-2:])
+
+
+def compose(kind, label, cls, status_since, cwd, now=None):
+    """Deterministic (title, body, priority, tags) for one alert class.
+
+    Title: 'TENDRIL · <label>'. Body: '<KIND> <verb> · <elapsed>[ · <cwd>]' —
+    built ONLY from the passed snapshot fields, never agent output.
+    """
+    if now is None:
+        now = time.time()
+    verb, priority, tags = CLASS_STYLE[cls]
+    kind = str(kind).strip().upper() or "AGENT"
+    clean = tendril_link.clean_label(label) or "workspace"
+    if len(clean) > MAX_TITLE_LABEL:
+        clean = clean[:MAX_TITLE_LABEL] + "…"
+    title = f"TENDRIL · {clean}"
+    body = f"{kind} {verb} · {human_elapsed(now - status_since)}"
+    short = short_cwd(cwd)
+    if short:
+        body += f" · {short}"
+    return title, body, priority, tags
+
+
+def render_template(template, fields):
+    """Total placeholder substitution for click URL templates: {name} ->
+    fields[name] or "" for unknown names. Pure string ops, never raises."""
+    return re.sub(r"\{([A-Za-z0-9_]+)\}",
+                  lambda m: str(fields.get(m.group(1), "")), template or "")
+
+
+def link_fields(host, workspace_id, label):
+    """tendril-link wire forms for a workspace, plus {label_uri}; None when
+    there is no linkable workspace (vanished workspace, invalid ids)."""
+    if not host or not workspace_id:
+        return None
+    try:
+        fields = tendril_link.describe(host, workspace_id, label)
+    except (tendril_link.LinkError, TypeError, ValueError):
+        return None
+    fields = {k: (v or "") for k, v in fields.items()}
+    fields["label_uri"] = quote(fields["label"], safe="")
+    return fields
+
+
+def click_headers(cfg, fields):
+    """(Click URL, Actions header) for this push; (None, None) when disabled.
+    ntfy short format (docs.ntfy.sh): view, <label>, <url>[, clear=true]."""
+    template = str(cfg.get("NTFY_CLICK_TEMPLATE") or "").strip()
+    if not template or not fields:
+        return None, None
+    url = render_template(template, fields)
+    if not url:
+        return None, None
+    actions = None
+    if str(cfg.get("NTFY_ACTIONS") or "1").strip() != "0":
+        actions = f"view, Attach, {url}, clear=true"
+    return url, actions
+
+
+def nudge_minutes(cfg):
+    """NTFY_WORKING_NUDGE_MINUTES as int; default 45; 0 disables; junk -> 45."""
+    raw = str(cfg.get("NTFY_WORKING_NUDGE_MINUTES") or "").strip()
+    if not raw:
+        return NUDGE_DEFAULT_MINUTES
+    try:
+        return int(raw)
+    except ValueError:
+        return NUDGE_DEFAULT_MINUTES
+
+
+def summarize(cfg, info):
+    """Optional local summarizer plugin (OFF unless NTFY_SUMMARIZER_BIN is an
+    executable). Feeds one JSON object on stdin, takes <=200 chars of stdout,
+    cleaned to a single line. ANY failure -> "" (silently omitted)."""
+    binary = str(cfg.get("NTFY_SUMMARIZER_BIN") or "").strip()
+    if not binary:
+        return ""
+    path = os.path.expanduser(binary)
+    if not os.path.isfile(path) or not os.access(path, os.X_OK):
+        return ""
+    try:
+        p = subprocess.run([path], input=json.dumps(info).encode("utf-8"),
+                           capture_output=True, timeout=8)
+        if p.returncode != 0:
+            return ""
+        text = p.stdout.decode("utf-8", "replace")[:200]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ""
+    return tendril_link.clean_label(text) or ""
 
 
 def log(msg):
@@ -175,13 +318,23 @@ def configured(cfg):
     return bool(cfg.get("NTFY_URL")) and bool(cfg.get("NTFY_TOPIC"))
 
 
-def send(cfg, title, body, priority, tags):
+def _utf8(value):
+    """ntfy accepts UTF-8 header values but http.client only encodes latin-1,
+    so hand it pre-encoded bytes (workspace labels may be any Unicode)."""
+    return value.encode("utf-8") if isinstance(value, str) else value
+
+
+def send(cfg, title, body, priority, tags, click=None, actions=None):
     url = cfg["NTFY_URL"].rstrip("/") + "/" + cfg["NTFY_TOPIC"]
     req = urllib.request.Request(url, data=body.encode("utf-8"), method="POST")
-    req.add_header("Title", title)
+    req.add_header("Title", _utf8(title))
     req.add_header("Priority", priority)
     if tags:
         req.add_header("Tags", tags)
+    if click:
+        req.add_header("Click", _utf8(click))
+    if actions:
+        req.add_header("Actions", _utf8(actions))
     token = cfg.get("NTFY_TOKEN", "")
     if token:
         req.add_header("Authorization", "Bearer " + token)
@@ -201,13 +354,67 @@ def snapshot():
         return None
 
 
+def pane_context(agent, workspaces):
+    """(kind, workspace_id, raw_label, title_label) for one snapshot agent."""
+    ws_id = agent.get("workspace_id") or ""
+    label = workspaces.get(ws_id) if ws_id else None
+    kind = str(agent.get("agent") or "agent").strip().upper() or "AGENT"
+    return kind, ws_id, label, label or ws_id or "workspace"
+
+
+def push(state, pid, agent, cls, workspaces, cfg, allow_push, now,
+         alert_since=None):
+    """Compose and send one alert for pid. Honors config + repeat window;
+    last_push only advances on a successful send so failures retry.
+    alert_since: start of the stint the alert describes — for transitions
+    that is the PREVIOUS status's start ("worked 22m, now done"), for the
+    nudge it is the current working stint (defaults to state's value)."""
+    st, status_since, last_push = state[pid]
+    if alert_since is None:
+        alert_since = status_since
+    if not (allow_push and configured(cfg)):
+        return
+    if now - last_push < MIN_REPEAT:
+        log(f"PUSH suppressed (repeat window) {pid}")
+        return
+    kind, ws_id, label, title_label = pane_context(agent, workspaces)
+    host = CONFIG.get("TAILSCALE_HOST") or os.uname().nodename
+    cwd = agent.get("cwd")
+    title, body, priority, tags = compose(kind, title_label, cls,
+                                          alert_since, cwd, now=now)
+    # vanished workspace -> no click/actions rather than a garbage payload
+    fields = (link_fields(host, ws_id, label)
+              if ws_id and ws_id in workspaces else None)
+    click, actions = click_headers(cfg, fields)
+    detail = summarize(cfg, {"workspace_id": ws_id, "label": title_label,
+                             "agent": kind, "status": st,
+                             "elapsed_s": int(now - alert_since),
+                             "cwd": cwd or "", "host": host})
+    if detail:
+        body += f" — {detail}"
+    try:
+        send(cfg, title, body, priority, tags, click=click, actions=actions)
+        state[pid] = (st, status_since, now)
+        log(f"PUSH {title}: {body}")
+    except Exception as e:  # keep old ts so next poll retries
+        log(f"WARN push failed for {title}: {e}")
+
+
 def poll(state, cfg, allow_push):
-    """One poll cycle. Returns True on success, False when snapshot failed."""
+    """One poll cycle. Returns True on success, False when snapshot failed.
+
+    State is pane_id -> (status, status_since, last_push). The still-working
+    nudge fires once per working stint: it is eligible only while last_push
+    predates the current stint (no push can otherwise happen DURING a working
+    stint, so last_push < status_since iff the nudge has not fired yet).
+    """
     snap = snapshot()
     if snap is None:
         return False
-    ws_labels = {w.get("workspace_id"): (w.get("label") or w.get("workspace_id", "?"))
-                 for w in snap.get("workspaces", [])}
+    workspaces = {}
+    for w in snap.get("workspaces", []):
+        if w.get("workspace_id"):
+            workspaces[w["workspace_id"]] = w.get("label")
     now = time.time()
     seen = set()
     for a in snap.get("agents", []):
@@ -216,33 +423,30 @@ def poll(state, cfg, allow_push):
         if not pid or not st:
             continue
         seen.add(pid)
-        kind = (a.get("agent") or "agent").upper()
-        label = ws_labels.get(a.get("workspace_id"), "?")
         prev = state.get(pid)
         if prev is None:
-            state[pid] = (st, 0.0)  # baseline: never push on first sighting
+            state[pid] = (st, now, 0.0)  # baseline: never push on first sighting
             continue
-        prev_st, last_push = prev
+        prev_st, status_since, last_push = prev
+        kind, _, _, title_label = pane_context(a, workspaces)
         if st == prev_st:
+            held = now - status_since
+            minutes = nudge_minutes(cfg)
+            if (st == "working" and minutes > 0 and held >= minutes * 60
+                    and last_push < status_since
+                    and allow_push and configured(cfg)):
+                log(f"NUDGE {title_label} // {kind}: working for "
+                    f"{human_elapsed(held)}")
+                push(state, pid, a, NUDGE, workspaces, cfg, allow_push, now)
             continue
-        state[pid] = (st, last_push)
-        title = f"{label} // {kind}"
-        hit = classify(prev_st, st)
-        log(f"TRANSITION {title}: {prev_st} -> {st}" + ("" if hit else " (silent)"))
-        if hit is None:
+        cls = classify(prev_st, st)
+        state[pid] = (st, now, last_push)
+        log(f"TRANSITION {title_label} // {kind}: {prev_st} -> {st}"
+            + ("" if cls else " (silent)"))
+        if cls is None:
             continue
-        body, priority, tags = hit
-        if not (allow_push and configured(cfg)):
-            continue
-        if now - last_push < MIN_REPEAT:
-            log(f"PUSH suppressed (repeat window) {title}")
-            continue
-        try:
-            send(cfg, title, body, priority, tags)
-            state[pid] = (st, now)
-            log(f"PUSH {title}: {body}")
-        except Exception as e:  # keep old ts so next poll retries
-            log(f"WARN push failed for {title}: {e}")
+        push(state, pid, a, cls, workspaces, cfg, allow_push, now,
+             alert_since=status_since)
     for pid in list(state):
         if pid not in seen:
             del state[pid]  # pane/agent gone; silent by design
@@ -268,6 +472,16 @@ def watch():
         time.sleep(POLL_SECONDS)
 
 
+def demo_workspace():
+    """Workspace for --test click rendering: first live one, else a demo."""
+    snap = snapshot()
+    if snap:
+        for w in snap.get("workspaces", []):
+            if w.get("workspace_id"):
+                return w["workspace_id"], w.get("label")
+    return "w0", "test"
+
+
 def test():
     cfg = load_env()
     if not configured(cfg):
@@ -277,9 +491,22 @@ def test():
         print(f"  NTFY_TOKEN=<optional bearer token>")
         print(f"then: chmod 600 {ENV_FILE} && systemctl --user restart herdr-notify")
         return 1
+    click = actions = None
+    template = str(cfg.get("NTFY_CLICK_TEMPLATE") or "").strip()
+    if template:
+        host = CONFIG.get("TAILSCALE_HOST") or os.uname().nodename
+        ws_id, label = demo_workspace()
+        fields = link_fields(host, ws_id, label)
+        if fields:
+            click, actions = click_headers(cfg, fields)
+            print(f"click: {click}")
+            if actions:
+                print(f"actions: {actions}")
+        else:
+            print("click: not rendered (no linkable workspace)")
     try:
         send(cfg, f"{os.uname().nodename} // remote-agents", "Test notification",
-             "default", "bell")
+             "default", "bell", click=click, actions=actions)
     except Exception as e:
         print(f"test push FAILED: {e}")
         return 1

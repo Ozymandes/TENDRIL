@@ -145,6 +145,43 @@ older selectors need `Q` then Enter; the updated selector quits with `Q` alone.
 Run `tendril` again to start the updated selector; reconnecting Mosh alone is
 not enough.
 
+## Deep links: tap a notification, land in the session
+
+Termux registers no URL schemes, so a bare notification tap cannot open
+Termux. What Termux does reliably: when a URL is **shared** to the Termux
+app it runs `~/bin/termux-url-opener <url>`. The repo ships that script —
+`phone/termux-url-opener` — and it recognizes TENDRIL links like
+`https://…/.tendril/w15` (also `?id=…`/`?p=…` pairs), validates the id and
+runs `tendril attach <id>` for you.
+
+Install it on the phone (`HOST` = ssh alias, `REPO` = host checkout path,
+as in step 5 above):
+
+```sh
+set -e
+HOST=home
+REPO=/path/to/tendril
+mkdir -p "$HOME/bin"
+scp "$HOST:$REPO/phone/termux-url-opener" "$HOME/bin/termux-url-opener"
+chmod 700 "$HOME/bin/termux-url-opener"
+```
+
+Two ways in:
+
+1. **Share flow (works today, zero setup beyond the install):** share any
+   `https://…/.tendril/<id>` URL from any app → Termux → the session opens.
+2. **One-tap flow (needs MacroDroid or Tasker):** the ntfy app broadcasts
+   `io.heckel.ntfy.MESSAGE_RECEIVED` per message (enable "broadcast
+   messages" in ntfy settings); MacroDroid turns that into a SEND intent
+   to Termux (no extra permission) or a RUN_COMMAND call of
+   `~/bin/tendril attach <id>` (needs `allow-external-apps=true` and the
+   `RUN_COMMAND` permission grant). Exact intent fields are in
+   **docs/DEEPLINK.md**.
+
+On iOS the equivalent is an ntfy tap → Shortcut → `remote-agents focus`
+over SSH → Blink; the full recipe and the canonical `tendril://` link
+format also live in docs/DEEPLINK.md.
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -156,3 +193,4 @@ not enough.
 | `Alt+D` does not detach | Tap ALT then D; a custom Alt+D Herdr binding can replace detach. Use Ctrl+B then D or restore the Alt+D detach binding. The installer adds bindings only when conflict-free. |
 | `Ctrl+Home` does not detach | Confirm you attached through `remote-agents` in a TTY and check the sequence with `cat -v` (`^[[1;5H`). The host bridge is on by default; it needs no forwarded `TERMUX_VERSION`. Host-side `TENDRIL_DETACH_BRIDGE=0` disables it. If Alt+D is custom-bound, the translated key may not detach; use Ctrl+B then D or restore Alt+D. |
 | garbled glyphs | `pkg install font-firas-mono` or any Nerd Font, and ensure UTF-8 locale |
+| tapped the notification and nothing happened | Termux cannot be opened by URL tap; use the share flow or the MacroDroid recipe — see docs/DEEPLINK.md |

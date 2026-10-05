@@ -53,21 +53,47 @@ Android Termux                            Linux + systemd (user)
 
 ### herdr-notify (watcher)
 
-- Polls the same snapshot every 8 s; tracks every detected agent pane.
-- State semantics (from Herdr's documented model — `idle` and `done` both
-  mean "ready for input"; screen-detected agents settle to `idle`):
+- Polls the same snapshot every 8 s; tracks every detected agent pane as
+  `pane_id → (status, status_since, last_push)`, where `status_since` is
+  when the pane entered its current status (set on baseline and on every
+  transition).
+- Alert classes (Herdr semantics — `idle` and `done` both mean "ready for
+  input"; screen-detected agents settle to `idle`):
 
-  | transition            | notification     |
-  |-----------------------|------------------|
-  | working → idle / done | Task complete    |
-  | any tracked → blocked | Input required   |
-  | everything else       | silent           |
+  | class         | trigger                          | body                                  | priority | tags              |
+  |---------------|----------------------------------|---------------------------------------|----------|-------------------|
+  | needs input   | any tracked → blocked            | `PI needs input · 18m · ~/research`   | high     | rotating_light    |
+  | done          | working → idle / done            | `PI finished · 22m · ~/research`      | default  | white_check_mark  |
+  | still working | working ≥ NTFY_WORKING_NUDGE_MINUTES (default 45, 0 disables), once per stint | `PI still working · 47m · ~/research` | min      | hourglass         |
 
+  Everything else is silent. Titles are `TENDRIL · <label>` (workspace
+  label else workspace id, sanitized via tendril-link and capped at 60
+  chars). Bodies carry only deterministic snapshot state — agent kind,
+  humanized time in status (`45s` / `18m` / `1h02m`) and a `~`-collapsed
+  cwd shortened to its last two components past 28 chars and omitted when
+  unknown — never agent output, prompts, or anything not in the snapshot.
 - First sighting baselines silently; after any Herdr outage the state is
   re-baselined (no false completion storms). Per-pane repeat window (90 s)
-  deduplicates flaps.
-- Push transport: ntfy over HTTPS with `Title`/`Priority`/`Tags` headers.
-  Credentials only from `~/.config/remote-agents/notify.env` (chmod 600).
+  deduplicates flaps; the still-working nudge fires exactly once per
+  working stint (at the first poll past the threshold).
+- Click plumbing (optional): `NTFY_CLICK_TEMPLATE` renders a URL from the
+  placeholders `{host} {workspace_id} {label} {label_uri} {payload_b64}
+  {uri}`; `{payload_b64}` is the canonical tendril-link payload (host +
+  workspace id + label only). The rendered URL goes out as the ntfy
+  `Click` header and — unless `NTFY_ACTIONS=0` — as an ntfy action button
+  (`view, Attach, <url>, clear=true`). Templates are total (unknown
+  placeholders render empty); a pane whose workspace vanished pushes
+  without click headers. Host comes from `TAILSCALE_HOST` in the
+  remote-agents config, else the machine nodename.
+- Optional body detail: `NTFY_SUMMARIZER_BIN` names a local executable
+  that receives one JSON object on stdin and may append a one-line
+  (≤200 chars) ` — <detail>` to the body. Off by default; any failure is
+  silently ignored. Zero LLM cost by default: no API keys, no external
+  calls, no network beyond the ntfy POST itself.
+- Push transport: ntfy over HTTPS with `Title`/`Priority`/`Tags` (plus
+  optional `Click`/`Actions`) headers, plain text only (no Markdown — the
+  mobile apps do not render it reliably). Credentials only from
+  `~/.config/remote-agents/notify.env` (chmod 600).
 
 ### install / uninstall
 
