@@ -5,6 +5,9 @@
 #   install --client              operator install: `tendril` connects to a host
 #   install [--client] --dry-run  preview every write, change nothing
 #   install --doctor              read-only system check (no fixes)
+#   install --upgrade             non-interactive refresh (what `tendril --upgrade`
+#                                 runs): binaries, symlink, PATH block, watcher
+#                                 unit; never touches config or notify.env
 
 set -u
 # --doctor and --dry-run are read-only: Python must not leave bytecode
@@ -26,7 +29,8 @@ for arg in "$@"; do
         --dry-run) DRY_RUN=1 ;;
         --doctor)  MODE=doctor ;;
         --client)  MODE=client ;;
-        -h|--help) sed -n '2,8p' "$PKG_DIR/install"; exit 0 ;;
+        --upgrade) MODE=upgrade ;;
+        -h|--help) sed -n '2,10p' "$PKG_DIR/install"; exit 0 ;;
         *) printf 'unknown option: %s (see --help)\n' "$arg" >&2; exit 2 ;;
     esac
 done
@@ -79,6 +83,37 @@ act() {
         say "  [dry-run] $desc"; say "            -> $*"; return 0
     fi
     say "  $desc"; "$@"
+}
+
+# ---------------- herdr config merge (shared: install and upgrade) -------
+# plan|apply the managed detach/switch set only; unrelated lines and
+# conflicts are never touched, every write is backed up first and rolled
+# back when the installed client rejects the result.
+herdr_detach() {
+    python3 "$DETACH_HELPER" "$1" "$HERDR_CONF" "$CTRL_HOME_SUPPORTED"
+}
+
+herdr_backup_config() {
+    [ "$DRY_RUN" = "1" ] && return 0
+    if [ -f "$HERDR_CONF" ]; then
+        backup "$HERDR_CONF"
+        ls -t "$HERDR_CONF".bak.* 2>/dev/null | head -1
+    fi
+}
+
+herdr_restore_config() {
+    if [ -n "$1" ]; then
+        cp -p "$1" "$HERDR_CONF"
+    else
+        rm -f "$HERDR_CONF"
+    fi
+}
+
+# Workspace/tab switching: each proposal is decided on its own by the helper
+# (exact chord conflicts after range expansion, then an isolated
+# `herdr config check`); conflicting ones are skipped, never forced.
+herdr_switch() {
+    python3 "$DETACH_HELPER" switch "$1" "$HERDR_CONF" "$HERDR_BIN"
 }
 
 # ---------------- doctor (read-only) ----------------
@@ -247,6 +282,137 @@ client_install() {
 }
 [ "$MODE" = client ] && client_install
 
+# ---------------- upgrade: the non-interactive refresh --------------------
+# What `tendril --upgrade` runs after a fast-forward in the source checkout:
+# reinstall the binaries and entrypoint symlink, add the PATH block only
+# when missing, apply the idempotent Herdr-binding merge, refresh the
+# watcher unit, and record install provenance. Never asks a question and
+# never writes config or notify.env — bin/tendril_upgrade.py asserts both
+# stay byte-identical across this run and aborts loudly otherwise.
+upgrade_install() {
+    hr; say "TENDRIL // UPGRADE (non-interactive refresh)"; hr
+    PYTHON=$(command -v python3 || true)
+    python_ok || python_missing
+    act "create $BIN_DIR and $CONF_DIR" mkdir -p "$BIN_DIR" "$CONF_DIR" || exit 1
+
+    say "1) Binaries"
+    # is the installed watcher binary stale? decide BEFORE the copy overwrites it
+    BIN_CHANGED=1
+    if [ -f "$BIN_DIR/herdr-notify" ] \
+       && cmp -s "$BIN_DIR/herdr-notify" "$PKG_DIR/bin/herdr-notify"; then
+        BIN_CHANGED=0
+    fi
+    for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py tendril_upgrade.py; do
+        [ -f "$BIN_DIR/$f" ] && backup "$BIN_DIR/$f"
+        act "install $BIN_DIR/$f" install -m 755 "$PKG_DIR/bin/$f" "$BIN_DIR/$f"
+    done
+    if [ -e "$BIN_DIR/tendril" ] && [ ! -L "$BIN_DIR/tendril" ]; then
+        say "  kept existing $BIN_DIR/tendril (not ours) - run remote-agents instead"
+    else
+        act "link $BIN_DIR/tendril -> remote-agents" ln -sfn remote-agents "$BIN_DIR/tendril"
+    fi
+    say ""
+
+    say "2) Remote session PATH (only when missing)"
+    if [ "$DRY_RUN" = "1" ]; then
+        say "  [dry-run] remote-path check, then apply only when incomplete"
+    elif python3 "$HOST_HELPER" remote-path check >/dev/null 2>&1; then
+        say "  ok - SSH and Mosh sessions find remote-agents"
+    else
+        python3 "$HOST_HELPER" remote-path apply
+    fi
+    say ""
+
+    say "3) Config and notifications"
+    say "  untouched by design - config and notify.env must survive this run byte-identical"
+    say ""
+
+    say "4) Notification watcher"
+    if [ "$DRY_RUN" = "1" ]; then
+        python3 "$HOST_HELPER" service refresh --pkg "$PKG_DIR" --dry-run
+    elif [ "$BIN_CHANGED" = 1 ]; then
+        python3 "$HOST_HELPER" service refresh --pkg "$PKG_DIR" --python "$PYTHON" --bin-changed
+    else
+        python3 "$HOST_HELPER" service refresh --pkg "$PKG_DIR" --python "$PYTHON"
+    fi
+    say ""
+
+    say "5) Herdr keybindings (idempotent merge; user lines untouched)"
+    HERDR_CONF="$HOME/.config/herdr/config.toml"
+    DETACH_HELPER="$PKG_DIR/bin/herdr-bindings.py"
+    HERDR_CHECK=$("$PKG_DIR/bin/remote-agents" --detect 2>&1) || true
+    HERDR_BIN=$(printf '%s\n' "$HERDR_CHECK" | sed -n 's/^chosen: //p')
+    if [ -z "$HERDR_BIN" ]; then
+        say "  herdr client not found - keybindings left untouched"
+    else
+        CTRL_HOME_SUPPORTED=0
+        if python3 "$DETACH_HELPER" supports "$HERDR_BIN" ctrl+home; then
+            CTRL_HOME_SUPPORTED=1
+        fi
+        PLAN=$(herdr_detach plan)
+        ADDED=$(printf '%s\n' "$PLAN" | sed -n 's/^ADDED=//p')
+        REMOVED=$(printf '%s\n' "$PLAN" | sed -n 's/^REMOVED=//p')
+        if [ -n "$ADDED" ] || [ "$REMOVED" != "" ]; then
+            say "  managed detach set: adds ${ADDED:-none}; removes ${REMOVED:-none}"
+            if [ "$DRY_RUN" = "1" ]; then
+                say "  [dry-run] apply the managed detach set, then herdr config check"
+            else
+                BAK=$(herdr_backup_config)
+                herdr_detach apply
+                if "$HERDR_BIN" config check >/dev/null 2>&1; then
+                    "$HERDR_BIN" server reload-config >/dev/null 2>&1 \
+                        && say "  applied + reloaded live (no server restart)"
+                else
+                    say "  config check FAILED - restoring previous config"
+                    herdr_restore_config "$BAK"
+                    "$HERDR_BIN" server reload-config >/dev/null 2>&1
+                fi
+            fi
+        else
+            say "  detach bindings already complete - nothing to do"
+        fi
+        PLAN=$(herdr_switch plan)
+        ADDS=$(printf '%s\n' "$PLAN" | sed -n 's/^ADD=[^|]*|\([^|]*\)|.*/\1/p')
+        if [ -n "$ADDS" ]; then
+            printf '%s\n' "$ADDS" | sed 's/^/  add switching binding: /'
+            if [ "$DRY_RUN" = "1" ]; then
+                say "  [dry-run] append the bindings above; herdr config check; reload-config"
+            else
+                "$HERDR_BIN" config check >/dev/null 2>&1; BASE_RC=$?
+                BAK=$(herdr_backup_config)
+                if RESULT=$(herdr_switch apply) \
+                   && { [ "$BASE_RC" != 0 ] || "$HERDR_BIN" config check >/dev/null 2>&1; }; then
+                    printf '%s\n' "$RESULT" | sed -n 's/^ADD=[^|]*|\([^|]*\)|.*/  added    \1/p'
+                    "$HERDR_BIN" server reload-config >/dev/null 2>&1 \
+                        && say "  applied + reloaded live (no server restart)"
+                else
+                    say "  config check FAILED - restoring previous config"
+                    herdr_restore_config "$BAK"
+                    "$HERDR_BIN" server reload-config >/dev/null 2>&1
+                fi
+            fi
+        else
+            say "  switching bindings already complete - nothing to do"
+        fi
+    fi
+    say ""
+
+    say "6) Install provenance"
+    if [ "$DRY_RUN" = "1" ]; then
+        say "  [dry-run] record $CONF_DIR/install.json"
+    elif "$PYTHON" "$PKG_DIR/bin/tendril_upgrade.py" record-provenance --pkg "$PKG_DIR/bin"; then
+        :
+    else
+        say "  note: provenance not recorded (non-fatal; the file enables tendril --upgrade)"
+    fi
+    say ""
+    hr
+    say "Upgrade done. Health check:  tendril --upgrade"
+    hr
+    return 0
+}
+[ "$MODE" = upgrade ] && { upgrade_install; exit $?; }
+
 hr; say "TENDRIL // INSTALLER"; say "a thin mobile control plane for persistent AI agents"; hr
 [ "$DRY_RUN" = "1" ] && say "(dry-run: nothing will be written)"; say ""
 
@@ -305,7 +471,7 @@ else
     printf '%s\n' "$CONF_BODY" > "$CONFIG"
     chmod 600 "$CONFIG"
 fi
-for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py; do
+for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py tendril_upgrade.py; do
     [ -f "$BIN_DIR/$f" ] && backup "$BIN_DIR/$f"
     act "install $BIN_DIR/$f" install -m 755 "$PKG_DIR/bin/$f" "$BIN_DIR/$f"
 done
@@ -447,11 +613,10 @@ say "     Ctrl+1..9     result below shows what yours actually do"
 say "     Ctrl+B n / p  next / previous tab (phone-safe)"
 say "     Alt+←/→       next / previous tab (desktop modifier encoding)"
 say "     Alt+Up        left unbound so Pi can edit steering messages"
-HERDR_CONF="$HOME/.config/herdr/config.toml"
-DETACH_HELPER="$PKG_DIR/bin/herdr-bindings.py"
-
 # Ask the installed client to parse Ctrl+Home in an isolated config. This
 # catches versions that do not know that key name without touching live config.
+HERDR_CONF="$HOME/.config/herdr/config.toml"
+DETACH_HELPER="$PKG_DIR/bin/herdr-bindings.py"
 CTRL_HOME_SUPPORTED=0
 if python3 "$DETACH_HELPER" supports "$HERDR_BIN" ctrl+home; then
     CTRL_HOME_SUPPORTED=1
@@ -462,32 +627,8 @@ else
 fi
 
 # plan|apply the managed detach set without disturbing unrelated bindings
-herdr_detach() {
-    python3 "$DETACH_HELPER" "$1" "$HERDR_CONF" "$CTRL_HOME_SUPPORTED"
-}
-
-herdr_backup_config() {
-    [ "$DRY_RUN" = "1" ] && return 0
-    if [ -f "$HERDR_CONF" ]; then
-        backup "$HERDR_CONF"
-        ls -t "$HERDR_CONF".bak.* 2>/dev/null | head -1
-    fi
-}
-
-herdr_restore_config() {
-    if [ -n "$1" ]; then
-        cp -p "$1" "$HERDR_CONF"
-    else
-        rm -f "$HERDR_CONF"
-    fi
-}
-
-# Workspace/tab switching: each proposal is decided on its own by the helper
-# (exact chord conflicts after range expansion, then an isolated
-# `herdr config check`); conflicting ones are skipped, never forced.
-herdr_switch() {
-    python3 "$DETACH_HELPER" switch "$1" "$HERDR_CONF" "$HERDR_BIN"
-}
+# (herdr_detach / herdr_backup_config / herdr_restore_config / herdr_switch
+# are defined with the other helpers at the top so upgrade mode reuses them)
 
 if [ ! -f "$HERDR_CONF" ]; then
     say "  no $HERDR_CONF yet; a minimal config will be proposed without replacing Herdr defaults"
@@ -604,6 +745,15 @@ say "  (the phone generates its own key; private keys are never copied)"
 say ""
 say "iPhone (Blink Shell): docs/IOS_BLINK.md - same host alias, same commands."
 say "Mac / desktop client:  run ./install --client on that machine (docs/MACOS.md)."
+say ""
+say "Install provenance (what `tendril --upgrade` reads):"
+if [ "$DRY_RUN" = "1" ]; then
+    say "  [dry-run] record $CONF_DIR/install.json (source, commit, version, phone hashes)"
+elif "$PYTHON" "$PKG_DIR/bin/tendril_upgrade.py" record-provenance --pkg "$PKG_DIR/bin"; then
+    :
+else
+    say "  note: provenance not recorded (non-fatal; it only enables tendril --upgrade)"
+fi
 say ""
 hr
 say "Done. Host console:  tendril (= $BIN_DIR/remote-agents)   |   doctor:  $0 --doctor"

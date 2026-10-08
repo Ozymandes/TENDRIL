@@ -7,10 +7,15 @@ where `systemctl --user` answers; host facts come from /proc where it
 exists and from sysctl/vm_stat/pmset otherwise. Stdlib only, Python 3.9+
 (the Xcode Command Line Tools python3 on macOS).
 
-    tendril_host.py service install|start|stop|restart|status|uninstall|logs
-                    [--dry-run] [--pkg DIR] [--python PATH]
+    tendril_host.py service install|start|stop|restart|refresh|status|uninstall|logs
+                    [--dry-run] [--pkg DIR] [--python PATH] [--bin-changed]
     tendril_host.py remote-path check|plan|apply|remove [--dry-run]
     tendril_host.py facts | hostname | tailscale-ip | ssh-server
+service refresh is the upgrade path (called by `./install --upgrade`):
+the unit/plist is rewritten only when its rendered content differs,
+systemd daemon-reload happens only then, and the watcher restarts only
+when the unit or the watcher binary changed (or it was not running) —
+a healthy, current install is left strictly alone.
 """
 import json
 import os
@@ -299,6 +304,53 @@ class Launchd(_Backend):
         return self.do("load + start",
                        ["launchctl", "bootstrap", self.domain(), self.plist])
 
+    def refresh(self, pkg_dir, python, bin_changed=False):
+        """Upgrade-path install: write the plist only when its rendered
+        content differs, and bootstrap (restart) only when the plist or the
+        watcher binary changed - or load + start one that is not running.
+        The last line is machine-readable (`refresh: <verb>`) so callers can
+        report restarted/started/unchanged."""
+        script = home(".local", "bin", "herdr-notify")
+        body = self.render(python, script)
+        try:
+            with open(self.plist, "rb") as f:
+                current = f.read()
+        except OSError:
+            current = None
+        changed = current != body
+        if self.dry_run:
+            self.say("  [dry-run] %s %s" % ("update" if changed else "keep",
+                                             self.plist))
+        elif changed:
+            os.makedirs(os.path.dirname(self.plist), exist_ok=True)
+            os.makedirs(os.path.dirname(self.log), mode=0o700, exist_ok=True)
+            _atomic_write(self.plist, body, 0o644)
+            self.say("  updated %s" % self.plist)
+        else:
+            self.say("  %s unchanged" % self.plist)
+        if self.dry_run:
+            self.say("  refresh: (dry-run)")
+            return 0
+        if changed or bin_changed:
+            domain = self.domain()
+            if self.loaded():
+                self.do("unload previous agent (if any)",
+                        ["launchctl", "bootout", "%s/%s" % (domain, LABEL)],
+                        check=False)
+            self.do("enable %s" % LABEL,
+                    ["launchctl", "enable", "%s/%s" % (domain, LABEL)],
+                    check=False)
+            rc = self.do("load %s into %s" % (LABEL, domain),
+                         ["launchctl", "bootstrap", domain, self.plist])
+            self.say("  refresh: %s" % ("restarted" if rc == 0 else "FAILED"))
+            return rc
+        if not self.loaded():
+            rc = self.start()
+            self.say("  refresh: %s" % ("started" if rc == 0 else "FAILED"))
+            return rc
+        self.say("  refresh: unchanged")
+        return 0
+
     def stop(self):
         # bootout, not kill: KeepAlive would resurrect a killed watcher.
         # The plist stays, so the watcher starts again at next login.
@@ -356,6 +408,58 @@ class Systemd(_Backend):
 
     def start(self):
         return self.do("start", ["systemctl", "--user", "start", UNIT])
+
+    def refresh(self, pkg_dir, python, bin_changed=False):
+        """Upgrade-path install: write the unit only when its content
+        differs, daemon-reload only then, and restart only when the unit or
+        the watcher binary changed (or enable --now a watcher that is not
+        running). The last line is machine-readable (`refresh: <verb>`)."""
+        src = os.path.join(pkg_dir, "systemd", UNIT)
+        try:
+            with open(src, "rb") as f:
+                body = f.read()
+        except OSError as exc:
+            self.say("  cannot read %s: %s" % (src, exc))
+            return 1
+        try:
+            with open(self.unit, "rb") as f:
+                current = f.read()
+        except OSError:
+            current = None
+        changed = current != body
+        if self.dry_run:
+            self.say("  [dry-run] %s %s" % ("update" if changed else "keep",
+                                             self.unit))
+        elif changed:
+            os.makedirs(os.path.dirname(self.unit), exist_ok=True)
+            with open(src, "rb") as f:
+                _atomic_write(self.unit, f.read(), 0o600)
+            self.say("  updated %s" % self.unit)
+        else:
+            self.say("  %s unchanged" % self.unit)
+        if changed:
+            self.do("daemon-reload", ["systemctl", "--user", "daemon-reload"])
+            self.do("enable %s" % UNIT, ["systemctl", "--user", "enable", UNIT],
+                    check=False)
+        if self.dry_run:
+            self.say("  refresh: (dry-run)")
+            return 0
+        if changed or bin_changed:
+            if self.status() == "running":
+                rc = self.do("restart %s" % UNIT,
+                             ["systemctl", "--user", "restart", UNIT])
+            else:
+                rc = self.do("enable --now %s" % UNIT,
+                             ["systemctl", "--user", "enable", "--now", UNIT])
+            self.say("  refresh: %s" % ("restarted" if rc == 0 else "FAILED"))
+            return rc
+        if self.status() != "running" and os.path.isfile(self.unit):
+            rc = self.do("start %s (was not running)" % UNIT,
+                         ["systemctl", "--user", "start", UNIT])
+            self.say("  refresh: %s" % ("started" if rc == 0 else "FAILED"))
+            return rc
+        self.say("  refresh: unchanged")
+        return 0
 
     def stop(self):
         return self.do("stop", ["systemctl", "--user", "stop", UNIT])
@@ -572,6 +676,12 @@ def main(argv=None):
                 os.path.abspath(__file__))))
             py = _opt(argv, "--python", sys.executable)
             return 0 if b.install(pkg, py) == 0 else 1
+        if verb == "refresh":
+            pkg = _opt(argv, "--pkg", os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))))
+            py = _opt(argv, "--python", sys.executable)
+            changed = "--bin-changed" in argv
+            return 0 if b.refresh(pkg, py, bin_changed=changed) == 0 else 1
         if verb in ("start", "stop", "restart", "uninstall"):
             return 0 if getattr(b, verb)() == 0 else 1
     if words[:1] == ["remote-path"] and len(words) == 2:

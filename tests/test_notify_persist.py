@@ -91,7 +91,8 @@ class ReinstallKeepsTopic(FakeDarwin):
         self.assertEqual(read(path), before)          # byte-for-byte
         self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
         self.assertEqual(sorted(os.listdir(os.path.dirname(path))),
-                         ["config", "notify.env"])    # no backup churn
+                         ["config", "install.json", "notify.env"])
+                         # install.json = upgrade provenance; no *.bak churn
 
     def test_update_sequence_two_installs_still_identical(self):
         path = seed_notify(self, f"NTFY_URL=https://ntfy.sh\n"

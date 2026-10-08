@@ -65,6 +65,10 @@ try:
     import tendril_host          # the few host facts/lifecycle verbs per OS
 except ImportError:
     tendril_host = None
+try:
+    import tendril_upgrade       # --version / --upgrade (thin dispatch below)
+except ImportError:
+    tendril_upgrade = None
 
 HOST_LABEL = CONFIG.get("TAILSCALE_HOST") or (
     tendril_host.short_hostname() if tendril_host else os.uname().nodename)
@@ -1591,6 +1595,47 @@ def _service(args):
     return tendril_host.main(["service", args[0]])
 
 
+HELP = """\
+TENDRIL host console (remote-agents) — a thin mobile control plane for
+persistent AI agents.
+
+  tendril                     the workspace selector (the console)
+  tendril attach|enter|resolve|focus|link <token>
+                              direct addressing: workspace id (w15), pane id
+                              (w15:p1), workspace number, or exact label
+  tendril service status|start|stop|restart|logs
+                              the notification watcher, on launchd or systemd
+  tendril --upgrade [--verbose]
+                              self-update: fetch + fast-forward the recorded
+                              source checkout, then ./install --upgrade
+                              (binaries, symlink, PATH block, watcher unit;
+                              config and notify.env stay byte-identical)
+  tendril --version           the installed version and commit
+  tendril --help              this help
+
+Upgrade is flags-only on purpose: a bare word is a session-token position
+and a workspace may legitimately be labeled "upgrade". Also:
+  --detect                    herdr client detection detail
+"""
+
+
+def _upgrade(args):
+    """`tendril --upgrade`: self-update from the recorded source checkout.
+    Deliberately flags-only — no bare `upgrade` word: a single word is a
+    session-token position and a workspace may legitimately be labeled
+    "upgrade"; --upgrade cannot collide."""
+    verbose = "--verbose" in args
+    extra = [a for a in args if a not in ("--upgrade", "--verbose")]
+    if extra or args.count("--upgrade") != 1:
+        print("usage: tendril --upgrade [--verbose]", file=sys.stderr)
+        return 2
+    if tendril_upgrade is None:
+        print("tendril_upgrade.py is missing next to remote-agents; re-run ./install",
+              file=sys.stderr)
+        return 1
+    return tendril_upgrade.upgrade_main(verbose=verbose)
+
+
 def main():
     if "--detect" in sys.argv:
         for cand, ok, detail in HERDR_VERDICTS:
@@ -1599,6 +1644,17 @@ def main():
         print("chosen:", HERDR or "NONE")
         return 0
     args = sys.argv[1:]
+    if "--version" in args:
+        if tendril_upgrade is not None:
+            print(tendril_upgrade.version_line())
+        else:
+            print("tendril (unknown - tendril_upgrade.py missing; re-run ./install)")
+        return 0
+    if "--help" in args or "-h" in args:
+        print(HELP, end="")
+        return 0
+    if "--upgrade" in args:
+        return _upgrade(args)
     if args[:1] == ["service"]:
         return _service(args[1:])
     if len(args) == 2 and args[0] in SUBCOMMANDS:
@@ -1613,6 +1669,8 @@ def main():
         print("       enter: exact focus + attach, then the selector (notification taps)",
               file=sys.stderr)
         print("       remote-agents service status|start|stop|restart|logs",
+              file=sys.stderr)
+        print("       remote-agents --upgrade [--verbose] | --version | --help",
               file=sys.stderr)
         return 2
     rows, code = _reachable_rows()

@@ -145,6 +145,24 @@ older selectors need `Q` then Enter; the updated selector quits with `Q` alone.
 Run `tendril` again to start the updated selector; reconnecting Mosh alone is
 not enough.
 
+The supported one-command update is `tendril --upgrade` on the host (add
+`--verbose` to see the installer/git output): it fast-forwards the recorded
+checkout, refreshes the installed files, and — when `phone/tendril` or
+`phone/termux-url-opener` changed upstream — prints `android client update
+available` with the exact commands. They are the same on any phone; run them
+inside Termux:
+
+```sh
+scp 'HOST_ALIAS:/path/to/tendril/phone/tendril' ~/bin/tendril
+scp 'HOST_ALIAS:/path/to/tendril/phone/termux-url-opener' ~/bin/termux-url-opener
+chmod 700 ~/bin/tendril ~/bin/termux-url-opener
+```
+
+`HOST_ALIAS` is the SSH config alias from step 3 and the path is the host's
+tendril checkout (the upgrade prints both with your real values). A plain
+selector-only change never requires a phone refresh — the upgrade says
+`android     client current` instead.
+
 ## Deep links: tap a notification, land in the session
 
 Termux registers no URL schemes, so a bare notification tap cannot open

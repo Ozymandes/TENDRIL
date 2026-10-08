@@ -4,6 +4,34 @@ All notable changes to TENDRIL are documented here.
 
 ## Unreleased
 
+- `tendril --upgrade [--verbose]`, plus `tendril --version` and `--help`:
+  safe self-update for hosts. Every install now records provenance
+  (`~/.config/remote-agents/install.json`: source checkout, commit,
+  branch, version, sha256 of the installed phone launchers); the upgrade
+  re-reads it — fallback: the realpath of the running command, but only
+  inside a real checkout containing ./install, never a guessed path — and
+  refuses (one line, exit non-zero, nothing touched) on: non-git source,
+  uncommitted/untracked changes (`git status --porcelain`), a
+  merge/rebase/cherry-pick in progress, detached HEAD, missing upstream,
+  local or diverged commits, or a branch switch since install. Otherwise:
+  `git fetch --quiet` + `git merge --ff-only @{u}` (never reset/rebase/
+  force), then the new `./install --upgrade` non-interactive mode
+  (binaries incl. the new `tendril_upgrade.py`, entrypoint symlink, PATH
+  block only when missing, idempotent Herdr-binding merge, watcher unit
+  refresh) and a hard abort if `config` or `notify.env` changed by a byte
+  (the ntfy topic can never rotate here). The watcher restarts only when
+  its binary or unit actually changed (or it was not running); systemd
+  daemon-reload happens only when the unit content differs. Closes with
+  non-destructive health checks (python, herdr `api snapshot`, ssh/mosh,
+  service status, config parse, remote PATH) and a compact summary block;
+  when `phone/tendril` / `phone/termux-url-opener` changed upstream it
+  prints `android client update available` with the exact Termux refresh
+  commands. Version comes from the new repo `VERSION` file (`0.2.0-dev`
+  until the next tag; a tag on HEAD overrides, `git describe` covers older
+  checkouts without the file). Upgrade is flags-only by design — a bare
+  word is a session-token position and a workspace may be labeled
+  `upgrade`.
+
 - Exact targets and the notification entry lifecycle. Deep links gain an
   additive `?pane=<pane-id>` query (contract stays v1; workspace-only
   links are byte-identical, payload whitelist is now `{v,h,w,l,p}`).

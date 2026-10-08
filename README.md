@@ -194,6 +194,32 @@ via Blink Shell is a first-class client ([docs/IOS_BLINK.md](docs/IOS_BLINK.md))
 Alt+D detach, Mosh hosts with a `tendril` startup command, and the automatic
 256-colour palette. Notifications stay deterministic — no LLM, no API cost.
 
+| Command | What it does |
+|---|---|
+| `tendril --upgrade [--verbose]` | self-update the host: fetch + fast-forward the recorded checkout, then a non-interactive refresh; ends in a health check + summary |
+| `tendril --version` | installed version and commit (`VERSION` in the repo; `0.2.0-dev` until the next tag) |
+| `tendril --help` | the full command list, including the above |
+
+**Upgrading.** `tendril --upgrade` reads the provenance every `./install`
+records (`~/.config/remote-agents/install.json`: source checkout, commit,
+branch, version, phone-launcher hashes), refuses — one line, nothing
+touched — unless that checkout is clean, on the same branch, and in sync
+with its upstream (no uncommitted changes, no merge/rebase in progress, no
+detached HEAD, no missing upstream, no local or diverged commits), then
+runs `git fetch --quiet` + `git merge --ff-only @{u}` (never reset, rebase
+or force) followed by the installer's non-interactive `./install --upgrade`
+(binaries, entrypoint symlink, PATH block only when missing, idempotent
+Herdr-binding merge, watcher unit). `config` and `notify.env` are asserted
+byte-identical, so the ntfy topic never rotates here; the watcher restarts
+only when its binary or unit changed (or it was not running). The run ends
+with non-destructive health checks and a summary block (`host updated |
+already current`, `watcher running | restarted | NOT RUNNING`, `android
+client current | client refresh recommended` — the exact Termux commands
+are printed when the phone launchers changed). Upgrade is flags-only on
+purpose: a bare word is a session-token position, and a workspace may
+legitimately be labeled `upgrade`. Phone side, see the refresh note in
+[docs/ANDROID.md](docs/ANDROID.md).
+
 ## Further reading
 
 - [Beginner setup guide](docs/TENDRIL-SETUP-GUIDE.md)
