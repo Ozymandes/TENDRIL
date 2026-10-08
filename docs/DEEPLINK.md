@@ -19,6 +19,38 @@ rejected, oversized input rejected, labels cleaned (control chars stripped,
 whitespace collapsed, ≤120 chars). A payload is safe to log and safe to
 treat as data — not code — on the far side.
 
+## Canonical deep-link contract (v1 — frozen)
+
+The actionable link TENDRIL notifications carry — and the only shape
+TENDRIL Link (Android) needs to claim — is the URI form:
+
+```
+tendril://host/<host>/workspace/<workspace-id>[?label=<label>]
+```
+
+Example (illustrative only — workspace ids are never assumed; use a real
+canonical id from `tendril link` or the selector):
+`tendril://host/omarchy/workspace/w16`
+
+`bin/tendril_link.py` is the single definition of this contract. The rules
+below are frozen; do not re-implement or extend them on either side:
+
+| aspect | contract |
+|---|---|
+| scheme + netloc | `tendril://host/…` — the netloc is the literal string `host`; anything else is malformed |
+| host syntax | `^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$` — Tailscale MagicDNS names, nodenames, ssh aliases |
+| workspace syntax | `^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`; a pane id (`w15:p1`) addresses its parent workspace |
+| query | `?label=<label>` only — any other parameter is rejected |
+| normalization | labels: NFC, control chars stripped, whitespace collapsed, capped at 120 chars; URI components percent-encoded; hosts and ids are never transformed |
+| malformed link | reject, never sanitize: a clean non-zero exit (`link error: …`, exit 2) on the host; unknown fields, wrong payload versions, oversized payloads and non-canonical encodings are all rejected |
+| stale workspace | `attach` / `focus` / `link` answer `not found` (exit 2) and print the closest live ids; a notification whose workspace vanished from the snapshot pushes WITHOUT Click/Actions headers |
+| supported actions | exactly two, both resolved on the host against live Herdr state: `attach` (focus + interactive attach) and `focus` (focus only). No other actions, no arbitrary commands, no shell payloads — the link carries no executable content |
+| security boundary | the payload whitelist is `{v,h,w,l}` (version, host, workspace id, label); links are data, never code; the ntfy topic remains the credential (docs/SECURITY.md) |
+
+Backwards compatibility: the payload form (`{payload_b64}`) and the id-only
+templates (`{workspace_id}`) remain valid; the URI is the canonical,
+human-inspectable form. New integrations should build on the URI.
+
 ## Host CLI (`remote-agents <cmd> <token>`)
 
 Machine interface: non-interactive, safe over plain SSH. Token resolution
@@ -58,6 +90,18 @@ vanished from the snapshot pushes without Click/Actions headers):
 With `NTFY_ACTIONS=1` (default) herdr-notify also sends the ntfy short-form
 Actions header: `view, Attach, <url>, clear=true`. Do not use Markdown — it
 is ntfy web-app only.
+
+To put the canonical deep link itself on every notification — the form
+TENDRIL Link claims on Android once installed:
+
+```
+NTFY_CLICK_TEMPLATE={uri}
+```
+
+If TENDRIL Link (or any handler for `tendril://`) is not installed, nothing
+breaks: the notification still displays; a tap just has no registered
+handler. Rotation of the notification topic is always explicit — see the
+installer flow in `./install` step 4.
 
 ## iOS: tap → Shortcut → focused session in Blink
 

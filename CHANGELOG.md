@@ -4,6 +4,20 @@ All notable changes to TENDRIL are documented here.
 
 ## Unreleased
 
+- Reinstalling no longer rotates the ntfy topic. `./install` used to
+  mint a fresh random topic every time the notification question was
+  answered yes, silently invalidating every subscribed phone. An existing
+  configuration (non-empty `NTFY_TOPIC`) is now detected and preserved by
+  default — `git pull && ./install` leaves `notify.env` byte-for-byte
+  unchanged — and rotation is a separate, explicit, default-no question
+  that warns about resubscribing. Rotation restarts the watcher only when
+  it is actually running; a custom `NTFY_URL`/`NTFY_TOKEN` is carried over
+  instead of being reset. The canonical `tendril://host/<host>/workspace/<id>`
+  deep-link contract (host/id charset, normalization, malformed/stale
+  behavior, the two supported actions `attach` and `focus`, security
+  boundary) is now frozen in docs/DEEPLINK.md, with `{uri}` as the
+  click-template placeholder that puts that link on every notification.
+
 - Android real-device certification passed on an S21 Ultra / Termux
   against this branch: launcher refresh, restored masthead and colour
   hierarchy, selector, Alt+D / Ctrl+B d, direct attach and resolve on a

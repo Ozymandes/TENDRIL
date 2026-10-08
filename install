@@ -37,6 +37,19 @@ hr()  { say "------------------------------------------------------------"; }
 row() { printf '%-14s %s\n' "$1" "$2"; }
 ask() { printf '%s [%s] ' "$1" "$2" >&2; read -r ans; [ -n "$ans" ] && printf '%s' "$ans" || printf '%s' "$2"; }
 confirm() { printf '%s [y/N] ' "$1"; read -r ans; [ "$ans" = "y" ] || [ "$ans" = "Y" ]; }
+# confirm with the default on ENTER: keeps existing state (confirm() defaults to no)
+confirm_keep() { printf '%s [Y/n] ' "$1"; read -r ans; case $ans in y | Y | "") return 0 ;; *) return 1 ;; esac; }
+# value of KEY= in an env-style file: first match, unquoted; empty when absent
+env_val() {
+    [ -f "$1" ] || return 0
+    _ev=$(sed -n "s/^$2=//p" "$1" | head -n 1)
+    # strip matching surrounding quotes (what herdr-notify's loader strips too)
+    case $_ev in
+        '"'*'"') _ev=${_ev#'"'}; _ev=${_ev%'"'} ;;
+        "'"*"'") _ev=${_ev#"'"}; _ev=${_ev%"'"} ;;
+    esac
+    printf '%s' "$_ev"
+}
 backup() { [ "$DRY_RUN" = "1" ] && return 0; [ -f "$1" ] && cp -p "$1" "$1.bak.$(date +%s)"; }
 # single-quote for display in copy-paste instructions (spaces are common on macOS)
 shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
@@ -328,24 +341,68 @@ fi
 say ""
 
 # ---------------- 4. notifications (optional) ----------------
+# An existing configuration (non-empty NTFY_TOPIC) is PRESERVED by default:
+# a plain `git pull && ./install` update must never rotate the topic or
+# invalidate subscribed phones. Rotation is always explicit and separately
+# confirmed. notify.env is left byte-for-byte untouched unless the user
+# chooses a new topic (or the file has no usable topic at all).
 say "4) Push notifications (ntfy -> Android / iPhone), optional"
-if confirm "Configure ntfy push now?"; then
-    TOPIC=$(python3 -c 'import secrets; print("tendril-" + secrets.token_urlsafe(12))')
-    say ""
-    say "  Your private topic name:  $TOPIC"
-    say "  On Android: install the ntfy app -> Subscribe to topic -> enter exactly:"
-    say "      $TOPIC"
-    say "  (a random topic is obscurity, not access control - see docs/SECURITY.md)"
-    NOTIFY="$CONF_DIR/notify.env"
-    if [ -f "$NOTIFY" ]; then backup "$NOTIFY"; say "  backed up existing notify.env"; fi
+NOTIFY="$CONF_DIR/notify.env"
+CUR_URL=$(env_val "$NOTIFY" NTFY_URL)
+CUR_TOKEN=$(env_val "$NOTIFY" NTFY_TOKEN)
+CUR_TOPIC=$(env_val "$NOTIFY" NTFY_TOPIC)
+new_topic() { python3 -c 'import secrets; print("tendril-" + secrets.token_urlsafe(12))'; }
+write_notify() {  # $1: topic; carries over any existing NTFY_URL / NTFY_TOKEN
     if [ "$DRY_RUN" = "1" ]; then
         say "  [dry-run] write $NOTIFY (chmod 600) with NTFY_URL/NTFY_TOPIC"
     else
+        backup "$NOTIFY"
         umask 177
-        printf 'NTFY_URL=https://ntfy.sh\nNTFY_TOPIC=%s\nNTFY_TOKEN=\n' "$TOPIC" > "$NOTIFY"
+        printf 'NTFY_URL=%s\nNTFY_TOPIC=%s\nNTFY_TOKEN=%s\n' \
+            "${CUR_URL:-https://ntfy.sh}" "$1" "$CUR_TOKEN" > "$NOTIFY"
         chmod 600 "$NOTIFY"
         umask 022
     fi
+}
+show_subscribe() {
+    say ""
+    say "  Your private topic name:  $1"
+    say "  On Android: install the ntfy app -> Subscribe to topic -> enter exactly:"
+    say "      $1"
+    say "  (a random topic is obscurity, not access control - see docs/SECURITY.md)"
+}
+restart_watcher_if_running() {
+    # the watcher reads notify.env once at startup, so only a CHANGED config
+    # can require a restart; keeping the file never touches the service
+    [ "$DRY_RUN" = "1" ] && return 0
+    WSTAT=$(python3 "$HOST_HELPER" service status 2>/dev/null)
+    case $WSTAT in
+        running*)
+            if python3 "$HOST_HELPER" service restart >/dev/null 2>&1; then
+                say "  watcher restarted (now pushing to the new topic)"
+            else
+                say "  note: run 'tendril service restart' to pick up the new topic"
+            fi ;;
+    esac
+}
+if [ -n "$CUR_TOPIC" ]; then
+    say ""
+    say "  Existing ntfy configuration found:"
+    say "    topic: $CUR_TOPIC"
+    if confirm_keep "Keep existing notification configuration?"; then
+        say "  kept - notify.env unchanged; subscribed phones keep working"
+    elif confirm "Rotate notification topic? Existing subscribers will need to resubscribe."; then
+        TOPIC=$(new_topic)
+        write_notify "$TOPIC"
+        show_subscribe "$TOPIC"
+        restart_watcher_if_running
+    else
+        say "  skipped - existing notification configuration left in place"
+    fi
+elif confirm "Configure ntfy push now?"; then
+    TOPIC=$(new_topic)
+    write_notify "$TOPIC"
+    show_subscribe "$TOPIC"
 else
     say "  skipped - create $CONF_DIR/notify.env later (see config/notify.env.example),"
     say "  then: tendril service restart"

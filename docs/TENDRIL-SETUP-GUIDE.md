@@ -430,6 +430,11 @@ This only checks. It does not change anything.
 
 Get an alert when an agent finishes or needs you.
 
+> Your topic survives updates. Re-running `./install` keeps the existing
+> `notify.env` byte-for-byte unless you explicitly choose **Rotate
+> notification topic** — subscribed phones never need to resubscribe after
+> a normal `git pull && ./install`.
+
 ### Step N1: Find your topic (on the computer)
 
 ```sh

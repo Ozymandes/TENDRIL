@@ -177,6 +177,14 @@ class Compose(unittest.TestCase):
                    hn.human_elapsed, hn.click_headers, hn.link_fields):
             self.assertNotIn("subprocess", inspect.getsource(fn))
 
+    def test_output_is_deterministic(self):
+        # same inputs -> byte-identical alert, call after call
+        outs = {hn.compose("pi", "research", cls, T0, "/home/op/research",
+                           now=T0 + 1080)
+                for cls in (hn.NEEDS_INPUT, hn.DONE, hn.NUDGE)
+                for _ in range(3)}
+        self.assertEqual(len(outs), 3)  # one tuple per class, no jitter
+
 
 class RenderTemplate(unittest.TestCase):
     def fields(self, label="my label"):
@@ -234,6 +242,49 @@ class RenderTemplate(unittest.TestCase):
     def test_vanished_workspace_skips_link(self):
         self.assertIsNone(hn.link_fields("testhost", "", "research"))
         self.assertIsNone(hn.link_fields("", "w1", "research"))
+
+
+class CanonicalDeepLinkClick(unittest.TestCase):
+    """{uri} puts the frozen tendril:// deep link on Click + Actions —
+    the exact contract TENDRIL Link will claim on Android."""
+
+    def fields(self):
+        return hn.link_fields("testhost", "w15", "research")
+
+    def test_uri_template_renders_canonical_link(self):
+        url, actions = hn.click_headers({"NTFY_CLICK_TEMPLATE": "{uri}"},
+                                        self.fields())
+        self.assertEqual(url, "tendril://host/testhost/workspace/w15"
+                              "?label=research")
+        self.assertEqual(actions, f"view, Attach, {url}, clear=true")
+
+    def test_uri_round_trips_through_the_link_module(self):
+        url, _ = hn.click_headers({"NTFY_CLICK_TEMPLATE": "{uri}"},
+                                  self.fields())
+        self.assertEqual(tl.parse_uri(url),
+                         {"host": "testhost", "workspace_id": "w15",
+                          "label": "research"})
+
+    def test_hostile_label_cannot_break_headers(self):
+        # CRLF injection, Actions-field smuggling via commas, template-brace
+        # spoofing: the label is cleaned + percent-encoded, so Click and
+        # Actions stay single-line, four-field, and parse back to one URI
+        hostile = "a,b\r\nTags: x\r\n, clear=true {payload_b64}"
+        fields = hn.link_fields("testhost", "w15", hostile)
+        url, actions = hn.click_headers({"NTFY_CLICK_TEMPLATE": "{uri}"},
+                                        fields)
+        for header in (url, actions):
+            self.assertIsNotNone(header)
+            self.assertNotIn("\r", header)
+            self.assertNotIn("\n", header)
+        self.assertTrue(actions.startswith("view, Attach, "))
+        self.assertTrue(actions.endswith(", clear=true"))
+        # the smuggled text is percent-encoded inside the query, not parsed
+        self.assertNotIn("clear=true?label", actions)
+        self.assertIn("label=a%2Cb", url)
+        # and the decoded link still yields the cleaned label, nothing more
+        self.assertEqual(tl.parse_uri(url)["label"],
+                         tl.clean_label(hostile))
 
 
 class PollTransitions(unittest.TestCase):
