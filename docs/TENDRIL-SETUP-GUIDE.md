@@ -100,6 +100,10 @@ Do these steps in a terminal **on the computer**.
 
 ### Step A1: Install the basic tools
 
+(These steps assume an Ubuntu/Debian computer. For a Mac, see
+[MACOS.md](MACOS.md): turn on Remote Login, run `xcode-select --install`,
+and `brew install mosh`.)
+
 ```sh
 sudo apt update
 sudo apt install -y openssh-server mosh git python3 curl
@@ -501,7 +505,7 @@ bash tendril-phone-setup.sh --check
 | The menu is empty | No workspaces yet. | Run `herdr` on the computer and start an agent. Or press **N** in the menu. |
 | Mosh connects, then freezes | The firewall blocks Mosh. | Use `tendril ssh` for now. Then do Step A5. |
 | ALT then D does nothing | The key went to the wrong place. | Use **Ctrl+B**, then **D**. |
-| No notifications | Wrong topic, or the watcher is stopped. | Check the topic in the ntfy app. On the computer: `systemctl --user status herdr-notify` |
+| No notifications | Wrong topic, or the watcher is stopped. | Check the topic in the ntfy app. On the computer: `tendril service status` (Linux also: `systemctl --user status herdr-notify`) |
 | Strange symbols on screen | The font lacks some characters. | In Termux: `pkg install font-firas-mono` |
 
 ### Useful check commands

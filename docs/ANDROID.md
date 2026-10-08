@@ -18,7 +18,7 @@ ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -C "termux"
 ```
 Host <alias>                     # pick any short name, e.g. "home"
     HostName <tailscale-hostname-or-ip>
-    User <your-linux-username>
+    User <your-host-username>       # Linux or macOS
     IdentityFile ~/.ssh/id_ed25519
     IdentitiesOnly yes
     ServerAliveInterval 30
@@ -72,7 +72,7 @@ Set your alias once (or pass it every time: `tendril <alias>`;
 an existing `AGENT_ALIAS` keeps working):
 
 ```sh
-echo 'TENDRIL_ALIAS=<alias>' >> ~/.bashrc
+echo 'export TENDRIL_ALIAS=<alias>' >> ~/.bashrc
 ```
 
 ## 6. Notifications
@@ -181,6 +181,9 @@ Two ways in:
 On iOS the equivalent is an ntfy tap → Shortcut → `remote-agents focus`
 over SSH → Blink; the full recipe and the canonical `tendril://` link
 format also live in docs/DEEPLINK.md.
+
+On a Mac, `./install --client` gives you the same `tendril` command
+(Mosh preferred, SSH fallback) — see docs/MACOS.md.
 
 ## Troubleshooting
 

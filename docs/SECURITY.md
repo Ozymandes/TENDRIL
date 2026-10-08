@@ -16,6 +16,25 @@
 - `remote-agents` and `herdr-notify` run as your user; there are no root
   components and no setuid bits.
 
+## macOS specifics (Remote Login, launchd, PATH block)
+
+- Host access is plain sshd via System Settings → General → Sharing →
+  **Remote Login**. TENDRIL never uses `sudo` and does not need Full Disk
+  Access (that optional toggle only matters for TCC-protected folders).
+- The watcher is a per-user LaunchAgent
+  (`~/Library/LaunchAgents/com.tendril.herdr-notify.plist`): it runs as
+  your user in the `gui/<uid>` or `user/<uid>` launchd domain, logs to
+  `~/Library/Logs/tendril/`, and adds no privileges beyond your own.
+- The managed PATH block (`# >>> tendril remote PATH`) only prepends
+  standard bin directories (`~/.local/bin`, `/opt/homebrew/bin`,
+  `/usr/local/bin`) to your own shell startup files (`~/.zshenv` or
+  `~/.bashrc`, plus `~/.profile`), after a timestamped backup. It changes
+  nothing for other users and grants no new capability: it only makes your
+  own binaries findable in non-interactive SSH/Mosh sessions, which macOS
+  sshd starts with the bare PATH `/usr/bin:/bin:/usr/sbin:/sbin`. Remove
+  it with `./uninstall` (it asks) or
+  `python3 ~/.local/bin/tendril_host.py remote-path remove`.
+
 ## Notifications
 
 - ntfy topics are the credential: the installer generates a long random

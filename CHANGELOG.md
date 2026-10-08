@@ -4,6 +4,40 @@ All notable changes to TENDRIL are documented here.
 
 ## Unreleased
 
+- macOS as a host and as a client. `./install` now runs unchanged on macOS
+  (Apple silicon and Intel, stock `/bin/sh`, Xcode Command Line Tools
+  Python 3.9+): no GNU `readlink -f`/`sed -i`/`\+` greps, package hints from
+  whichever manager is present (brew, pacman, apt, dnf), the Tailscale
+  app-bundle CLI is found automatically, and the default host name drops the
+  mDNS `.local` suffix. Herdr is found in `~/.local/bin` (install.sh) and
+  Homebrew prefixes even from SSH/launchd PATHs.
+- New `bin/tendril_host.py`: the few host facts and lifecycle verbs that
+  differ by OS, chosen by capability. The notification watcher runs as a
+  launchd LaunchAgent (`~/Library/LaunchAgents/com.tendril.herdr-notify.plist`,
+  log in `~/Library/Logs/tendril/`) where `launchctl` exists, and as the
+  existing systemd user unit otherwise. One command on both:
+  `tendril service status|start|stop|restart|logs`. launchd restarts a
+  crashed watcher; it has no watchdog, so hung-process recovery stays
+  Linux-only. The Info panel no longer reads `/proc` (it crashed on macOS).
+- Installer step 3b, "Remote session PATH": detects when SSH/Mosh commands
+  cannot find `remote-agents` or `mosh-server` (the macOS default: sshd's
+  `zsh -c` reads only `~/.zshenv`, Mosh's `sh -lc` only `~/.profile`) and
+  offers one small marked block, backed up first and removed by `./uninstall`.
+- `./install --client`: installs the launcher as `~/.local/bin/tendril` on a
+  Mac or Linux desktop (or `tendril-remote` when the machine is also a host)
+  with the default host in `~/.config/tendril/alias`. The launcher also gains
+  `resolve|focus|link <id>` over plain SSH and rejects aliases that start
+  with `-`.
+- iOS/Blink re-certified against current Blink source; `docs/IOS_BLINK.md`
+  now marks each feature as source-verified, automated-tested, real-device
+  required, or blocked by Blink. `docs/MACOS.md` covers both Mac roles.
+- Fixes: the Android setup block now `export`s `TENDRIL_ALIAS`; the guided
+  phone setup no longer uses GNU `sed -i` on the host, refreshes
+  `tendril_host.py`, and checks/restarts the watcher on launchd too; the
+  suite passes on Python 3.9.
+- CI: GitHub Actions runs the suite on Ubuntu and macOS (Python 3.9 and
+  current) plus shell syntax checks.
+
 - Guided phone-first setup (PR #1 by @bakrianoo): a one-shot Termux script
   (`docs/scripts/tendril-phone-setup.sh`) bootstraps both ends from the
   phone — SSH key and alias, host-side Herdr/TENDRIL install or atomic

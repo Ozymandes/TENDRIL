@@ -1,11 +1,27 @@
 ![TENDRIL launch banner](assets/branding/TENDRIL_BANNER.png)
 
-[![Python](https://img.shields.io/badge/Python-stdlib-3776AB?style=for-the-badge&logo=python&logoColor=white)](#host-installation) [![Linux](https://img.shields.io/badge/Linux-host-1F2937?style=for-the-badge&logo=linux&logoColor=F0C94A)](#host-installation) [![Android](https://img.shields.io/badge/Android-Termux-197A46?style=for-the-badge&logo=android&logoColor=white)](docs/ANDROID.md) [![Herdr](https://img.shields.io/badge/Herdr-0.9%2B-8A5CF6?style=for-the-badge)](https://herdr.dev) [![Remote agents](https://img.shields.io/badge/remote-agents-1F1F1F?style=for-the-badge&logo=github&logoColor=white)](#what-it-does) [![Mosh%20%2F%20SSH](https://img.shields.io/badge/Mosh%20%2F%20SSH-private_network-238DB5?style=for-the-badge)](#how-it-works) [![CLI%20%2F%20TUI](https://img.shields.io/badge/CLI%20%2F%20TUI-terminal-16A6A1?style=for-the-badge)](#what-it-does) [![Version tag](https://img.shields.io/badge/version-v0.1.1-3974AD?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Ozymandes/TENDRIL/tree/v0.1.1) [![MIT](https://img.shields.io/badge/licence-MIT-D6A62E?style=for-the-badge&logo=opensourceinitiative&logoColor=white)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-stdlib-3776AB?style=for-the-badge&logo=python&logoColor=white)](#host-installation) [![Linux](https://img.shields.io/badge/Linux-host-1F2937?style=for-the-badge&logo=linux&logoColor=F0C94A)](#host-installation) [![macOS](https://img.shields.io/badge/macOS-host%20%2F%20client-8A8A8F?style=for-the-badge&logo=apple&logoColor=white)](docs/MACOS.md) [![Android](https://img.shields.io/badge/Android-Termux-197A46?style=for-the-badge&logo=android&logoColor=white)](docs/ANDROID.md) [![Herdr](https://img.shields.io/badge/Herdr-0.9%2B-8A5CF6?style=for-the-badge)](https://herdr.dev) [![Remote agents](https://img.shields.io/badge/remote-agents-1F1F1F?style=for-the-badge&logo=github&logoColor=white)](#what-it-does) [![Mosh%20%2F%20SSH](https://img.shields.io/badge/Mosh%20%2F%20SSH-private_network-238DB5?style=for-the-badge)](#how-it-works) [![CLI%20%2F%20TUI](https://img.shields.io/badge/CLI%20%2F%20TUI-terminal-16A6A1?style=for-the-badge)](#what-it-does) [![Version tag](https://img.shields.io/badge/version-v0.1.1-3974AD?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Ozymandes/TENDRIL/tree/v0.1.1) [![MIT](https://img.shields.io/badge/licence-MIT-D6A62E?style=for-the-badge&logo=opensourceinitiative&logoColor=white)](LICENSE)
 
 TENDRIL puts a small, direct control surface for persistent AI-agent sessions
-in your pocket. From Android, check the live workspaces on a Linux workstation,
-move to the session you need, and leave the host to keep working when you put
-the phone away.
+in your pocket. From your phone, check the live workspaces on your
+workstation (Linux or macOS), move to the session you need, and leave the
+host to keep working when you put the phone away.
+
+## Platforms
+
+| Role | Platform | Status |
+|---|---|---|
+| Host | Linux | ✅ daily use, full test suite |
+| Host | macOS (Apple silicon, Intel) | 🟡 Darwin-simulation tests pass; real-Mac sign-off pending |
+| Client | Android (Termux) | ✅ daily use, full test suite |
+| Client | macOS terminal | 🟡 launcher tests pass; real-Mac sign-off pending |
+| Client | iOS (Blink Shell) | 🟡 source-verified against Blink + host-side tests; real-iPhone sign-off pending |
+
+✅ marks combinations in daily use with the full test suite. 🟡 means
+supported and covered by automated tests (CI runs the suite on Linux and
+on a macOS runner), but not yet signed off on a real device. Any host
+works with any client: SSH everywhere, Mosh where both ends have it. See [docs/MACOS.md](docs/MACOS.md) and
+[docs/IOS_BLINK.md](docs/IOS_BLINK.md).
 
 ## Why TENDRIL exists
 
@@ -22,8 +38,8 @@ control, simplicity, and openness I wanted from the start.
 
 ## What it does
 
-- `tendril` connects from Termux to your Linux host, preferring Mosh and falling
-  back to SSH.
+- `tendril` connects from Termux or a desktop to your Linux or macOS host,
+  preferring Mosh and falling back to SSH.
 - `remote-agents` presents Herdr's live workspaces in a terminal selector. Pick
   a workspace to attach, open a shell, or view host info.
 - Sessions are addressable: `remote-agents attach <id>` (and
@@ -39,7 +55,7 @@ and the walk to the kettle.
 ## How it works
 
 ```text
-ANDROID / TERMUX                         LINUX WORKSTATION
+ANDROID / TERMUX                         LINUX / MACOS HOST
 `tendril` ── Tailscale ── Mosh / SSH ──> Herdr
                                            └─ `remote-agents` TUI
                                                 ├─ Pi / Claude Code / Codex
@@ -79,13 +95,15 @@ Notes:
 - Install Termux and Termux:Widget from F-Droid. Termux:Widget is not on
   Google Play.
 - On a server or VPS, run `sudo loginctl enable-linger $USER` so the
-  notification watcher keeps running after you log out.
+  notification watcher keeps running after you log out (Linux/systemd hosts;
+  on macOS the watcher is a launchd agent that starts at login —
+  [docs/MACOS.md](docs/MACOS.md)).
 
 ### Host installation
 
-On Linux, install Herdr first, then clone TENDRIL and run its interactive
-installer. It checks compatibility, previews changes with `--dry-run`, and
-never uses `sudo`.
+On the host — Linux or macOS — install Herdr first, then clone TENDRIL and
+run its interactive installer. It checks compatibility, previews changes
+with `--dry-run`, and never uses `sudo`.
 
 ```sh
 git clone https://github.com/Ozymandes/TENDRIL.git
@@ -93,6 +111,16 @@ cd TENDRIL
 ./install --doctor
 ./install
 ```
+
+On a Mac, enable Remote Login first and expect Homebrew-flavoured hints;
+the watcher installs as a launchd LaunchAgent rather than a systemd unit.
+Prerequisites, firewall and Mosh quirks, and the Linux/macOS lifecycle
+table are in [docs/MACOS.md](docs/MACOS.md). A Mac or Linux desktop can
+also be a pure *client* instead of a host: `./install --client` installs a
+`tendril` command that dials your host over SSH/Mosh. On either kind of
+host, the installer can set up the push watcher as a user service — check
+it with `tendril service status`, manage with
+`tendril service restart|stop|logs`.
 
 To update only the host selector from the checkout root, replace its executable:
 
@@ -169,6 +197,7 @@ Alt+D detach, Mosh hosts with a `tendril` startup command, and the automatic
 
 - [Beginner setup guide](docs/TENDRIL-SETUP-GUIDE.md)
 - [Android / Termux setup](docs/ANDROID.md)
+- [macOS host & client](docs/MACOS.md)
 - [Architecture](docs/ARCHITECTURE.md)
 - [Security model](docs/SECURITY.md)
 - [License](LICENSE)
