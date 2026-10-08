@@ -101,7 +101,11 @@ reach it**, so a bare notification tap cannot open Termux. Three real flows:
    #!/bin/sh  # ~/bin/print-id — surface the workspace id in the body
    sed -n 's/.*"workspace_id":"\([A-Za-z0-9._:-]*\)".*/\1/p'
    ```
-   Open Termux → `tendril attach w15`.
+   Open Termux → `tendril attach <id>`. `<id>` must be a live canonical
+   workspace id (`w15` here is an example): read it off the selector
+   (number + Enter shows it), print one on the host with `tendril link`,
+   or check one with `tendril resolve <id>` — an unknown id exits with a
+   clean "not found".
 
 2. **Share → termux-url-opener (verified Termux contract).** Termux runs
    `~/bin/termux-url-opener <url>` for any URL *shared* to it

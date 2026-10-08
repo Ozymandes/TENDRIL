@@ -182,7 +182,7 @@ ssh-copy-id home                # afterwards: ssh home must need no password
 | `tendril` | console on the default host (Mosh preferred, SSH fallback) |
 | `tendril <alias>` | another host |
 | `tendril ssh <alias>` | force plain SSH, skip Mosh |
-| `tendril attach w15` | straight into a session (workspace id, `w15:p1`, number, or label) |
+| `tendril attach w15` | straight into a session (workspace id, `w15:p1`, number, or label; ids come from the selector or `tendril link` on the host, and an unknown id exits cleanly) |
 | `tendril <alias> attach w15` | same, explicit host |
 | `tendril [<alias>] resolve\|focus\|link <id>` | JSON / headless focus / canonical link — always plain SSH, no TTY |
 

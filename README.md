@@ -13,11 +13,12 @@ host to keep working when you put the phone away.
 |---|---|---|
 | Host | Linux | ✅ daily use, full test suite |
 | Host | macOS (Apple silicon, Intel) | 🟡 Darwin-simulation tests pass; real-Mac sign-off pending |
-| Client | Android (Termux) | ✅ daily use, full test suite |
+| Client | Android (Termux) | ✅ real-device certified (launcher, masthead, selector, direct attach/resolve, deep links) |
 | Client | macOS terminal | 🟡 launcher tests pass; real-Mac sign-off pending |
 | Client | iOS (Blink Shell) | 🟡 source-verified against Blink + host-side tests; real-iPhone sign-off pending |
 
-✅ marks combinations in daily use with the full test suite. 🟡 means
+✅ marks combinations in daily use with the full test suite (Android is
+additionally certified on a real S21 Ultra / Termux device). 🟡 means
 supported and covered by automated tests (CI runs the suite on Linux and
 on a macOS runner), but not yet signed off on a real device. Any host
 works with any client: SSH everywhere, Mosh where both ends have it. See [docs/MACOS.md](docs/MACOS.md) and

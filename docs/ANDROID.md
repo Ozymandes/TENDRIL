@@ -152,7 +152,9 @@ Termux. What Termux does reliably: when a URL is **shared** to the Termux
 app it runs `~/bin/termux-url-opener <url>`. The repo ships that script —
 `phone/termux-url-opener` — and it recognizes TENDRIL links like
 `https://…/.tendril/w15` (also `?id=…`/`?p=…` pairs), validates the id and
-runs `tendril attach <id>` for you.
+runs `tendril attach <id>` for you. `w15` is only an example: use a live
+id from the selector (or `tendril link` on the host); an unknown id
+exits with a clean "not found".
 
 Install it on the phone (`HOST` = ssh alias, `REPO` = host checkout path,
 as in step 5 above):

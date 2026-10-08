@@ -4,6 +4,11 @@ All notable changes to TENDRIL are documented here.
 
 ## Unreleased
 
+- Android real-device certification passed on an S21 Ultra / Termux
+  against this branch: launcher refresh, restored masthead and colour
+  hierarchy, selector, Alt+D / Ctrl+B d, direct attach and resolve on a
+  live workspace id, and the `termux-url-opener` deep link.
+
 - Fix (predates the cross-platform work): the installer's Herdr switching
   merge looked conflicts up by action name in a map keyed by chord, so it
   never noticed a `switch_tab` that already claims `prefix+1..9`/`alt+1..9`;

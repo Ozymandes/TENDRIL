@@ -473,7 +473,8 @@ Alerts contain only these words and the workspace name. They never contain your 
 The setup script already copied the deep-link helper to
 `~/bin/termux-url-opener`. Android cannot open Termux from a bare
 notification tap, so today there are two supported paths: **share** any
-TENDRIL URL (like `https://…/.tendril/w15`) to the Termux app from any
+TENDRIL URL (like `https://…/.tendril/w15`; `w15` is an example — use a
+live id shown by the selector) to the Termux app from any
 share sheet (works right away, no extra setup), or set up Tasker or
 MacroDroid for real one-tap behavior (needs the ntfy "broadcast
 messages" setting). What each path can and cannot do is documented in
