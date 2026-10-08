@@ -440,8 +440,9 @@ def render(rows, note="", selected=None):
 
     compact = len(rows) > 6
     # Paths yield when needed to keep the menu and prompt on screen, or when
-    # dropping them buys the compact mark a slot. Otherwise preserve paths;
-    # masthead() can fall back to its caption tiers independently.
+    # dropping them buys the brand a tier: the compact mark, else the
+    # TENDRIL + slogan caption, else the one-line caption. Paths never push
+    # the whole brand off screen (a keyboard-open phone with 7+ workspaces).
     term_rows = shutil.get_terminal_size(fallback=(52, 24)).lines
     est = 4 + len(feet) + 2
     with_paths = est + sum(1 + (1 if r["path"] else 0) + (0 if compact else 1)
@@ -450,9 +451,11 @@ def render(rows, note="", selected=None):
     if note:
         with_paths += 1
         without += 1
-    mark = 7 + 1                                # compact tier + blank separator
+    # brand heights incl. the blank separator: compact mark, caption, title
+    brand = next((h for h in (7 + 1, 2 + 1, 1 + 1)
+                  if h + without + 1 <= term_rows), 0) if COLOR else 0
     show_paths = with_paths + 1 <= term_rows and (
-        mark + with_paths + 1 <= term_rows or mark + without + 1 > term_rows)
+        brand + with_paths + 1 <= term_rows)
 
     lines = []
     edge = f"{C_LIME}\u250c{line(inner)}\u2510{C_RESET}"

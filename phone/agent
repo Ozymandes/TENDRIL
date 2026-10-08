@@ -2,5 +2,14 @@
 # agent — compatibility alias for `tendril` (the TENDRIL phone launcher).
 # Install this wrapper as ~/bin/agent alongside ~/bin/tendril.
 here=$(dirname -- "$0")
+# A second hop means ~/bin/tendril is this wrapper too (e.g. a copy written
+# through an old `agent -> tendril` symlink): it would exec itself forever.
+if [ -n "${TENDRIL_AGENT_HOP:-}" ]; then
+    echo "[agent] $here/tendril is the agent wrapper, not the TENDRIL launcher." >&2
+    echo "  reinstall: rm -f ~/bin/tendril ~/bin/agent, then copy phone/tendril" >&2
+    echo "  and phone/agent again (docs/ANDROID.md)." >&2
+    exit 1
+fi
+export TENDRIL_AGENT_HOP=1
 [ -f "$here/tendril" ] && exec sh "$here/tendril" "$@"
 exec tendril "$@"

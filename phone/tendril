@@ -71,6 +71,13 @@ case "$ALIAS" in
     -*) echo "[tendril] '$ALIAS' is not an SSH alias (leading '-')"; exit 2 ;;
 esac
 if [ -z "$ALIAS" ]; then
+    echo "[tendril] no host alias: TENDRIL_ALIAS is empty and ~/.config/tendril/alias is missing."
+    HOSTS=$(awk 'tolower($1)=="host" { for (i = 2; i <= NF; i++) if ($i !~ /[*?!]/) printf "%s ", $i }' \
+        "$HOME/.ssh/config" 2>/dev/null)
+    [ -n "$HOSTS" ] && echo "  hosts in ~/.ssh/config: $HOSTS"
+    echo "  connect once:   tendril <alias>"
+    echo "  set a default:  echo <alias> > ~/.config/tendril/alias"
+    echo "                  (or: echo 'export TENDRIL_ALIAS=<alias>' >> ~/.bashrc)"
     echo "usage: tendril [<alias>] [attach|resolve|focus|link <session-id>] | tendril ssh <alias>"
     echo "first time: see docs/ANDROID.md or docs/MACOS.md — create a key, then: ssh-copy-id <alias>"
     exit 1
