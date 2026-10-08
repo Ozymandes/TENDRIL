@@ -1,4 +1,13 @@
-# Android (Termux) setup
+## Android (Termux) setup
+
+## 0. Pair your phone (fastest path)
+
+On the host, run `tendril --pair`. It prints the host identity, the
+`TENDRIL1:` pairing code for the TENDRIL Link app (a scannable QR too,
+when `qrencode` is installed), the ntfy topic to subscribe to, and a
+paste-ready Termux setup block with every value filled in. Scan or paste
+the code in the app; it fills in the host. The manual steps below do the
+same thing by hand.
 
 ## 1. Install the base
 

@@ -197,9 +197,11 @@ class FakeDarwin(unittest.TestCase):
 
 
 class DryRunDarwin(FakeDarwin):
-    # dry-run asks the config questions and the watcher/keybinding confirms,
-    # but step 3b skips the PATH question entirely.
-    ANSWERS = ["", "", "", "", "y", "", ""]
+    # dry-run: stdin is a pipe, so the identity/roots block takes its
+    # discovered defaults and asks nothing; the ntfy question and the
+    # watcher/keybinding confirms still read answers (3b skips its PATH
+    # question entirely under --dry-run).
+    ANSWERS = ["", "y", "", ""]
 
     def test_dry_run_writes_nothing_and_shows_the_launchd_plan(self):
         p = self.run_script(INSTALL, ["--dry-run"], self.ANSWERS)
@@ -210,11 +212,14 @@ class DryRunDarwin(FakeDarwin):
         self.assertIn("com.tendril.herdr-notify", out)        # plist preview
         self.assertEqual(self.walk_home(), [])                # zero writes
         self.assertEqual(self.linux_calls(), [])              # no Linux tools
-        # the offered default is the short mDNS-free hostname
-        self.assertIn("Tailscale hostname of this machine [%s]" % HOST, out)
-        self.assertIn("SSH alias the phone will use [%s]" % HOST, out)
+        # non-tty: the discovered identity is shown and accepted, not asked
+        self.assertIn("Host identity", out)
+        self.assertIn("janes-macbook-pro", out)               # lowercased nodename
+        self.assertNotIn("Use this host?", out)               # no confirm on a pipe
+        self.assertIn("(--yes / non-interactive: accepted as shown)", out)
         self.assertNotIn("Janes-MacBook-Pro.local", out)
-        self.assertIn("TAILSCALE_HOST=%s" % HOST, out)        # config preview
+        self.assertIn("TENDRIL_HOST=janes-macbook-pro", out)  # config preview
+        self.assertIn("TAILSCALE_HOST=janes-macbook-pro", out)
         self.assertNotIn("pacman", out)                       # Homebrew hint
 
     def test_dry_run_never_bootstraps_the_agent(self):
@@ -253,10 +258,11 @@ class InstallHints(FakeDarwin):
 
 
 class HostInstallDarwin(FakeDarwin):
-    # roots, hostname, alias, PATH-block y, ntfy n, watcher y, bindings n n
-    # (the mosh-server stub keeps the PATH check failing, so run 2 asks
-    # the same questions and gets the same answers as run 1)
-    FIRST = ["", "", "", "y", "", "y", "", ""]
+    # stdin is a pipe: the identity/roots block takes its defaults, then
+    # PATH-block y, ntfy n, watcher y, bindings n n (the mosh-server stub
+    # keeps the PATH check failing, so run 2 asks the same questions and
+    # gets the same answers as run 1)
+    FIRST = ["y", "", "y", "", ""]
     SECOND = FIRST
 
     def test_install_idempotent_then_uninstall(self):
@@ -396,8 +402,9 @@ class SwitchingOnClaimedDigits(FakeDarwin):
         shutil.copy(fixture, conf)
         with open(fixture) as f:
             before = f.read()
-        # roots, host, alias, PATH n, ntfy n, watcher n, detach n, switching y
-        p = self.run_script(INSTALL, [], ["", "", "", "n", "", "n", "n", "y"])
+        # PATH n, ntfy n, watcher n, detach n, switching y (the identity
+        # block takes its defaults: stdin is a pipe)
+        p = self.run_script(INSTALL, [], ["n", "", "n", "n", "y"])
         out = p.stdout
         self.assertEqual(p.returncode, 0, out + p.stderr)
         self.assertRegex(out, r"SKIPPED +prefix workspace switching .*conflict with keys.switch_tab")

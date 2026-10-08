@@ -10,7 +10,8 @@ exists and from sysctl/vm_stat/pmset otherwise. Stdlib only, Python 3.9+
     tendril_host.py service install|start|stop|restart|refresh|status|uninstall|logs
                     [--dry-run] [--pkg DIR] [--python PATH] [--bin-changed]
     tendril_host.py remote-path check|plan|apply|remove [--dry-run]
-    tendril_host.py facts | hostname | tailscale-ip | ssh-server
+    tendril_host.py facts | hostname | tailscale-ip | tailscale-identity |
+                    host-identity [CONFIG] | ssh-server
 service refresh is the upgrade path (called by `./install --upgrade`):
 the unit/plist is rewritten only when its rendered content differs,
 systemd daemon-reload happens only then, and the watcher restarts only
@@ -93,6 +94,65 @@ def tailscale_name(run=_run, cli=None):
     except ValueError:
         return ""
     return dns.split(".", 1)[0]
+
+
+def tailscale_identity(run=_run, cli=None):
+    """(short MagicDNS name, MagicDNS FQDN) from `tailscale status --json`,
+    per Self.HostName / Self.DNSName; ('', '') when Tailscale is absent or
+    down. The FQDN is the phone's ssh target (trailing dot stripped); the
+    short name falls back to the FQDN's first label. Read-only discovery
+    for the installer's host-identity summary; it never configures."""
+    cli = cli or tailscale_cli()
+    if not cli:
+        return "", ""
+    rc, out, _ = run([cli, "status", "--json"], 4)
+    if rc != 0:
+        return "", ""
+    try:
+        self_ = json.loads(out).get("Self") or {}
+    except ValueError:
+        return "", ""
+    fqdn = str(self_.get("DNSName") or "").strip().rstrip(".")
+    short = str(self_.get("HostName") or "").strip()
+    if not short and fqdn:
+        short = fqdn.split(".", 1)[0]
+    return short, fqdn
+
+
+def parse_env_file(path):
+    """KEY=VALUE lines from a config file; first match wins, matching
+    quotes stripped (the same loose shape remote-agents/herdr-notify use)."""
+    cfg = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln and not ln.startswith("#") and "=" in ln:
+                    k, v = ln.split("=", 1)
+                    cfg[k.strip()] = v.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return cfg
+
+
+def host_identity(config_path=None):
+    """The canonical host id for CONFIG_PATH (default: the installed host
+    config), via tendril_link.host_identity — the single definition of the
+    TENDRIL_HOST -> legacy TAILSCALE_HOST -> hostname order. The inline
+    fallback keeps this verb working next to a stale tendril_link.py."""
+    cfg = parse_env_file(config_path) if config_path else {}
+    try:
+        import tendril_link
+        return tendril_link.host_identity(cfg)
+    except ImportError:
+        pass
+    for key in ("TENDRIL_HOST", "TAILSCALE_HOST"):
+        value = str(cfg.get(key) or "").strip().lower()
+        if value and re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$", value):
+            return value
+    node = short_hostname().split(".", 1)[0].strip().lower()
+    node = re.sub(r"[^a-z0-9._-]+", "-", node).strip("-.")
+    return node or "host"
 
 
 def short_hostname(nodename=None):
@@ -655,6 +715,14 @@ def main(argv=None):
         if ip:
             print(ip)
         return 0 if ip else 1
+    if words[:1] == ["tailscale-identity"]:
+        short, fqdn = tailscale_identity()
+        print(short)
+        print(fqdn)
+        return 0
+    if words[:1] == ["host-identity"]:
+        print(host_identity(words[1] if len(words) > 1 else None))
+        return 0
     if words[:1] == ["ssh-server"]:
         return 0 if ssh_server_listening() else 1
     if words[:1] == ["service"] and len(words) == 2:

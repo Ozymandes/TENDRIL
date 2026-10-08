@@ -30,13 +30,15 @@ from test_darwin_install import FakeDarwin, INSTALL  # noqa: E402
 sys.path.insert(0, os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "bin"))  # noqa: E402
 
-# roots, host, alias, PATH-block, ...then the ntfy flow, watcher, bindings
-KEEP_ANSWERS = ["", "", "", "n", "", "n", "", ""]          # ENTER = keep
-KEEP_YES_ANSWERS = ["", "", "", "n", "Y", "n", "", ""]
-DECLINE_BOTH = ["", "", "", "n", "n", "n", "n", "", ""]    # no keep, no rotate
-ROTATE_ANSWERS = ["", "", "", "n", "n", "y", "n", "", ""]  # explicit rotation
-FRESH_YES = ["", "", "", "n", "y", "n", "", ""]            # first-run flow
-FRESH_NO = ["", "", "", "n", "n", "n", "", ""]
+# stdin is a pipe, so the identity/roots block takes its discovered defaults
+# and asks nothing; answers start at the PATH-block question, then the ntfy
+# flow, watcher, keybindings
+KEEP_ANSWERS = ["n", "", "n", "", ""]                     # ENTER = keep
+KEEP_YES_ANSWERS = ["n", "Y", "n", "", ""]
+DECLINE_BOTH = ["n", "n", "n", "n", "n", ""]             # no keep, no rotate
+ROTATE_ANSWERS = ["n", "n", "y", "n", "n", ""]           # explicit rotation
+FRESH_YES = ["n", "y", "n", "n", ""]                     # first-run flow
+FRESH_NO = ["n", "n", "n", "n", ""]
 
 OLD_TOPIC = "tendril-lPD1ADyhP1iXjUGs"  # the topic from the real bug report
 NEW_TOPIC_RE = re.compile(r"^tendril-[A-Za-z0-9_-]{16}$")
@@ -319,9 +321,9 @@ class InjectionAttempts(FakeDarwin):
 
 
 class DryRunKeepsWorking(FakeDarwin):
-    # dry-run skips the PATH question: roots, host, alias, keep(""),
-    # watcher(""), detach(""), switching("")
-    ANSWERS = ["", "", "", "", "", "", ""]
+    # dry-run skips the PATH question: keep(""), watcher(""), detach(""),
+    # switching("") — the identity block asks nothing on a pipe
+    ANSWERS = ["", "", "", ""]
 
     def test_dry_run_with_existing_config_writes_nothing(self):
         path = seed_notify(self, f"NTFY_URL=https://ntfy.sh\n"

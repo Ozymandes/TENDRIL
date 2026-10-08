@@ -82,12 +82,22 @@ if [ "$1" = "--check" ]; then
 fi
 
 echo "== TENDRIL phone setup =="
-HOST_ADDR=$(ask "Computer's Tailscale name or 100.x IP" "")
-[ -z "$HOST_ADDR" ] && { echo "A host address is required."; exit 1; }
-HOST_USER=$(ask "Your username on that computer (Linux or Mac)" "")
-[ -z "$HOST_USER" ] && { echo "A username is required."; exit 1; }
-ALIAS=$(ask "Short name for this computer" "home")
-REPO=$(ask "TENDRIL folder on the computer" "TENDRIL")
+# All four answers can come from the environment (or the host's
+# `tendril --pair` output): when TENDRIL_HOST_ADDR, TENDRIL_HOST_USER,
+# TENDRIL_ALIAS_NAME and TENDRIL_REPO_DIR are all set the questions are
+# skipped entirely; otherwise they become the defaults.
+if [ -n "$TENDRIL_HOST_ADDR" ] && [ -n "$TENDRIL_HOST_USER" ] \
+   && [ -n "$TENDRIL_ALIAS_NAME" ] && [ -n "$TENDRIL_REPO_DIR" ]; then
+    HOST_ADDR=$TENDRIL_HOST_ADDR HOST_USER=$TENDRIL_HOST_USER
+    ALIAS=$TENDRIL_ALIAS_NAME REPO=$TENDRIL_REPO_DIR
+else
+    HOST_ADDR=$(ask "Computer's Tailscale name or 100.x IP" "${TENDRIL_HOST_ADDR:-}")
+    [ -z "$HOST_ADDR" ] && { echo "A host address is required."; exit 1; }
+    HOST_USER=$(ask "Your username on that computer (Linux or Mac)" "${TENDRIL_HOST_USER:-}")
+    [ -z "$HOST_USER" ] && { echo "A username is required."; exit 1; }
+    ALIAS=$(ask "Short name for this computer" "${TENDRIL_ALIAS_NAME:-home}")
+    REPO=$(ask "TENDRIL folder on the computer" "${TENDRIL_REPO_DIR:-TENDRIL}")
+fi
 
 # These values are embedded in remote SSH commands below; spaces or quotes
 # would break the hand-off (or the ssh config). Keep them simple.

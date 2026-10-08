@@ -399,7 +399,7 @@ def push(state, pid, agent, cls, workspaces, cfg, allow_push, now,
         log(f"PUSH suppressed (repeat window) {pid}")
         return
     kind, ws_id, label, title_label = pane_context(agent, workspaces)
-    host = CONFIG.get("TAILSCALE_HOST") or os.uname().nodename
+    host = tendril_link.host_identity(CONFIG)
     cwd = agent.get("cwd")
     pane_id = agent.get("pane_id") or ""
     title, body, priority, tags = compose(kind, title_label, cls,
@@ -517,7 +517,7 @@ def test():
     click = actions = None
     template = str(cfg.get("NTFY_CLICK_TEMPLATE") or "").strip()
     if template:
-        host = CONFIG.get("TAILSCALE_HOST") or os.uname().nodename
+        host = tendril_link.host_identity(CONFIG)
         ws_id, label = demo_workspace()
         fields = link_fields(host, ws_id, label)
         if fields:

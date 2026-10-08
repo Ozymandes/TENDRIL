@@ -33,6 +33,22 @@ The pane field is additive (LINK_VERSION stays 1): workspace-only links
 are byte-identical to the original contract, and a link without a pane
 parses to exactly the original three-key dict.
 
+Also the canonical host identity (documented in
+docs/ANDROID.md, "Pair your phone"): one value, TENDRIL_HOST in the host
+config, is what every deep link, notification and pairing code calls this
+machine. Readers resolve it here so remote-agents, herdr-notify and the
+pairing flow cannot drift:
+
+    host_identity(config): config TENDRIL_HOST -> legacy TAILSCALE_HOST
+    (lowercased) -> short hostname (lowercased); anything that cannot match
+    HOST_RE is sanitized (lowercase, [a-z0-9._-], runs of junk -> '-'),
+    never rewritten on disk.
+
+And the phone pairing code encoder, the exact inverse of the TENDRIL Link
+app decoder (app/.../core/PairingCode.kt): `TENDRIL1:` + base64url without
+padding over compact JSON with sorted keys {"h","s","u","v":1}. The
+developer test in the Link repo pins byte identity both ways.
+
 CLI (for debugging on phone or host):
     tendril_link.py encode <host> <workspace-id> [label] [pane]
     tendril_link.py decode <payload-or-uri>
@@ -40,6 +56,7 @@ CLI (for debugging on phone or host):
 import base64
 import binascii
 import json
+import os
 import re
 import sys
 import unicodedata
@@ -55,6 +72,14 @@ HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$")
 # Herdr workspace ids ("w15", "wK") and pane ids ("w15:p1").
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 
+# ---- canonical host identity (IDENTITY-PAIRING.md) -----------------------
+# The ssh target and the ssh user of a pairing code: separate grammar,
+# because "what to call it" != "how to reach it".
+SSH_TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
+PAIR_USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+PAIRING_PREFIX = "TENDRIL1:"
+PAIRING_MAX_LENGTH = 512
+
 
 class LinkError(ValueError):
     """Malformed host, id, label, pane, payload or URI. Never a security event."""
@@ -68,6 +93,76 @@ def clean_label(label):
     text = unicodedata.normalize("NFC", str(label))
     text = re.sub(r"[\x00-\x1f\x7f\s]+", " ", text).strip()
     return text[:MAX_LABEL].strip() or None
+
+
+def sanitize_host(name):
+    """Force a hostname-shaped id: lowercase, keep [a-z0-9._-], collapse
+    every run of anything else into one '-', trim leading/trailing '-'.
+    Deterministic cleanup for odd nodenames ("My Host!" -> "my-host");
+    HOST_RE stays the gate — this only makes more values passable."""
+    text = re.sub(r"[^a-z0-9._-]+", "-", str(name or "").strip().lower())
+    return text.strip("-.")
+
+
+def host_identity(config=None, nodename=None):
+    """The canonical TENDRIL host id (binding contract, readers side):
+
+    config TENDRIL_HOST -> legacy TAILSCALE_HOST (lowercased) -> short
+    hostname (lowercased).
+
+    A candidate that cannot match HOST_RE is sanitized and used only if
+    the sanitized form passes; otherwise the next source is tried, ending
+    at the sanitized nodename. Uppercase legacy values (OMARCHY) resolve
+    to omarchy. Never mutates config; never touches the network.
+    """
+    cfg = config if isinstance(config, dict) else {}
+    if nodename is None:
+        nodename = os.uname().nodename
+    short = str(nodename or "").split(".", 1)[0].strip()
+    for key in ("TENDRIL_HOST", "TAILSCALE_HOST"):
+        value = str(cfg.get(key) or "").strip().lower()
+        if not value:
+            continue
+        if HOST_RE.match(value):
+            return value
+        value = sanitize_host(value)
+        if value and HOST_RE.match(value):
+            return value
+    value = short.lower()
+    if HOST_RE.match(value):
+        return value
+    value = sanitize_host(short)
+    return value if value and HOST_RE.match(value) else "host"
+
+
+# ---- phone pairing code (TENDRIL Link, PairingCode.kt inverse) -----------
+
+def pairing_code(host, ssh_target, user):
+    """The exact bytes the TENDRIL Link decoder accepts:
+
+    TENDRIL1:<base64url, no padding, of compact JSON with the sorted keys
+    {"h","s","u","v":1}> — h the canonical host id (already lowercase;
+    the decoder rejects uppercase), s the ssh target (DNS grammar), u the
+    ssh user. Payload carries nothing else: no keys, tokens, topics,
+    paths or commands. Raises LinkError on any invalid input; callers
+    print the error and no code.
+    """
+    host = str(host or "")
+    ssh_target = str(ssh_target or "")
+    user = str(user or "")
+    if not host or host != host.lower() or not HOST_RE.match(host):
+        raise LinkError(f"pairing host invalid (lowercase hostname expected): {host!r}")
+    if not SSH_TARGET_RE.match(ssh_target):
+        raise LinkError(f"pairing ssh target invalid (hostname/alias expected): {ssh_target!r}")
+    if not PAIR_USER_RE.match(user):
+        raise LinkError(f"pairing user invalid (lowercase ssh username expected): {user!r}")
+    blob = json.dumps({"v": 1, "h": host, "s": ssh_target, "u": user},
+                      sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    code = PAIRING_PREFIX + base64.urlsafe_b64encode(
+        blob.encode("utf-8")).decode("ascii").rstrip("=")
+    if len(code) > PAIRING_MAX_LENGTH:
+        raise LinkError(f"pairing code oversized ({len(code)} > {PAIRING_MAX_LENGTH} chars)")
+    return code
 
 
 def _valid_pane(workspace_id, pane):

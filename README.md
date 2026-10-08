@@ -13,7 +13,7 @@ host to keep working when you put the phone away.
 |---|---|---|
 | Host | Linux | ✅ daily use, full test suite |
 | Host | macOS (Apple silicon, Intel) | 🟡 Darwin-simulation tests pass; real-Mac sign-off pending |
-| Client | Android (Termux) | ✅ real-device certified (launcher, masthead, selector, direct attach/resolve, deep links) |
+| Client | Android (Termux) | ✅ real-device certified (launcher/TUI, selector, ntfy one-tap entry, exact pane deep links, detach back to the selector) |
 | Client | macOS terminal | 🟡 launcher tests pass; real-Mac sign-off pending |
 | Client | iOS (Blink Shell) | 🟡 source-verified against Blink + host-side tests; real-iPhone sign-off pending |
 
@@ -21,7 +21,10 @@ host to keep working when you put the phone away.
 additionally certified on a real S21 Ultra / Termux device). 🟡 means
 supported and covered by automated tests (CI runs the suite on Linux and
 on a macOS runner), but not yet signed off on a real device. Any host
-works with any client: SSH everywhere, Mosh where both ends have it. See [docs/MACOS.md](docs/MACOS.md) and
+works with any client: SSH everywhere, Mosh where both ends have it.
+One-tap notification entry on Android uses the optional
+TENDRIL Link Android companion (not yet
+published); TENDRIL works fully without it. See [docs/MACOS.md](docs/MACOS.md) and
 [docs/IOS_BLINK.md](docs/IOS_BLINK.md).
 
 ## Why TENDRIL exists
@@ -136,13 +139,23 @@ binary. An already-running Mosh selector keeps using its old process until you
 quit and start `tendril` again; see the [Android guide](docs/ANDROID.md) for the
 safe exit sequence.
 
+The canonical way to update everything is `tendril --upgrade` (safe
+self-update from the recorded checkout; config and your ntfy topic stay
+byte-identical). To pair a phone — the TENDRIL Link app or Termux — run
+`tendril --pair` on the host: it prints the identity summary, the pairing
+code (QR when `qrencode` is installed), the ntfy subscribe URL and a
+paste-ready Termux setup block.
+
 ### Android / Termux
 
 Install OpenSSH and Mosh, configure an SSH host alias, and add the phone's key
-to the host. The [Android guide](docs/ANDROID.md) walks through pairing and
-copies both canonical launchers from the host checkout into `~/bin`.
+to the host — or skip the hand steps: `tendril --pair` on the host prints a
+paste-ready block with your real values (and the code for the TENDRIL Link
+app). The [Android guide](docs/ANDROID.md) walks through pairing and copies
+both canonical launchers from the host checkout into `~/bin`.
 
 ```sh
+tendril --pair                       # on the host: code + QR + setup block
 pkg update && pkg install openssh mosh
 ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -C termux
 ssh-copy-id <host-alias>

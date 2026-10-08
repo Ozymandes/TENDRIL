@@ -4,6 +4,54 @@ All notable changes to TENDRIL are documented here.
 
 ## Unreleased
 
+- Android real-device certification (Samsung Galaxy S21 Ultra, F-Droid Termux
+  0.118, TENDRIL Link full integration): ntfy notification tap → TENDRIL Link →
+  Termux RUN_COMMAND → `tendril enter` lands in the exact emitting pane, across
+  workspaces and with alphanumeric pane ids (`w7:p2`, `w8:p1`, `wX:pC`);
+  several notifications each land in their own pane; workspace-only links keep
+  their old behaviour; Ctrl+Home / Alt+D detach returns to the TENDRIL
+  selector. Stale-pane handling (no attach, selector notice) is covered by
+  automated tests and was not part of the device run. TENDRIL Link is an
+  optional companion; TENDRIL works fully without it. macOS still lacks a
+  physical-Mac sign-off and iOS/Blink a real-iPhone sign-off.
+
+- Canonical host identity: one value,
+  `TENDRIL_HOST` in the host config, is what every deep link, notification and
+  pairing code calls this machine. Readers resolve it in one place
+  (`tendril_link.host_identity`): config `TENDRIL_HOST` → legacy
+  `TAILSCALE_HOST` (lowercased, so old `OMARCHY` backups read as `omarchy`) →
+  short hostname, HOST_RE-gated and sanitized, never rewritten on disk.
+  `remote-agents` (HOST_LABEL) and both `herdr-notify` sites use the resolver;
+  existing installs keep resolving to their configured name with zero config
+  churn.
+- `tendril --pair [--code]`: prints the phone pairing code for the TENDRIL
+  Link app — `TENDRIL1:` + unpadded base64url over compact JSON with the
+  sorted keys `{"h","s","u","v":1}`, byte-identical to the app's decoder
+  (pinned against its test fixture) — plus the identity summary, a QR of the
+  code when `qrencode` is on PATH (never a dependency), the ntfy subscribe
+  URL, and a paste-ready Termux setup block with every value filled in.
+  Flags-only like `--upgrade` (a bare word is a session-token position);
+  `--code` prints only the code. The payload carries nothing but host, ssh
+  target and user — no keys, tokens, topics, paths or commands — and invalid
+  values produce one clear error, never a code. SSH target resolution:
+  config `SSH_TARGET` → Tailscale MagicDNS FQDN → `SSH_ALIAS` → identity.
+- Installer (`./install`): discovery first, questions last. The installer now
+  detects Tailscale (`tailscale status --json`), resolves the canonical
+  identity, and shows one summary (identity, Tailscale name/FQDN, SSH/Mosh
+  availability, project roots) with a single `Use this host? [Y/n]` — a name
+  is asked only when Tailscale and the hostname disagree. `--yes` or a
+  non-tty run takes every discovered default without a question. Fresh
+  installs write `TENDRIL_HOST`/`SSH_TARGET` (and keep `TAILSCALE_HOST`/
+  `SSH_ALIAS` for compatibility); reinstalls keep configured values and ask
+  nothing about identity; the separate project-roots question is gone
+  (default: the standard roots that exist, editable in the config). Step 2's
+  interactive prompt count drops from 3 asks to 1 confirmation (2 only in the
+  genuinely ambiguous case). The `read` helpers now tolerate a vanished tty
+  (EIO) instead of dying under `set -u`.
+- `docs/scripts/tendril-phone-setup.sh` accepts all four answers as env
+  (`TENDRIL_HOST_ADDR`, `TENDRIL_HOST_USER`, `TENDRIL_ALIAS_NAME`,
+  `TENDRIL_REPO_DIR`) and skips its questions when all four are set.
+
 - `tendril --upgrade [--verbose]`, plus `tendril --version` and `--help`:
   safe self-update for hosts. Every install now records provenance
   (`~/.config/remote-agents/install.json`: source checkout, commit,
