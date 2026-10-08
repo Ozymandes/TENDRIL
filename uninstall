@@ -4,6 +4,9 @@
 # unrelated LaunchAgents/units and unrelated ntfy config are untouched.
 
 set -u
+# --doctor and --dry-run are read-only: Python must not leave bytecode
+# caches either (Apple's python3 writes them under ~/Library/Caches).
+export PYTHONDONTWRITEBYTECODE=1
 
 BIN_DIR="$HOME/.local/bin"
 CONF_DIR="$HOME/.config/remote-agents"

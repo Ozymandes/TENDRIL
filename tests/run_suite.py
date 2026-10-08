@@ -9,7 +9,9 @@ Same tests as `python3 -m unittest discover -s tests`, plus:
   later hang or job timeout cannot swallow them;
 - a per-test watchdog: if one test runs longer than the timeout, every
   Python thread's stack is dumped (faulthandler), followed by the child
-  processes still running under this runner, then the run exits 3.
+  processes still running under this runner, then the run exits 3. If a
+  C call holds the GIL, faulthandler's own timer dumps the stacks 20s
+  later and exits 1 (the START line above names the test).
 Stdlib only; Python 3.9+.
 """
 import faulthandler
@@ -54,8 +56,12 @@ class Watchdog:
         self.timer = threading.Timer(TIMEOUT, self.fire, args=(name,))
         self.timer.daemon = True
         self.timer.start()
+        # Backstop that needs no GIL: a C call that blocks while holding it
+        # (termios.tcsetattr on Python 3.9) starves the thread above.
+        faulthandler.dump_traceback_later(TIMEOUT + 20, exit=True)
 
     def cancel(self):
+        faulthandler.cancel_dump_traceback_later()
         if self.timer:
             self.timer.cancel()
             self.timer = None

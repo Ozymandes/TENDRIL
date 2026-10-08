@@ -7,6 +7,9 @@
 #   install --doctor              read-only system check (no fixes)
 
 set -u
+# --doctor and --dry-run are read-only: Python must not leave bytecode
+# caches either (Apple's python3 writes them under ~/Library/Caches).
+export PYTHONDONTWRITEBYTECODE=1
 
 # resolve a symlinked installer without GNU `readlink -f`
 SELF=$0

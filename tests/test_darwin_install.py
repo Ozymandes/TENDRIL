@@ -411,6 +411,26 @@ class SwitchingOnClaimedDigits(FakeDarwin):
         self.assertEqual(after[len(before):], '\n[keys.indexed]\ntabs = "ctrl"\n')
 
 
+class NoBytecodeLeftBehind(FakeDarwin):
+    """--doctor/--dry-run are read-only, including Python's bytecode
+    caches: Apple's python3 writes them under ~/Library/Caches (seen on
+    the macOS runner), others next to the sources in the checkout."""
+
+    def test_doctor_and_dry_run_write_no_pycache_into_the_checkout(self):
+        pkg = os.path.join(self.tmp, "checkout copy")
+        for d in ("bin", "systemd", "phone", "config"):
+            shutil.copytree(os.path.join(REPO, d), os.path.join(pkg, d),
+                            ignore=shutil.ignore_patterns("__pycache__"))
+        for f in ("install", "uninstall"):
+            shutil.copy2(os.path.join(REPO, f), os.path.join(pkg, f))
+        self.run_script(os.path.join(pkg, "install"), ["--doctor"], [])
+        self.run_script(os.path.join(pkg, "install"), ["--dry-run"],
+                        DryRunDarwin.ANSWERS)
+        caches = [r for r, dirs, _ in os.walk(pkg) if "__pycache__" in dirs]
+        self.assertEqual(caches, [])
+        self.assertEqual(self.walk_home(), [])
+
+
 class DoctorDarwin(FakeDarwin):
     def test_doctor_is_read_only_and_darwin_native(self):
         p = self.run_script(INSTALL, ["--doctor"], [])

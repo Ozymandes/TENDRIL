@@ -4,12 +4,14 @@ import importlib.util
 import io
 import os
 import pty
+import select
 import shutil
 import signal
 import subprocess
 import sys
 import termios
 import tempfile
+import threading
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -30,11 +32,37 @@ def load_cli():
 ra = load_cli()
 
 
+def tty_settings(fd):
+    """termios attributes minus PENDIN: macOS's kernel sets that status bit
+    itself when canonical mode returns with input pending; it is not a
+    setting anyone chose, so restore checks ignore it."""
+    attrs = termios.tcgetattr(fd)
+    attrs[3] &= ~getattr(termios, "PENDIN", 0)
+    return attrs
+
+
 class KeyReader(unittest.TestCase):
     def setUp(self):
         self.master, self.slave = pty.openpty()
+        # A real terminal always reads what the tty echoes. Without a
+        # reader, restoring with TCSADRAIN waits forever on macOS for that
+        # echo to drain (Linux returns at once for ptys).
+        self._stop = threading.Event()
+        self._drain = threading.Thread(target=self._read_output, daemon=True)
+        self._drain.start()
+
+    def _read_output(self):
+        while not self._stop.is_set():
+            try:
+                r, _, _ = select.select([self.master], [], [], 0.05)
+                if r:
+                    os.read(self.master, 4096)
+            except OSError:
+                return
 
     def tearDown(self):
+        self._stop.set()
+        self._drain.join(2)
         os.close(self.master)
         os.close(self.slave)
 
@@ -53,23 +81,23 @@ class KeyReader(unittest.TestCase):
         self.assertEqual(self.read(bytes([27])), "escape")
 
     def test_terminal_modes_restore_after_success_and_exception(self):
-        original = termios.tcgetattr(self.slave)
+        original = tty_settings(self.slave)
         with ra.raw_terminal(self.slave):
-            self.assertNotEqual(termios.tcgetattr(self.slave), original)
-        self.assertEqual(termios.tcgetattr(self.slave), original)
+            self.assertNotEqual(tty_settings(self.slave), original)
+        self.assertEqual(tty_settings(self.slave), original)
 
         with self.assertRaisesRegex(RuntimeError, "boom"):
             with ra.raw_terminal(self.slave):
                 raise RuntimeError("boom")
-        self.assertEqual(termios.tcgetattr(self.slave), original)
+        self.assertEqual(tty_settings(self.slave), original)
 
     def test_numeric_input_supports_multi_digit_and_backspace_and_restores_tty(self):
-        original = termios.tcgetattr(self.slave)
+        original = tty_settings(self.slave)
         output = io.StringIO()
         with mock.patch.object(ra.sys, "stdout", output):
             os.write(self.master, b"123" + bytes([127]) + b"4" + bytes([13]))
             self.assertEqual(ra.read_menu_action(True, self.slave), ("line", "124"))
-        self.assertEqual(termios.tcgetattr(self.slave), original)
+        self.assertEqual(tty_settings(self.slave), original)
 
     def test_enter_and_footer_keys_are_distinct_actions(self):
         with mock.patch.object(ra.sys, "stdout", io.StringIO()):
@@ -553,7 +581,7 @@ class CtrlHomeBridge(unittest.TestCase):
                  "mod.attach({'id': 'w-test', 'label': 'test'})\n"
                  if through_attach else "mod._attach_session()\n"))
         master, slave = pty.openpty()
-        orig = termios.tcgetattr(slave)   # before the driver can go raw
+        orig = tty_settings(slave)   # before the driver can go raw
         env = dict(os.environ)
         for key in ("TERMUX_VERSION", "TENDRIL_DETACH_BRIDGE", "HERDR_ENV"):
             env.pop(key, None)
@@ -616,7 +644,7 @@ class CtrlHomeBridge(unittest.TestCase):
         self.assertIn(b"1b5b48", out)        # HOME forwarded verbatim
         self.assertIn(b"1b5b481b64", out)    # ...then ESC d (the detach)
         self.assertEqual(proc.wait(10), 0)   # session exit reaped cleanly
-        self.assertEqual(termios.tcgetattr(slave), orig)
+        self.assertEqual(tty_settings(slave), orig)
 
     def test_clean_host_attach_uses_real_bridge_and_translates_ctrl_home(self):
         stub = self.ECHO_STUB.replace("buf = b''\n",
@@ -630,7 +658,7 @@ class CtrlHomeBridge(unittest.TestCase):
         out = self._read_until(master, lambda data: b"1b64" in data)
         self.assertIn(b"1b64", out)
         self.assertEqual(proc.wait(10), 0)
-        self.assertEqual(termios.tcgetattr(slave), orig)
+        self.assertEqual(tty_settings(slave), orig)
 
     def test_held_partial_sequence_flushes_when_input_goes_idle(self):
         """A cancelled combo must not hold bytes until the next keystroke:

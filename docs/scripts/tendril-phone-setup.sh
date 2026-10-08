@@ -226,7 +226,7 @@ echo; echo "6) Installing the phone launchers and deep-link helper..."
 # Fetch into a fresh directory, then REPLACE each file: copying straight onto
 # ~/bin would write through an old `agent -> tendril` symlink and leave the
 # agent wrapper in place of the launcher.
-mkdir -p ~/bin
+mkdir -p "$HOME/bin"
 STAGE=$(mktemp -d "${TMPDIR:-$HOME}/tendril-launchers.XXXXXX")
 if scp -q "$ALIAS:$REPO/phone/tendril" "$ALIAS:$REPO/phone/agent" \
         "$ALIAS:$REPO/phone/termux-url-opener" "$STAGE/" 2>/dev/null; then
@@ -241,7 +241,7 @@ fi
 grep -q '^# tendril — TENDRIL' "$STAGE/tendril" && grep -q '^# agent — compatibility alias' "$STAGE/agent" \
     || { echo "   downloaded launchers look wrong - not installing them"; rm -rf "$STAGE"; exit 1; }
 for f in tendril agent termux-url-opener; do
-    rm -f ~/bin/$f && mv "$STAGE/$f" ~/bin/$f
+    rm -f "$HOME/bin/$f" && mv "$STAGE/$f" "$HOME/bin/$f"
 done
 rmdir "$STAGE" 2>/dev/null
 chmod 700 ~/bin/tendril ~/bin/agent ~/bin/termux-url-opener
