@@ -1,14 +1,33 @@
 #!/bin/sh
 # TENDRIL installer — user-local, interactive, never runs sudo.
-#   install              interactive install
-#   install --dry-run    preview every write, change nothing
-#   install --doctor     read-only system check (no fixes)
+# Linux and macOS hosts; any POSIX sh (dash, bash 3.2 as macOS /bin/sh).
+#   install                       host install (Herdr + agents live here)
+#   install --client              operator install: `tendril` connects to a host
+#   install [--client] --dry-run  preview every write, change nothing
+#   install --doctor              read-only system check (no fixes)
 
 set -u
 
-PKG_DIR=$(CDPATH= cd -- "$(dirname -- "$(readlink -f "$0")")" && pwd)
-MODE="${1:-install}"
+# resolve a symlinked installer without GNU `readlink -f`
+SELF=$0
+while [ -L "$SELF" ]; do
+    LINK=$(readlink "$SELF")
+    case $LINK in /*) SELF=$LINK ;; *) SELF=$(dirname -- "$SELF")/$LINK ;; esac
+done
+PKG_DIR=$(CDPATH='' cd -- "$(dirname -- "$SELF")" && pwd -P)
+HOST_HELPER="$PKG_DIR/bin/tendril_host.py"
+MODE=install
 DRY_RUN=0
+for arg in "$@"; do
+    case $arg in
+        --dry-run) DRY_RUN=1 ;;
+        --doctor)  MODE=doctor ;;
+        --client)  MODE=client ;;
+        -h|--help) sed -n '2,8p' "$PKG_DIR/install"; exit 0 ;;
+        *) printf 'unknown option: %s (see --help)\n' "$arg" >&2; exit 2 ;;
+    esac
+done
+OS=$(uname -s)          # messages only; behaviour follows capabilities
 
 say() { printf '%s\n' "$*"; }
 hr()  { say "------------------------------------------------------------"; }
@@ -16,6 +35,28 @@ row() { printf '%-14s %s\n' "$1" "$2"; }
 ask() { printf '%s [%s] ' "$1" "$2" >&2; read -r ans; [ -n "$ans" ] && printf '%s' "$ans" || printf '%s' "$2"; }
 confirm() { printf '%s [y/N] ' "$1"; read -r ans; [ "$ans" = "y" ] || [ "$ans" = "Y" ]; }
 backup() { [ "$DRY_RUN" = "1" ] && return 0; [ -f "$1" ] && cp -p "$1" "$1.bak.$(date +%s)"; }
+# single-quote for display in copy-paste instructions (spaces are common on macOS)
+shq() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+# host aliases/names end up in ~/.ssh/config and argv: keep them boring
+valid_name() { case $1 in "" | -* | *[!A-Za-z0-9._-]*) return 1 ;; esac; return 0; }
+ask_name() {
+    while :; do
+        v=$(ask "$1" "$2")
+        valid_name "$v" && { printf '%s' "$v"; return 0; }
+        say "  use letters, digits, . _ - only (no leading -)" >&2
+        [ -t 0 ] || return 1
+    done
+}
+# the package manager actually present, for copy-paste hints only
+pkg_hint() {
+    if command -v brew >/dev/null 2>&1; then printf 'brew install %s' "$*"
+    elif command -v pacman >/dev/null 2>&1; then printf 'sudo pacman -S %s' "$*"
+    elif command -v apt-get >/dev/null 2>&1; then printf 'sudo apt install %s' "$*"
+    elif command -v dnf >/dev/null 2>&1; then printf 'sudo dnf install %s' "$*"
+    elif [ "$OS" = Darwin ]; then printf 'install Homebrew (https://brew.sh), then: brew install %s' "$*"
+    else printf 'install with your package manager: %s' "$*"
+    fi
+}
 act() {
     desc=$1; shift
     if [ "$DRY_RUN" = "1" ]; then
@@ -28,6 +69,7 @@ act() {
 doctor() {
     say "TENDRIL // SYSTEM CHECK"
     say ""
+    row "Platform" "$OS $(uname -m)"
     if command -v python3 >/dev/null 2>&1; then
         row "Python" "OK ($(python3 -V 2>&1))"
     else
@@ -51,11 +93,22 @@ doctor() {
         printf '%s\n' "$HERDR_CHECK" | sed 's/^/                /'
     fi
 
-    TIP=$(tailscale ip -4 2>/dev/null | head -1)
+    TIP=$(python3 "$HOST_HELPER" tailscale-ip 2>/dev/null)
     if [ -n "$TIP" ]; then row "Tailscale" "ACTIVE ($TIP)"; else row "Tailscale" "DOWN / NOT INSTALLED"; fi
 
     command -v ssh  >/dev/null 2>&1 && row "SSH"  "OK"  || row "SSH"  "MISSING"
+    if python3 "$HOST_HELPER" ssh-server >/dev/null 2>&1; then
+        row "SSH server" "LISTENING (port 22)"
+    else
+        row "SSH server" "NOT LISTENING - $(sshd_hint)"
+    fi
     command -v mosh >/dev/null 2>&1 && row "Mosh" "OK"  || row "Mosh" "MISSING (optional, recommended)"
+    if python3 "$HOST_HELPER" remote-path check >/dev/null 2>&1; then
+        row "Remote PATH" "OK (ssh/mosh sessions find remote-agents)"
+    else
+        row "Remote PATH" "INCOMPLETE - re-run ./install (step 3b)"
+        python3 "$HOST_HELPER" remote-path check 2>/dev/null | sed 's/^/                /'
+    fi
 
     for a in pi claude codex; do
         LABEL=$(printf '%s' "$a" | cut -c1 | tr 'a-z' 'A-Z')$(printf '%s' "$a" | cut -c2-)
@@ -63,27 +116,120 @@ doctor() {
     done
 
     if [ -f "$HOME/.config/remote-agents/notify.env" ] \
-       && grep -q '^NTFY_TOPIC=..\+' "$HOME/.config/remote-agents/notify.env" 2>/dev/null; then
+       && grep -q '^NTFY_TOPIC=..*' "$HOME/.config/remote-agents/notify.env" 2>/dev/null; then
         row "Push" "ACTIVE"
     else
         row "Push" "NOT CONFIGURED"
     fi
 
-    if systemctl --user is-active herdr-notify.service 2>/dev/null | grep -q active; then
-        row "Watcher" "RUNNING"
-    else
-        row "Watcher" "STOPPED"
-    fi
+    WATCH=$(python3 "$HOST_HELPER" service status 2>/dev/null)
+    case $WATCH in
+        running*) row "Watcher" "RUNNING ${WATCH#running }" ;;
+        not\ installed*) row "Watcher" "NOT INSTALLED ${WATCH#not installed } - ./install step 5" ;;
+        "")       row "Watcher" "NO SERVICE MANAGER (run herdr-notify by hand)" ;;
+        no\ service*) row "Watcher" "NO SERVICE MANAGER (run herdr-notify by hand)" ;;
+        *)        row "Watcher" "STOPPED ($WATCH)" ;;
+    esac
     return 0
 }
 
-[ "$MODE" = "--doctor" ] && doctor && exit 0
+sshd_hint() {
+    if [ "$OS" = Darwin ]; then
+        printf 'enable System Settings > General > Sharing > Remote Login'
+    else
+        printf 'enable your sshd (e.g. systemctl enable --now sshd)'
+    fi
+}
 
-if [ "$MODE" = "--dry-run" ]; then DRY_RUN=1; fi
+[ "$MODE" = doctor ] && doctor && exit 0
 
 BIN_DIR="$HOME/.local/bin"
 CONF_DIR="$HOME/.config/remote-agents"
-SYSTEMD_DIR="$HOME/.config/systemd/user"
+CLIENT_CONF_DIR="$HOME/.config/tendril"
+
+# python3 must really run: on a fresh Mac /usr/bin/python3 is only a stub
+# that offers to install the Command Line Tools.
+python_ok() {
+    [ -n "${PYTHON:-}" ] && "$PYTHON" -c 'import sys; sys.exit(sys.version_info < (3, 9))' >/dev/null 2>&1
+}
+python_missing() {
+    say "  MISSING: python3 >= 3.9 is required (the installer never installs packages)."
+    if [ "$OS" = Darwin ]; then
+        say "  macOS: run  xcode-select --install  (Command Line Tools ship python3),"
+        say "         or:  $(pkg_hint python)"
+    else
+        say "  e.g.:  $(pkg_hint python3)"
+    fi
+    exit 1
+}
+path_hint() {
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) ;;
+        *) say "  note: $BIN_DIR is not on your PATH. Add to your shell profile:"
+           say "        export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+    esac
+}
+
+# ---------------- client mode: this machine operates a remote host ----------------
+client_install() {
+    hr; say "TENDRIL // CLIENT SETUP"; say "this machine attaches to a TENDRIL host over SSH (Mosh when available)"; hr
+    [ "$DRY_RUN" = "1" ] && say "(dry-run: nothing will be written)"; say ""
+    say "1) Dependency check"
+    if command -v ssh >/dev/null 2>&1; then say "  ssh     : ok"; else
+        say "  MISSING: ssh is required ($(pkg_hint openssh))"; exit 1; fi
+    if command -v mosh >/dev/null 2>&1; then say "  mosh    : ok (preferred; SSH is the fallback)"; else
+        say "  mosh    : not found - SSH only. Optional: $(pkg_hint mosh)"; fi
+    say ""
+    say "2) Host"
+    say "  The SSH alias from ~/.ssh/config that reaches your TENDRIL host."
+    CUR=""
+    [ -r "$CLIENT_CONF_DIR/alias" ] && IFS= read -r CUR < "$CLIENT_CONF_DIR/alias"
+    CALIAS=$(ask_name "SSH alias of the TENDRIL host" "${TENDRIL_ALIAS:-$CUR}") || {
+        say "  no valid alias given"; exit 1; }
+    say ""
+    say "3) Install files"
+    NAME=tendril
+    if [ -L "$BIN_DIR/tendril" ] && [ "$(readlink "$BIN_DIR/tendril")" = "remote-agents" ]; then
+        NAME=tendril-remote          # this machine is also a host: keep its console
+        say "  $BIN_DIR/tendril is this machine's host console; the client is $NAME"
+    elif [ -e "$BIN_DIR/tendril" ] && ! grep -q 'TENDRIL client launcher' "$BIN_DIR/tendril" 2>/dev/null; then
+        NAME=tendril-remote
+        say "  kept existing $BIN_DIR/tendril (not ours); the client is $NAME"
+    fi
+    act "create $BIN_DIR and $CLIENT_CONF_DIR" mkdir -p "$BIN_DIR" "$CLIENT_CONF_DIR" || exit 1
+    if [ "$DRY_RUN" = "1" ]; then
+        say "  [dry-run] install $BIN_DIR/$NAME (phone/tendril with a #!/bin/sh shebang)"
+        say "  [dry-run] write $CLIENT_CONF_DIR/alias: $CALIAS"
+    else
+        TMP=$(mktemp "$BIN_DIR/.tendril-client.XXXXXX") || exit 1
+        { printf '#!/bin/sh\n'; sed '1d' "$PKG_DIR/phone/tendril"; } > "$TMP" \
+            && chmod 755 "$TMP" && mv -f "$TMP" "$BIN_DIR/$NAME" || { rm -f "$TMP"; exit 1; }
+        say "  installed $BIN_DIR/$NAME"
+        printf '%s\n' "$CALIAS" > "$CLIENT_CONF_DIR/alias" && chmod 600 "$CLIENT_CONF_DIR/alias"
+        say "  default host: $CALIAS  ($CLIENT_CONF_DIR/alias; TENDRIL_ALIAS overrides)"
+    fi
+    path_hint
+    say ""
+    say "4) Key check"
+    if [ "$DRY_RUN" = "1" ]; then
+        say "  [dry-run] ssh -o BatchMode=yes $CALIAS true"
+    elif ssh -o ConnectTimeout=5 -o BatchMode=yes "$CALIAS" true 2>/dev/null; then
+        say "  key login to $CALIAS: ok"
+    else
+        say "  key login to $CALIAS failed. One-time setup:"
+        say "    ssh-keygen -t ed25519            # if you have no key yet"
+        say "    ssh-copy-id $CALIAS"
+        say "  and make sure ~/.ssh/config has a 'Host $CALIAS' entry (docs/MACOS.md)."
+    fi
+    say ""
+    hr
+    say "Done.  $NAME                  open the TENDRIL console on $CALIAS"
+    say "       $NAME attach w15       jump straight into a workspace"
+    say "       $NAME <alias>          another host;  $NAME ssh <alias> skips Mosh"
+    hr
+    exit 0
+}
+[ "$MODE" = client ] && client_install
 
 hr; say "TENDRIL // INSTALLER"; say "a thin mobile control plane for persistent AI agents"; hr
 [ "$DRY_RUN" = "1" ] && say "(dry-run: nothing will be written)"; say ""
@@ -91,30 +237,28 @@ hr; say "TENDRIL // INSTALLER"; say "a thin mobile control plane for persistent 
 # ---------------- 1. dependencies ----------------
 say "1) Dependency check"
 PYTHON=$(command -v python3 || true)
-if [ -z "$PYTHON" ]; then
-    say "  MISSING: python3 is required."
-    say "  Install it first, e.g.:  sudo pacman -S python   (Arch)"
-    say "  (the installer never installs packages for you)"
-    exit 1
-fi
-say "  python3 : ok ($PYTHON)"
+python_ok || python_missing
+say "  python3 : ok ($PYTHON, $("$PYTHON" -V 2>&1))"
+say "  host    : $OS $(uname -m)"
 say "  herdr   : probing candidates (protocol-checked)..."
 HERDR_CHECK=$("$PKG_DIR/bin/remote-agents" --detect 2>&1) || true
 printf '%s\n' "$HERDR_CHECK" | sed 's/^/    /'
 HERDR_BIN=$(printf '%s\n' "$HERDR_CHECK" | sed -n 's/^chosen: //p')
 if [ -z "$HERDR_BIN" ]; then
     say "  MISSING: no protocol-compatible herdr client found."
-    say "  Install Herdr 0.9.x for your user, e.g.:"
-    say "    curl -fsSL https://herdr.dev/install.sh | sh"
+    say "  Install Herdr 0.9.3 or newer for your user (Linux or macOS), e.g.:"
+    say "    curl -fsSL https://herdr.dev/install.sh | sh     # -> ~/.local/bin/herdr"
+    command -v brew >/dev/null 2>&1 && say "    or: brew install herdr"
     say "  then re-run this installer."
     exit 1
 fi
 for tool in ssh tailscale mosh; do
-    if command -v "$tool" >/dev/null 2>&1; then
+    if command -v "$tool" >/dev/null 2>&1 \
+       || { [ "$tool" = tailscale ] && python3 "$HOST_HELPER" tailscale-ip >/dev/null 2>&1; }; then
         say "  $tool    : ok"
     else
         say "  $tool    : NOT FOUND (optional; mobile access needs ssh+mosh."
-        say "            install it yourself, e.g.: sudo pacman -S openssh mosh tailscale)"
+        say "            install it yourself, e.g.: $(pkg_hint "$tool"))"
     fi
 done
 for agent in pi claude codex; do
@@ -128,8 +272,8 @@ say ""
 say "2) Configuration"
 DEFAULT_ROOTS="$HOME/Projects:$HOME/src:$HOME/dev:$HOME/code"
 ROOTS=$(ask "Project roots to scan (colon-separated)" "$DEFAULT_ROOTS")
-TSHOST=$(ask "Tailscale hostname of this machine" "$(uname -n)")
-ALIAS=$(ask  "SSH alias the phone will use" "$TSHOST")
+TSHOST=$(ask_name "Tailscale hostname of this machine" "$(python3 "$HOST_HELPER" hostname)") || exit 1
+ALIAS=$(ask_name "SSH alias the phone will use" "$TSHOST") || exit 1
 say ""
 
 # ---------------- 3. write config + bins ----------------
@@ -145,7 +289,7 @@ else
     printf '%s\n' "$CONF_BODY" > "$CONFIG"
     chmod 600 "$CONFIG"
 fi
-for f in remote-agents herdr-notify tendril_link.py; do
+for f in remote-agents herdr-notify tendril_link.py tendril_host.py; do
     [ -f "$BIN_DIR/$f" ] && backup "$BIN_DIR/$f"
     act "install $BIN_DIR/$f" install -m 755 "$PKG_DIR/bin/$f" "$BIN_DIR/$f"
 done
@@ -155,10 +299,33 @@ if [ -e "$BIN_DIR/tendril" ] && [ ! -L "$BIN_DIR/tendril" ]; then
 else
     act "link $BIN_DIR/tendril -> remote-agents" ln -sfn remote-agents "$BIN_DIR/tendril"
 fi
+path_hint
+say ""
+
+# ---------------- 3b. remote session PATH ----------------
+# Phones run `remote-agents` (and Mosh runs `mosh-server`) in a
+# non-interactive shell that may not read the profile that puts
+# ~/.local/bin / Homebrew on PATH - the default on macOS.
+say "3b) Remote session PATH (what SSH/Mosh commands can find)"
+if [ "$DRY_RUN" = "1" ]; then
+    say "  [dry-run] python3 $HOST_HELPER remote-path check (after install)"
+elif python3 "$HOST_HELPER" remote-path check >/dev/null 2>&1; then
+    say "  ok - SSH and Mosh sessions find remote-agents"
+else
+    python3 "$HOST_HELPER" remote-path check | sed 's/^/  /'
+    say "  A small managed block (marked '# >>> tendril remote PATH') prepends"
+    say "  ~/.local/bin and Homebrew's bin to PATH; the files are backed up first:"
+    python3 "$HOST_HELPER" remote-path plan | sed 's/^ *\[dry-run\] /    /'
+    if confirm "Add the managed PATH block?"; then
+        python3 "$HOST_HELPER" remote-path apply
+    else
+        say "  skipped - phones can set REMOTE_AGENTS_BIN=$BIN_DIR/remote-agents instead"
+    fi
+fi
 say ""
 
 # ---------------- 4. notifications (optional) ----------------
-say "4) Push notifications (ntfy -> Android), optional"
+say "4) Push notifications (ntfy -> Android / iPhone), optional"
 if confirm "Configure ntfy push now?"; then
     TOPIC=$(python3 -c 'import secrets; print("tendril-" + secrets.token_urlsafe(12))')
     say ""
@@ -178,28 +345,31 @@ if confirm "Configure ntfy push now?"; then
     fi
 else
     say "  skipped - create $CONF_DIR/notify.env later (see config/notify.env.example),"
-    say "  then: systemctl --user restart herdr-notify"
+    say "  then: tendril service restart"
 fi
 say ""
 
-# ---------------- 5. systemd watcher (optional) ----------------
-say "5) Notification watcher (systemd --user)"
-if command -v systemctl >/dev/null 2>&1 && [ -n "${XDG_RUNTIME_DIR:-}" ] \
-   && systemctl --user is-system-running >/dev/null 2>&1; then
-    if confirm "Install and start herdr-notify.service (user unit)?"; then
-        act "install $SYSTEMD_DIR/herdr-notify.service" \
-            install -m 600 "$PKG_DIR/systemd/herdr-notify.service" \
-                           "$SYSTEMD_DIR/herdr-notify.service"
-        act "daemon-reload" systemctl --user daemon-reload
-        act "enable --now herdr-notify.service" \
-            systemctl --user enable --now herdr-notify.service
-    else
-        say "  skipped - unit lives at $PKG_DIR/systemd/, enable later with:"
-        say "    install -Dm600 $PKG_DIR/systemd/herdr-notify.service $SYSTEMD_DIR/herdr-notify.service"
-        say "    systemctl --user daemon-reload && systemctl --user enable --now herdr-notify"
-    fi
+# ---------------- 5. notification watcher (optional) ----------------
+# systemd user unit on Linux, launchd LaunchAgent on macOS - whichever
+# service manager this host actually has.
+WATCH=$(python3 "$HOST_HELPER" service status 2>/dev/null); WATCH_RC=$?
+WATCH_MGR=$(printf '%s' "$WATCH" | sed -n 's/.*(\(.*\))$/\1/p')
+say "5) Notification watcher (${WATCH_MGR:-no service manager})"
+if [ "$WATCH_RC" = "3" ] || [ -z "$WATCH_MGR" ]; then
+    say "  no launchd or user systemd session detected - skipped."
+    say "  run it by hand when needed:  herdr-notify"
 else
-    say "  no user systemd session detected - skipped."
+    [ -n "$WATCH" ] && say "  current: $WATCH"
+    if confirm "Install and start the herdr-notify watcher ($WATCH_MGR, user-level)?"; then
+        if [ "$DRY_RUN" = "1" ]; then
+            python3 "$HOST_HELPER" service install --pkg "$PKG_DIR" --python "$PYTHON" --dry-run
+        else
+            python3 "$HOST_HELPER" service install --pkg "$PKG_DIR" --python "$PYTHON"
+        fi
+        say "  manage it later with:  tendril service status|restart|stop|logs"
+    else
+        say "  skipped - enable later by re-running ./install (step 5)"
+    fi
 fi
 say ""
 
@@ -441,21 +611,24 @@ say ""
 say "  ssh-copy-id $ALIAS && ssh $ALIAS    # must log in without a password"
 say "  set -e"
 say "  mkdir -p ~/bin ~/tendril-launchers"
-say "  scp $ALIAS:$PKG_DIR/phone/tendril ~/tendril-launchers/tendril"
-say "  scp $ALIAS:$PKG_DIR/phone/agent ~/tendril-launchers/agent"
+say "  scp $(shq "$ALIAS:$PKG_DIR/phone/tendril") ~/tendril-launchers/tendril"
+say "  scp $(shq "$ALIAS:$PKG_DIR/phone/agent") ~/tendril-launchers/agent"
 say "  rm -f ~/bin/tendril ~/bin/agent"
 say "  mv ~/tendril-launchers/tendril ~/bin/tendril"
 say "  mv ~/tendril-launchers/agent ~/bin/agent"
 say "  chmod 700 ~/bin/tendril ~/bin/agent && rmdir ~/tendril-launchers"
 say "  echo 'export PATH=\$HOME/bin:\$PATH' >> ~/.bashrc"
-say "  echo 'TENDRIL_ALIAS=$ALIAS' >> ~/.bashrc && source ~/.bashrc"
+say "  echo 'export TENDRIL_ALIAS=$ALIAS' >> ~/.bashrc && source ~/.bashrc"
 say ""
 say "  hash -r && command -v tendril && command -v agent"
 say "  tendril              # TENDRIL console"
 say ""
 say "  (the phone generates its own key; private keys are never copied)"
 say ""
+say "iPhone (Blink Shell): docs/IOS_BLINK.md - same host alias, same commands."
+say "Mac / desktop client:  run ./install --client on that machine (docs/MACOS.md)."
+say ""
 hr
 say "Done. Host console:  tendril (= $BIN_DIR/remote-agents)   |   doctor:  $0 --doctor"
-say "Daily use from the phone:  tendril"
+say "Daily use from the phone:  tendril          watcher:  tendril service status"
 hr

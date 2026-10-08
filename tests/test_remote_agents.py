@@ -766,7 +766,7 @@ class DetachGate(unittest.TestCase):
         sys.stdin = test_stdin
         with mock.patch.object(
                 ra.subprocess, "run",
-                staticmethod(lambda args, check=False: attached.append(args))):
+                lambda args, check=False: attached.append(args)):
             try:
                 ra._attach_session()
             finally:

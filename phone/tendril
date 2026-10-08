@@ -1,14 +1,17 @@
 #!/data/data/com.termux/files/usr/bin/sh
-# tendril — TENDRIL phone launcher: connect to the host (Mosh preferred, SSH fallback).
+# tendril — TENDRIL client launcher: connect to the host (Mosh preferred, SSH fallback).
+# Termux runs this file as-is; `./install --client` installs it on macOS and
+# Linux desktops with a #!/bin/sh shebang. Plain POSIX sh, nothing else.
 # The phone/agent compatibility wrapper delegates to this launcher.
 #
-# One-time setup (see docs/ANDROID.md):
+# One-time setup (see docs/ANDROID.md, docs/MACOS.md):
 #   1. pkg install openssh mosh
 #   2. ssh-keygen -t ed25519   (dedicated Termux key; never share private keys)
 #   3. create ~/.ssh/config with your Host alias
 #   4. ssh-copy-id <alias>
 #   5. either pass the alias every time:  tendril <alias>
-#      or set it once in your profile:  TENDRIL_ALIAS=<alias>  (AGENT_ALIAS still works)
+#      or set it once in your profile:  export TENDRIL_ALIAS=<alias>  (AGENT_ALIAS works)
+#      or once in ~/.config/tendril/alias (one line; written by ./install --client)
 #
 # Usage:
 #   tendril              connect using $TENDRIL_ALIAS (or $AGENT_ALIAS)
@@ -16,13 +19,18 @@
 #   tendril ssh <alias>  force plain SSH (skip Mosh)
 #   tendril attach <id>          direct-attach session <id> on the default alias
 #   tendril <alias> attach <id>  direct-attach session <id> via an explicit alias
+#   tendril [<alias>] resolve|focus|link <id>
+#                                print JSON / focus headless / print the deep
+#                                link, over plain SSH (no TTY, no Mosh)
 #
 # <id> is anything `remote-agents attach` resolves on the host: the canonical
 # workspace id (w15), a pane id (w15:p1), the workspace number or an exact
 # label. Only A-Z a-z 0-9 . _ : - are accepted (max 128 chars), so the id can
 # be embedded single-quoted in the mosh/ssh remote command injection-proof.
 
-DEFAULT_ALIAS="${TENDRIL_ALIAS:-${AGENT_ALIAS:-}}"
+CONF_ALIAS=""
+[ -r "$HOME/.config/tendril/alias" ] && IFS= read -r CONF_ALIAS < "$HOME/.config/tendril/alias"
+DEFAULT_ALIAS="${TENDRIL_ALIAS:-${AGENT_ALIAS:-$CONF_ALIAS}}"
 ALIAS="${1:-$DEFAULT_ALIAS}"
 MODE=""
 ATTACH_ID=""
@@ -30,42 +38,52 @@ FORCE_SSH=""
 if [ "$1" = "ssh" ]; then
     ALIAS="${2:-$DEFAULT_ALIAS}"
     FORCE_SSH=1
-elif [ "$1" = "attach" ]; then
-    MODE=attach
-    ALIAS="$DEFAULT_ALIAS"
-    ATTACH_ID="$2"
-elif [ "${2:-}" = "attach" ]; then
-    MODE=attach
-    ALIAS="$1"
-    ATTACH_ID="$3"
+else
+    case "${1:-}" in
+        attach | resolve | focus | link)
+            MODE="$1"; ALIAS="$DEFAULT_ALIAS"; ATTACH_ID="${2:-}" ;;
+        *)
+            case "${2:-}" in
+                attach | resolve | focus | link)
+                    MODE="$2"; ALIAS="$1"; ATTACH_ID="${3:-}" ;;
+            esac ;;
+    esac
 fi
 REMOTE_BIN="${REMOTE_AGENTS_BIN:-remote-agents}"   # resolved on the HOST (login shell)
 REMOTE_CMD="$REMOTE_BIN"
 
-if [ "$MODE" = "attach" ]; then
+if [ -n "$MODE" ]; then
     BAD=""
     case "$ATTACH_ID" in
         "" | *[!A-Za-z0-9._:-]*) BAD=1 ;;
     esac
     [ "${#ATTACH_ID}" -le 128 ] || BAD=1
     if [ "$BAD" = "1" ]; then
-        echo "usage: tendril [<alias>] attach <session-id>"
+        echo "usage: tendril [<alias>] $MODE <session-id>"
         echo "  <session-id>: workspace id (w15), pane id (w15:p1), workspace number"
         echo "  or exact label; characters A-Z a-z 0-9 . _ : - only, max 128"
         exit 2
     fi
-    REMOTE_CMD="$REMOTE_BIN attach '$ATTACH_ID'"
+    REMOTE_CMD="$REMOTE_BIN $MODE '$ATTACH_ID'"
 fi
 
+case "$ALIAS" in
+    -*) echo "[tendril] '$ALIAS' is not an SSH alias (leading '-')"; exit 2 ;;
+esac
 if [ -z "$ALIAS" ]; then
-    echo "usage: tendril [<alias>] [attach <session-id>] | tendril ssh <alias>"
-    echo "first time: see docs/ANDROID.md — create a key, then: ssh-copy-id <alias>"
+    echo "usage: tendril [<alias>] [attach|resolve|focus|link <session-id>] | tendril ssh <alias>"
+    echo "first time: see docs/ANDROID.md or docs/MACOS.md — create a key, then: ssh-copy-id <alias>"
     exit 1
 fi
 
+# resolve/focus/link print a result and exit: one plain SSH round trip
+case "$MODE" in
+    resolve | focus | link) exec ssh "$ALIAS" "$REMOTE_CMD" ;;
+esac
+
 if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$ALIAS" true 2>/dev/null; then
     echo "[tendril] key-auth check failed for '$ALIAS'."
-    echo "  - is Tailscale connected on this phone?"
+    echo "  - is Tailscale connected on this device?"
     echo "  - first time? run: ssh $ALIAS   (accept host key, password once)"
     echo "  - then: ssh-copy-id $ALIAS"
     echo "[tendril] attempting interactive SSH anyway..."

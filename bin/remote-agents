@@ -52,7 +52,6 @@ PROJECT_ROOTS = _root_list("PROJECT_ROOTS",
                            ["~/Projects", "~/src", "~/dev", "~/code", "~"])
 NOTIFY_BIN = os.path.expanduser(CONFIG.get("NOTIFY_BIN")
                                 or "~/.local/bin/herdr-notify")
-HOST_LABEL = CONFIG.get("TAILSCALE_HOST") or os.uname().nodename
 
 # ---------- canonical deep links (tendril-link, installed next to us) ----------
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -60,9 +59,19 @@ try:
     import tendril_link          # payload/uri codec for session addresses
 except ImportError:              # stale install: the selector keeps working
     tendril_link = None
+try:
+    import tendril_host          # the few host facts/lifecycle verbs per OS
+except ImportError:
+    tendril_host = None
+
+HOST_LABEL = CONFIG.get("TAILSCALE_HOST") or (
+    tendril_host.short_hostname() if tendril_host else os.uname().nodename)
 
 
 # ---------- Herdr client detection (protocol-verified, newest-compatible) ----------
+HERDR_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
+
+
 def _herdr_candidates():
     out = []
     override = CONFIG.get("HERDR_BIN") or os.environ.get("HERDR_BIN")
@@ -71,6 +80,11 @@ def _herdr_candidates():
     found = shutil.which("herdr")
     if found:
         out.append(found)
+    # install.sh (~/.local/bin) and Homebrew locations: SSH/launchd PATHs omit them
+    for d in HERDR_DIRS:
+        p = os.path.join(os.path.expanduser(d), "herdr")
+        if os.path.isfile(p):
+            out.append(p)
     mise = os.path.expanduser("~/.local/share/mise/installs/herdr")
     latest = os.path.join(mise, "latest", "herdr")
     if os.path.isfile(latest):
@@ -102,12 +116,16 @@ def herdr_probe(path):
         v = subprocess.run([path, "--version"], capture_output=True,
                            text=True, timeout=6)
         version = (v.stdout or v.stderr).strip() or "(no version output)"
+    except subprocess.TimeoutExpired:
+        return False, "no answer to --version (timeout)"
     except OSError as e:
         return False, f"not runnable: {e}"
     try:
         s = subprocess.run([path, "status"], capture_output=True,
                            text=True, timeout=8)
         txt = (s.stdout or "") + (s.stderr or "")
+    except subprocess.TimeoutExpired:
+        return False, f"{version}; status timed out"
     except OSError as e:
         return False, f"{version}; status failed: {e}"
     running = re.search(r"status:\s*running", txt)
@@ -141,6 +159,8 @@ EXTRA_PATH = ":".join([
     os.path.expanduser("~/.local/share/mise/installs/pi/latest/pi"),
     os.path.expanduser("~/.local/share/mise/installs/claude/latest"),
     os.path.expanduser("~/.local/share/mise/installs/codex/latest/bin"),
+    "/opt/homebrew/bin",           # Homebrew (Apple Silicon / Intel): agents
+    "/usr/local/bin",              # installed there are absent from SSH PATH
 ])
 os.environ["PATH"] = os.environ.get("PATH", "") + ":" + EXTRA_PATH
 
@@ -154,8 +174,9 @@ SHORT = {"pi": "PI", "claude": "CL", "codex": "CX", "gemini": "GE",
 def terminal_name(env=None):
     """'termux' | 'blink' | generic terminal family name.
 
-    Termux self-identifies (TERMUX_VERSION, forwarded by its ssh).
-    Everything else is opt-in: users who want terminal-aware hints set
+    TERMUX_VERSION only arrives when the user forwards it (ssh SendEnv /
+    AcceptEnv): stock OpenSSH sends just TERM and LC_*, and mosh only its
+    colour count and locale. Everything else is opt-in: users who want terminal-aware hints set
     TENDRIL_TERMINAL=blink (Blink Shell) — Blink sends no distinguishing
     env over SSH. Unknown values pass through as-is so future clients
     need no code change."""
@@ -174,7 +195,10 @@ def pick_palette(colorterm):
     (COLORTERM), else the nearest 256-colour approximations. mosh < 1.4
     silently drops 38;2;r;g;b sequences (Ubuntu 22.04 ships 1.3.2), which
     rendered the whole phone UI monochrome; the 256-colour entries survive
-    every transport."""
+    every transport. COLORTERM proves the terminal, not the transport: a
+    COLORTERM forwarded into mosh < 1.4 still loses 38;2. Desktop terminals
+    need no special case: Apple Terminal sets no COLORTERM (256 colours);
+    iTerm2, Ghostty, WezTerm and kitty advertise truecolor."""
     if (colorterm or "").lower() in ("truecolor", "24bit"):
         return ("\033[38;2;203;253;117m", "\033[38;2;47;179;196m",
                 "\033[38;2;112;128;136m", "\033[38;2;232;92;111m")
@@ -351,8 +375,15 @@ def line(w, ch="\u2500"):
     return ch * w
 
 
+def tailscale_cli():
+    """PATH first, then the macOS app bundle's CLI."""
+    if tendril_host:
+        return tendril_host.tailscale_cli() or "tailscale"
+    return "tailscale"
+
+
 def tailscale_parts():
-    rc, out, _ = run(["tailscale", "ip", "-4"], 4)
+    rc, out, _ = run([tailscale_cli(), "ip", "-4"], 4)
     if rc == 0 and out.strip():
         return "ACTIVE", out.strip().splitlines()[0]
     return "DOWN", ""
@@ -1082,6 +1113,8 @@ def help_screen():
                       "these hints."]
     else:
         notes[1:1] = ["Ctrl+Home bridge: default on.",
+                      "Mac: Fn+Ctrl+Left = Ctrl+Home.",   # stock Terminal/iTerm2
+                      "No Home key? Ctrl+B then D.",      # send neither combo
                       "Disable on host with:",
                       "TENDRIL_DETACH_BRIDGE=0",
                       "(false/no/off/empty also disable)."]
@@ -1104,24 +1137,18 @@ def help_screen():
 
 
 def info():
-    host = os.uname().nodename
-    rc, ip, _ = run(["tailscale", "ip", "-4"], 4)
-    ts = ip.strip().splitlines()[0] if rc == 0 and ip.strip() else "down"
-    _, up, _ = run(["uptime", "-p"], 3)
-    load = open("/proc/loadavg").read().split()[:3]
-    mem = {}
-    for ln in open("/proc/meminfo"):
-        k, v = ln.split(":")
-        mem[k] = int(v.split()[0]) // 1024
-    disk = run(["df", "-h", "/"], 3)[1].splitlines()[-1].split()
-    bat = ""
-    for b in ("/sys/class/power_supply/BAT0/capacity",
-              "/sys/class/power_supply/BAT1/capacity"):
-        try:
-            bat = open(b).read().strip() + "%"
-            break
-        except OSError:
-            pass
+    host = tendril_host.short_hostname() if tendril_host else os.uname().nodename
+    status, ip = tailscale_parts()
+    ts = ip if status == "ACTIVE" else "down"
+    if tendril_host:
+        up = tendril_host.format_uptime(tendril_host.uptime_seconds(run))
+        load = tendril_host.load_average()
+        mem = tendril_host.memory_mb(run)
+        bat = tendril_host.battery(run)
+    else:
+        up, load, mem, bat = "?", ("?", "?", "?"), None, ""
+    disk = run(["df", "-h", "/"], 3)[1].splitlines()[-1:] or [""]
+    disk = disk[0].split()
     rows = collect() or []
     nws = len(rows)
     counts = {}
@@ -1129,17 +1156,19 @@ def info():
         for a in r["agents"]:
             counts[a.get("agent", "?")] = counts.get(a.get("agent", "?"), 0) + 1
     agents = " ".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "none"
+    memtxt = f"{mem[0]}/{mem[1]}M free" if mem else "n/a"
     print(f"{C_LIME}{host}{C_RESET}  {C_GRAY}tailscale{C_RESET} {C_TEAL}{ts}{C_RESET}"
           f"  {C_GRAY}battery {bat or 'n/a'}{C_RESET}")
-    print(f"{C_GRAY}up {up.strip()}{C_RESET}")
+    print(f"{C_GRAY}up {up}{C_RESET}")
     print(f"{C_GRAY}load {load[0]} {load[1]} {load[2]}   "
-          f"mem {mem['MemAvailable']}/{mem['MemTotal']}M free   "
-          f"disk {disk[2]} used{C_RESET}")
+          f"mem {memtxt}   "
+          f"disk {disk[2] if len(disk) > 2 else '?'} used{C_RESET}")
     print(f"{C_GRAY}herdr {nws} workspaces   agents {agents}{C_RESET}")
     env_ok = os.path.isfile(os.path.expanduser("~/.config/remote-agents/notify.env"))
     push = f"{C_TEAL}ACTIVE{C_RESET}" if env_ok else f"{C_GRAY}NOT CONFIGURED{C_RESET}"
-    rc_n, _, _ = run(["systemctl", "--user", "is-active", "herdr-notify"], 3)
-    watch = f"{C_TEAL}RUNNING{C_RESET}" if rc_n == 0 else f"{C_GRAY}STOPPED{C_RESET}"
+    svc = tendril_host.backend(run) if tendril_host else None
+    running = bool(svc) and svc.status() == "running"
+    watch = f"{C_TEAL}RUNNING{C_RESET}" if running else f"{C_GRAY}STOPPED{C_RESET}"
     print(f"{C_GRAY}Push       {push}{C_RESET}   {C_GRAY}Watcher    {watch}{C_RESET}")
     print(f"{C_GRAY}press any key to continue...{C_RESET}", end="", flush=True)
     wait_for_key()
@@ -1379,6 +1408,23 @@ def _run_subcommand(cmd, token):
     return 0
 
 
+SERVICE_VERBS = ("status", "start", "stop", "restart", "logs")
+
+
+def _service(args):
+    """`tendril service <verb>`: the notification watcher, on whichever
+    service manager this host has (launchd LaunchAgent / systemd user unit)."""
+    if len(args) != 1 or args[0] not in SERVICE_VERBS:
+        print("usage: remote-agents service " + "|".join(SERVICE_VERBS),
+              file=sys.stderr)
+        return 2
+    if tendril_host is None:
+        print("tendril_host.py is missing next to remote-agents; re-run ./install",
+              file=sys.stderr)
+        return 1
+    return tendril_host.main(["service", args[0]])
+
+
 def main():
     if "--detect" in sys.argv:
         for cand, ok, detail in HERDR_VERDICTS:
@@ -1387,6 +1433,8 @@ def main():
         print("chosen:", HERDR or "NONE")
         return 0
     args = sys.argv[1:]
+    if args[:1] == ["service"]:
+        return _service(args[1:])
     if len(args) == 2 and args[0] in SUBCOMMANDS:
         return _run_subcommand(args[0], args[1])
     if args:
@@ -1395,6 +1443,8 @@ def main():
         print("       <session-token>: workspace id (w15), pane id (w15:p1),",
               file=sys.stderr)
         print("       workspace number or exact label; no args opens the selector",
+              file=sys.stderr)
+        print("       remote-agents service status|start|stop|restart|logs",
               file=sys.stderr)
         return 2
     rows, code = _reachable_rows()

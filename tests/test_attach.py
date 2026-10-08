@@ -326,6 +326,11 @@ class PhoneLauncher(unittest.TestCase):
         env["PATH"] = self.bindir + os.pathsep + env.get("PATH", "")
         env["TENDRIL_RECORD"] = self.record
         env["REMOTE_AGENTS_BIN"] = "remote-agents"
+        # isolate HOME so the launcher's ~/.config/tendril/alias lookup can
+        # never pick up a real alias file from the developer's home
+        env["HOME"] = os.path.join(self.tmp, "isolated home")
+        os.makedirs(env["HOME"], exist_ok=True)
+        env.pop("XDG_CONFIG_HOME", None)
         if alias is None:
             env.pop("TENDRIL_ALIAS", None)
             env.pop("AGENT_ALIAS", None)
