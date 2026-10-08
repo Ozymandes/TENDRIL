@@ -46,8 +46,14 @@ jobs:
       # No herdr in CI: the two pty/masthead tests skip on their own
       # (skipUnless herdr_reachable()) and the herdr-CLI tests skip via
       # shutil.which("herdr"); everything else is stubbed. ~20s.
+      # tests/run_suite.py = the same discover run, plus: test names printed
+      # before each test, failures printed live, and a per-test watchdog that
+      # dumps every Python stack + the child process tree, then exits 3.
       - name: Stdlib unittest suite
-        run: python3 -m unittest discover -s tests
+        env:
+          TENDRIL_TEST_TIMEOUT: "90"
+          PYTHONFAULTHANDLER: "1"
+        run: python3 -u tests/run_suite.py
 
   # A stock Mac has exactly one python3: /usr/bin/python3 from the Xcode
   # Command Line Tools (3.9.6). Run the suite on it, then smoke the
@@ -61,7 +67,10 @@ jobs:
       - name: Which system python (expect Python 3.9.x)
         run: /usr/bin/python3 -V
       - name: Stdlib unittest suite under the CLT python
-        run: /usr/bin/python3 -m unittest discover -s tests
+        env:
+          TENDRIL_TEST_TIMEOUT: "90"
+          PYTHONFAULTHANDLER: "1"
+        run: /usr/bin/python3 -u tests/run_suite.py
       - name: Smoke installer + launchd plist (stock PATH, HOME with a space)
         run: |
           HOME_DIR="$RUNNER_TEMP/home with space"

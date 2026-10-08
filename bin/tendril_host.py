@@ -65,8 +65,8 @@ def tailscale_cli(which=shutil.which, exists=os.path.isfile):
     return TAILSCALE_APP if exists(TAILSCALE_APP) else None
 
 
-def tailscale_ip(run=_run):
-    cli = tailscale_cli()
+def tailscale_ip(run=_run, cli=None):
+    cli = cli or tailscale_cli()
     if not cli:
         return ""
     rc, out, _ = run([cli, "ip", "-4"], 4)
@@ -74,9 +74,10 @@ def tailscale_ip(run=_run):
     return lines[0].strip() if lines else ""
 
 
-def tailscale_name(run=_run):
-    """This node's MagicDNS short name ('' when Tailscale is down/absent)."""
-    cli = tailscale_cli()
+def tailscale_name(run=_run, cli=None):
+    """This node's MagicDNS short name ('' when Tailscale is down/absent).
+    cli: the Tailscale command to use (default: found via tailscale_cli)."""
+    cli = cli or tailscale_cli()
     if not cli:
         return ""
     rc, out, _ = run([cli, "status", "--json"], 4)

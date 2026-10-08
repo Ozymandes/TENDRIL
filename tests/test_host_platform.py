@@ -161,6 +161,9 @@ class TailscaleCli(unittest.TestCase):
 
 
 class TailscaleName(unittest.TestCase):
+    """The CLI is injected, so these hold whether or not the machine
+    running the tests has Tailscale (CI runners do not)."""
+
     def test_first_label_of_self_dnsname(self):
         def reply(args):
             if args == ["tailscale", "status", "--json"]:
@@ -168,19 +171,40 @@ class TailscaleName(unittest.TestCase):
                     {"Self": {"DNSName": "janes-mac.tail1234.ts.net."}}), ""
             return None
 
-        self.assertEqual(th.tailscale_name(run=recorder(reply)), "janes-mac")
+        run = recorder(reply)
+        self.assertEqual(th.tailscale_name(run=run, cli="tailscale"), "janes-mac")
+        self.assertEqual(run.calls, [["tailscale", "status", "--json"]])
+
+    def test_app_bundle_cli_is_used_as_given(self):
+        run = recorder(lambda a: (0, json.dumps({"Self": {"DNSName": "m.ts.net."}}), ""))
+        self.assertEqual(th.tailscale_name(run=run, cli=th.TAILSCALE_APP), "m")
+        self.assertEqual(run.calls[0][0], th.TAILSCALE_APP)
 
     def test_down_cli_gives_empty(self):
-        rc = lambda a: (7, "", "boom")
-        self.assertEqual(th.tailscale_name(run=recorder(rc)), "")
+        run = recorder(lambda a: (7, "", "boom"))
+        self.assertEqual(th.tailscale_name(run=run, cli="tailscale"), "")
+        self.assertEqual(len(run.calls), 1)          # really asked, really failed
 
     def test_bad_json_gives_empty(self):
-        rc = lambda a: (0, "<html>not json</html>", "")
-        self.assertEqual(th.tailscale_name(run=recorder(rc)), "")
+        run = recorder(lambda a: (0, "<html>not json</html>", ""))
+        self.assertEqual(th.tailscale_name(run=run, cli="tailscale"), "")
+        self.assertEqual(len(run.calls), 1)
 
     def test_missing_self_gives_empty(self):
-        rc = lambda a: (0, json.dumps({"Self": None}), "")
-        self.assertEqual(th.tailscale_name(run=recorder(rc)), "")
+        run = recorder(lambda a: (0, json.dumps({"Self": None}), ""))
+        self.assertEqual(th.tailscale_name(run=run, cli="tailscale"), "")
+        self.assertEqual(len(run.calls), 1)
+
+    def test_no_cli_anywhere_gives_empty_without_running_anything(self):
+        run = recorder(lambda a: (0, "{}", ""))
+        with mock.patch.object(th, "tailscale_cli", return_value=None):
+            self.assertEqual(th.tailscale_name(run=run), "")
+            self.assertEqual(th.tailscale_ip(run=run), "")
+        self.assertEqual(run.calls, [])
+
+    def test_ip_first_line(self):
+        run = recorder(lambda a: (0, "100.64.0.7\n", ""))
+        self.assertEqual(th.tailscale_ip(run=run, cli="tailscale"), "100.64.0.7")
 
 
 class MemoryLinux(unittest.TestCase):
