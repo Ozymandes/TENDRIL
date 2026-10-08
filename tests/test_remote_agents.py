@@ -4,14 +4,12 @@ import importlib.util
 import io
 import os
 import pty
-import select
 import shutil
 import signal
 import subprocess
 import sys
 import termios
 import tempfile
-import threading
 import time
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -47,22 +45,15 @@ class KeyReader(unittest.TestCase):
         # A real terminal always reads what the tty echoes. Without a
         # reader, restoring with TCSADRAIN waits forever on macOS for that
         # echo to drain (Linux returns at once for ptys).
-        self._stop = threading.Event()
-        self._drain = threading.Thread(target=self._read_output, daemon=True)
-        self._drain.start()
-
-    def _read_output(self):
-        while not self._stop.is_set():
-            try:
-                r, _, _ = select.select([self.master], [], [], 0.05)
-                if r:
-                    os.read(self.master, 4096)
-            except OSError:
-                return
+        # A separate process, not a thread: on Python 3.9 the blocked
+        # tcsetattr holds the GIL, so a reader thread could never run.
+        self._drain = subprocess.Popen(["cat"], stdin=self.master,
+                                       stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
 
     def tearDown(self):
-        self._stop.set()
-        self._drain.join(2)
+        self._drain.kill()
+        self._drain.wait(5)
         os.close(self.master)
         os.close(self.slave)
 
@@ -183,34 +174,57 @@ class Panels(unittest.TestCase):
                 self.assertIn("TENDRIL_DETACH_BRIDGE=0", output.getvalue())
 
     def test_info_returns_via_any_key_wait(self):
+        """Both host-fact paths, on any OS: /proc (Linux) and sysctl/vm_stat
+        (macOS). Only the listed commands may run."""
+        darwin_answers = {
+            ("sysctl", "-n", "kern.boottime"): "{ sec = 1700000000, usec = 0 } Tue Nov 14\n",
+            ("sysctl", "-n", "hw.memsize"): "17179869184\n",
+            ("vm_stat",): "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+                          "Pages free: 21894.\nPages inactive: 201301.\n"
+                          "Pages speculative: 51234.\n",
+            ("pmset", "-g", "batt"): "Now drawing from 'AC Power'\n",
+        }
+
         def fake_run(args, timeout=6):
             command = args[0]
-            if command == "tailscale":
+            if command == "tailscale" or command.endswith("/Tailscale"):
                 return 1, "", ""
             if command == "uptime":
                 return 0, "up 1 hour\n", ""
             if command == "df":
                 return 0, "Filesystem Size Used Avail Use% Mounted on\n/dev/root 100G 20G 80G 20% /\n", ""
-            if command == "systemctl":
+            if command in ("systemctl", "launchctl"):
                 return 1, "", ""
+            if tuple(args) in darwin_answers:
+                return 0, darwin_answers[tuple(args)], ""
             self.fail(f"unexpected command: {args}")
 
         def fake_open(path, *args, **kwargs):
             if path == "/proc/loadavg":
                 return io.StringIO("0.1 0.2 0.3 4/100 1\n")
+            if path == "/proc/uptime":
+                return io.StringIO("3600.5 100.0\n")
             if path == "/proc/meminfo":
                 return io.StringIO("MemAvailable: 1024 kB\nMemTotal: 4096 kB\n")
             raise OSError(path)
 
-        with contextlib.ExitStack() as stack:
-            wait = stack.enter_context(mock.patch.object(ra, "wait_for_key"))
-            stack.enter_context(mock.patch.object(ra, "run", side_effect=fake_run))
-            stack.enter_context(mock.patch.object(ra, "collect", return_value=[]))
-            stack.enter_context(mock.patch("builtins.open", side_effect=fake_open))
-            stack.enter_context(mock.patch("builtins.input", side_effect=AssertionError("line input used")))
-            with contextlib.redirect_stdout(io.StringIO()):
-                ra.info()
-        wait.assert_called_once_with()
+        real_exists = os.path.exists
+        for procfs in (True, False):
+            with self.subTest(procfs=procfs), contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    ra.tendril_host.os.path, "exists",
+                    lambda p, real=real_exists, on=procfs:
+                        on if p.startswith("/proc/") else real(p)))
+                wait = stack.enter_context(mock.patch.object(ra, "wait_for_key"))
+                stack.enter_context(mock.patch.object(ra, "run", side_effect=fake_run))
+                stack.enter_context(mock.patch.object(ra, "collect", return_value=[]))
+                stack.enter_context(mock.patch("builtins.open", side_effect=fake_open))
+                stack.enter_context(mock.patch("builtins.input", side_effect=AssertionError("line input used")))
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    ra.info()
+                wait.assert_called_once_with()
+                self.assertIn("free", out.getvalue())       # memory line rendered
 
 
 class Selection(unittest.TestCase):
