@@ -19,11 +19,13 @@
 #   tendril ssh <alias>  force plain SSH (skip Mosh)
 #   tendril attach <id>          direct-attach session <id> on the default alias
 #   tendril <alias> attach <id>  direct-attach session <id> via an explicit alias
+#   tendril enter <id>           notification entry: exact focus + attach,
+#                                then the selector (same lifecycle as a tap)
 #   tendril [<alias>] resolve|focus|link <id>
 #                                print JSON / focus headless / print the deep
 #                                link, over plain SSH (no TTY, no Mosh)
 #
-# <id> is anything `remote-agents attach` resolves on the host: the canonical
+# <id> is anything `remote-agents attach`/`enter` resolves on the host: the canonical
 # workspace id (w15), a pane id (w15:p1), the workspace number or an exact
 # label. Only A-Z a-z 0-9 . _ : - are accepted (max 128 chars), so the id can
 # be embedded single-quoted in the mosh/ssh remote command injection-proof.
@@ -40,11 +42,11 @@ if [ "$1" = "ssh" ]; then
     FORCE_SSH=1
 else
     case "${1:-}" in
-        attach | resolve | focus | link)
+        attach | resolve | focus | link | enter)
             MODE="$1"; ALIAS="$DEFAULT_ALIAS"; ATTACH_ID="${2:-}" ;;
         *)
             case "${2:-}" in
-                attach | resolve | focus | link)
+                attach | resolve | focus | link | enter)
                     MODE="$2"; ALIAS="$1"; ATTACH_ID="${3:-}" ;;
             esac ;;
     esac
@@ -78,7 +80,7 @@ if [ -z "$ALIAS" ]; then
     echo "  connect once:   tendril <alias>"
     echo "  set a default:  echo <alias> > ~/.config/tendril/alias"
     echo "                  (or: echo 'export TENDRIL_ALIAS=<alias>' >> ~/.bashrc)"
-    echo "usage: tendril [<alias>] [attach|resolve|focus|link <session-id>] | tendril ssh <alias>"
+    echo "usage: tendril [<alias>] [attach|enter|resolve|focus|link <session-id>] | tendril ssh <alias>"
     echo "first time: see docs/ANDROID.md or docs/MACOS.md — create a key, then: ssh-copy-id <alias>"
     exit 1
 fi

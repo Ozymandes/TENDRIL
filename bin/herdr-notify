@@ -8,6 +8,9 @@ label. Classes: input required (high), task finished (default), and a
 once-per-stint "still working" nudge (min). Optional deep-link plumbing
 renders an ntfy Click URL (plus an Attach action button) from canonical
 tendril-link payloads so a tap can open the right workspace on the phone.
+The click target is the EMITTING agent's own pane (from the snapshot
+entry that produced the event) — never the workspace's currently focused
+tab, which is why taps used to land on the wrong session.
 Zero LLM/API cost by default: no external services, no API keys, and no
 network traffic beyond the ntfy POST itself. Baselines on start and after
 any Herdr outage so restarts never cause notification storms. Credentials
@@ -221,17 +224,26 @@ def render_template(template, fields):
                   lambda m: str(fields.get(m.group(1), "")), template or "")
 
 
-def link_fields(host, workspace_id, label):
-    """tendril-link wire forms for a workspace, plus {label_uri}; None when
-    there is no linkable workspace (vanished workspace, invalid ids)."""
+def link_fields(host, workspace_id, label, pane_id=None):
+    """tendril-link wire forms for a workspace — narrowed to the emitting
+    agent's pane when one is known — plus {label_uri}; None when there is
+    no linkable workspace (vanished workspace, invalid ids). A malformed
+    pane id falls back to the workspace-only link so the tap still lands
+    on the right workspace."""
     if not host or not workspace_id:
         return None
-    try:
-        fields = tendril_link.describe(host, workspace_id, label)
-    except (tendril_link.LinkError, TypeError, ValueError):
+    fields = None
+    for pane in (pane_id, None):
+        try:
+            fields = tendril_link.describe(host, workspace_id, label, pane)
+            break
+        except (tendril_link.LinkError, TypeError, ValueError):
+            continue
+    if fields is None:
         return None
     fields = {k: (v or "") for k, v in fields.items()}
     fields["label_uri"] = quote(fields["label"], safe="")
+    fields["pane_id"] = pane_id or ""
     return fields
 
 
@@ -389,10 +401,12 @@ def push(state, pid, agent, cls, workspaces, cfg, allow_push, now,
     kind, ws_id, label, title_label = pane_context(agent, workspaces)
     host = CONFIG.get("TAILSCALE_HOST") or os.uname().nodename
     cwd = agent.get("cwd")
+    pane_id = agent.get("pane_id") or ""
     title, body, priority, tags = compose(kind, title_label, cls,
                                           alert_since, cwd, now=now)
-    # vanished workspace -> no click/actions rather than a garbage payload
-    fields = (link_fields(host, ws_id, label)
+    # vanished workspace -> no click/actions rather than a garbage payload;
+    # the click target is this emitting agent's pane, never the focused tab
+    fields = (link_fields(host, ws_id, label, pane_id)
               if ws_id and ws_id in workspaces else None)
     click, actions = click_headers(cfg, fields)
     detail = summarize(cfg, {"workspace_id": ws_id, "label": title_label,

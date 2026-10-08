@@ -359,6 +359,26 @@ class PhoneLauncher(unittest.TestCase):
         # the remote shell receives the quoted id and passes it as one argument
         self.assertIn("remote-agents attach w15", self.calls())
 
+    def test_enter_uses_default_alias_quotes_the_id_and_execs_remote(self):
+        p = self.run_launcher(["enter", "w15:p1"])
+        self.assertEqual(p.returncode, 0)
+        mosh = [c for c in self.calls() if c.startswith("mosh ")]
+        self.assertEqual(len(mosh), 1)
+        # the remote command is `exec remote-agents enter '<id>'`, so the
+        # selector's Quit ends the session (no orphan mosh)
+        self.assertIn("sh -lc exec remote-agents enter 'w15:p1'", mosh[0])
+        # the remote shell receives the quoted id as one argument
+        self.assertIn("remote-agents enter w15:p1", self.calls())
+
+    def test_enter_invalid_id_exits_two_without_connecting(self):
+        p = self.run_launcher(["enter", "x;rm"])
+        self.assertEqual(p.returncode, 2)
+        self.assertEqual(self.calls(), [])
+        self.assertIn("usage", p.stdout + p.stderr)
+        p = self.run_launcher(["enter", "w" * 129])
+        self.assertEqual(p.returncode, 2)
+        self.assertEqual(self.calls(), [])
+
     def test_explicit_alias_attach_respects_the_alias(self):
         p = self.run_launcher(["otherhost", "attach", "wK"], alias="unused")
         self.assertEqual(p.returncode, 0)
@@ -401,6 +421,242 @@ class PhoneLauncher(unittest.TestCase):
         self.assertEqual(p.returncode, 1)
         self.assertEqual(self.calls(), [])
         self.assertIn("usage", p.stdout + p.stderr)
+
+
+
+class EnterLifecycle(unittest.TestCase):
+    """remote-agents enter <token> and the exact-pane semantics of
+    attach/resolve/focus, against a fully faked herdr client (the same
+    fake-herdr harness as Dispatch: every herdr command is recorded)."""
+
+    def setUp(self):
+        self.out = io.StringIO()
+        self.err = io.StringIO()
+        self.run_calls = []
+        self.attached = []
+        self.renders = []
+
+    # ---- fakes -------------------------------------------------------------
+
+    def snapshot_envelope(self, focused_pane_id="w15:p1"):
+        return {"result": {"snapshot": {
+            "workspaces": [
+                {"workspace_id": "w15", "label": "tendril", "number": 3,
+                 "focused": True, "active_tab_id": "w15:t1"},
+            ],
+            "panes": [
+                {"pane_id": "w15:p1", "tab_id": "w15:t1",
+                 "workspace_id": "w15", "agent": "pi",
+                 "agent_status": "working",
+                 "cwd": "/home/u/Projects/tendril",
+                 "foreground_cwd": "/home/u/Projects/tendril",
+                 "focused": True},
+            ],
+            "agents": [
+                {"pane_id": "w15:p1", "tab_id": "w15:t1",
+                 "workspace_id": "w15", "agent": "pi",
+                 "agent_status": "working",
+                 "cwd": "/home/u/Projects/tendril", "focused": False},
+            ],
+            "focused_pane_id": focused_pane_id,
+            "focused_tab_id": "w15:t1",
+        }}}
+
+    def fake_run(self, args, focused_pane_id):
+        self.run_calls.append(list(args))
+        if args[1:] == ["api", "snapshot"]:
+            return 0, json.dumps(self.snapshot_envelope(focused_pane_id)), ""
+        if args[1:] == ["status"]:
+            return 0, "status: running\nendpoint_compatible: yes\n", ""
+        return 0, "", ""                                  # focus commands
+
+    def run_main(self, argv, focused_pane_id="w15:p1", menu=None,
+                 menu_return=0, lines=("q",)):
+        """Run ra.main(argv) with the herdr client faked and the attach
+        bridge recorded; menu=Mock asserts the selector contract directly,
+        otherwise the real selector loop runs on patched line input."""
+        stdin = mock.Mock()
+        stdin.isatty.return_value = False
+        ctx = [
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(ra, "HERDR", "herdr"),
+            mock.patch.object(ra, "HOST_LABEL", "testhost"),
+            mock.patch.object(ra, "run", side_effect=lambda args, timeout=6:
+                              self.fake_run(args, focused_pane_id)),
+            mock.patch.object(ra, "_attach_session",
+                              side_effect=lambda: self.attached.append("attach")),
+            mock.patch.object(ra, "save_last", lambda row: None),
+            mock.patch.object(ra.sys, "stdin", stdin),
+            mock.patch.object(ra.sys, "argv", ["remote-agents"] + argv),
+            mock.patch.object(ra.sys, "stdout", self.out),
+            mock.patch.object(ra.sys, "stderr", self.err),
+        ]
+        if menu is not None:
+            ctx.append(mock.patch.object(ra, "menu_loop", menu))
+        else:
+            ctx += [
+                mock.patch.object(ra, "render",
+                                  side_effect=lambda rows, note, selected:
+                                  self.renders.append(note)),
+                mock.patch("builtins.input", side_effect=list(lines)),
+            ]
+        for c in ctx:
+            c.start()
+        try:
+            return ra.main()
+        finally:
+            for c in reversed(ctx):
+                c.stop()
+
+    def focus_sequence(self):
+        return [c[1:] for c in self.run_calls
+                if len(c) >= 3 and c[1] in ("workspace", "tab", "agent")
+                and c[2] == "focus"]
+
+    # ---- enter with a pane target -------------------------------------------
+
+    def test_enter_pane_focuses_exact_tab_and_pane_then_attaches_then_selector(self):
+        rc = self.run_main(["enter", "w15:p1"])
+        self.assertEqual(rc, 0)
+        # exact focus: workspace -> tab -> pane, in that order
+        self.assertEqual(self.focus_sequence(),
+                         [["workspace", "focus", "w15"],
+                          ["tab", "focus", "w15:t1"],
+                          ["agent", "focus", "w15:p1"]])
+        # the SAME Ctrl+Home-bridged attach the selector uses
+        self.assertEqual(self.attached, ["attach"])
+        # detach fell into the normal selector loop, once, and quit -> 0
+        self.assertEqual(len(self.renders), 1)
+        self.assertEqual(self.renders[0], "")    # no stale notice on success
+
+    def test_enter_quit_returns_zero_after_detach(self):
+        rc = self.run_main(["enter", "w15:p1"], lines=("q",))
+        self.assertEqual(rc, 0)
+
+    def test_enter_verification_failure_never_attaches_and_shows_the_notice(self):
+        # the snapshot says a DIFFERENT pane is focused: never attach
+        menu = mock.Mock(return_value=0)
+        rc = self.run_main(["enter", "w15:p1"],
+                           focused_pane_id="w15:t1-fake", menu=menu)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.attached, [])
+        self.assertEqual(self.focus_sequence(),
+                         [["workspace", "focus", "w15"],
+                          ["tab", "focus", "w15:t1"],
+                          ["agent", "focus", "w15:p1"]])
+        menu.assert_called_once()
+        self.assertEqual(menu.call_args.kwargs["note"], ra.STALE_NOTE)
+        self.assertEqual(menu.call_args.kwargs["preferred_id"], "w15")
+
+    def test_enter_stale_pane_never_attaches_and_preselects_the_parent(self):
+        menu = mock.Mock(return_value=0)
+        rc = self.run_main(["enter", "w15:p99"], menu=menu)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.attached, [])
+        self.assertEqual(self.focus_sequence(), [])   # nothing was focused
+        menu.assert_called_once()
+        self.assertEqual(menu.call_args.kwargs["note"], ra.STALE_NOTE)
+        self.assertEqual(menu.call_args.kwargs["preferred_id"], "w15")
+
+    def test_enter_stale_pane_without_a_parent_preselects_nothing(self):
+        menu = mock.Mock(return_value=0)
+        self.run_main(["enter", "w99:p1"], menu=menu)
+        self.assertEqual(self.attached, [])
+        menu.assert_called_once()
+        self.assertEqual(menu.call_args.kwargs["note"], ra.STALE_NOTE)
+        self.assertIsNone(menu.call_args.kwargs["preferred_id"])
+
+    # ---- enter with a workspace token ----------------------------------------
+
+    def test_enter_workspace_token_focuses_attaches_then_selector(self):
+        rc = self.run_main(["enter", "w15"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.focus_sequence(),
+                         [["workspace", "focus", "w15"]])   # workspace semantics
+        self.assertEqual(self.attached, ["attach"])
+        self.assertEqual(len(self.renders), 1)
+
+    def test_enter_unknown_workspace_token_exits_two_without_selector(self):
+        menu = mock.Mock(return_value=0)
+        rc = self.run_main(["enter", "gone"], menu=menu)
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.attached, [])
+        menu.assert_not_called()
+        self.assertIn("no session matches 'gone'", self.err.getvalue())
+
+    # ---- attach: one-shot, exact when a pane ----------------------------------
+
+    def test_attach_pane_token_is_one_shot_exact_focus_without_selector(self):
+        menu = mock.Mock(return_value=0)
+        rc = self.run_main(["attach", "w15:p1"], menu=menu)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.focus_sequence(),
+                         [["workspace", "focus", "w15"],
+                          ["tab", "focus", "w15:t1"],
+                          ["agent", "focus", "w15:p1"]])
+        self.assertEqual(self.attached, ["attach"])
+        menu.assert_not_called()          # one-shot: no selector, returns to shell
+
+    def test_attach_workspace_token_stays_the_plain_one_shot(self):
+        menu = mock.Mock(return_value=0)
+        rc = self.run_main(["attach", "w15"], menu=menu)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.focus_sequence(),
+                         [["workspace", "focus", "w15"]])
+        self.assertEqual(self.attached, ["attach"])
+        menu.assert_not_called()
+
+    def test_attach_stale_pane_exits_two_without_attaching(self):
+        menu = mock.Mock(return_value=0)
+        rc = self.run_main(["attach", "w15:p99"], menu=menu)
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.attached, [])
+        menu.assert_not_called()
+        self.assertIn("no session matches 'w15:p99'", self.err.getvalue())
+
+    # ---- resolve / focus with pane ids -----------------------------------------
+
+    def test_resolve_pane_json_includes_pane_tab_and_agent(self):
+        rc = self.run_main(["resolve", "w15:p1"])
+        self.assertEqual(rc, 0)
+        doc = json.loads(self.out.getvalue().strip())
+        self.assertEqual(doc["workspace_id"], "w15")
+        self.assertEqual(doc["pane_id"], "w15:p1")
+        self.assertEqual(doc["tab_id"], "w15:t1")
+        self.assertEqual(doc["agent"], "pi")
+        self.assertEqual(doc["agents"],
+                         [{"agent": "pi", "agent_status": "working",
+                           "pane_id": "w15:p1"}])
+
+    def test_resolve_pane_link_carries_the_pane(self):
+        self.run_main(["resolve", "w15:p1"])
+        doc = json.loads(self.out.getvalue().strip())
+        self.assertEqual(tl.parse_uri(doc["link"]),
+                         {"host": "testhost", "workspace_id": "w15",
+                          "label": "tendril", "pane": "w15:p1"})
+
+    def test_resolve_stale_pane_exits_two_on_the_not_found_path(self):
+        rc = self.run_main(["resolve", "w15:p99"])
+        self.assertEqual(rc, 2)
+        self.assertIn("no session matches 'w15:p99'", self.err.getvalue())
+        self.assertIn("closest:", self.err.getvalue())
+
+    def test_focus_pane_verifies_exact_focus_then_prints_json(self):
+        rc = self.run_main(["focus", "w15:p1"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.focus_sequence(),
+                         [["workspace", "focus", "w15"],
+                          ["tab", "focus", "w15:t1"],
+                          ["agent", "focus", "w15:p1"]])
+        doc = json.loads(self.out.getvalue().strip())
+        self.assertEqual(doc["pane_id"], "w15:p1")
+        self.assertEqual(doc["tab_id"], "w15:t1")
+
+    def test_focus_pane_verification_failure_exits_two_without_json(self):
+        rc = self.run_main(["focus", "w15:p1"],
+                           focused_pane_id="w15:other")
+        self.assertEqual(rc, 2)
+        self.assertNotIn("{", self.out.getvalue())
 
 
 if __name__ == "__main__":

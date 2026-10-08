@@ -4,6 +4,27 @@ All notable changes to TENDRIL are documented here.
 
 ## Unreleased
 
+- Exact targets and the notification entry lifecycle. Deep links gain an
+  additive `?pane=<pane-id>` query (contract stays v1; workspace-only
+  links are byte-identical, payload whitelist is now `{v,h,w,l,p}`).
+  herdr-notify aims every click URI at the EMITTING agent's own pane
+  (new `{pane_id}` and `{target}` placeholders; `{uri}` carries the
+  pane), never the workspace's currently focused tab — the wrong-tab root
+  cause. New `remote-agents enter <target>`: resolve, exact focus
+  (`workspace focus` + `tab focus` + `agent focus <pane_id>`, verified
+  against the snapshot's `focused_pane_id`), the same Ctrl+Home-bridged
+  attach the selector uses, then the selector loop in-process on detach —
+  no re-exec, no recursion, no orphaned mosh. A stale pane never attaches:
+  `enter` opens the selector with a one-line notice and the parent
+  workspace preselected; `resolve`/`attach`/`focus` take the existing
+  not-found path (exit 2) with `resolve` gaining `pane_id`/`tab_id`/
+  `agent` fields. `attach` stays one-shot. Phone side: `tendril enter`
+  (same validation/quoting/mosh-ssh fallback as attach) and the
+  termux-url-opener now routes recognized links to `tendril enter <id>`.
+  Closed pane/tab ids are not reused within a server lifetime (Herdr
+  documented; cross-restart ids are a new server's scope — hence the
+  verification + stale handling).
+
 - Reinstalling no longer rotates the ntfy topic. `./install` used to
   mint a fresh random topic every time the notification question was
   answered yes, silently invalidating every subscribed phone. An existing

@@ -554,12 +554,20 @@ def _bridge_enabled():
     return True
 
 
-def attach(row):
+def attach(row, pane=None):
+    """One-shot attach (selector, `attach <token>`). pane=None focuses
+    the workspace -- the historical semantics, unchanged. With a live
+    pane entry the focus is exact (workspace -> tab -> pane, verified)
+    and a failed verification attaches nothing, returning False."""
     save_last(row)
-    run([HERDR, "workspace", "focus", row["id"]], 6)
+    if pane is not None:
+        if not _focus_pane(pane):
+            return False
+    else:
+        run([HERDR, "workspace", "focus", row["id"]], 6)
     if os.environ.get("HERDR_ENV") == "1":
         input(f"already inside Herdr — workspace '{row['label']}' focused. Enter...")
-        return
+        return True
     if _bridge_enabled():
         print(f"{C_GRAY}attaching {row['label']} \u2014 detach: Ctrl+Home \u00b7 Alt+D \u00b7 Ctrl+B d - menu returns here{C_RESET}",
               flush=True)
@@ -568,6 +576,7 @@ def attach(row):
         print(f"{C_GRAY}attaching {row['label']} \u2014 detach: Alt+D \u00b7 Ctrl+B then D fallback - menu returns here{C_RESET}",
               flush=True)
         subprocess.run([HERDR, "session", "attach", SESSION], check=False)
+    return True
 
 
 # ---------- Ctrl+Home detach bridge (default-on TENDRIL convenience) ----------
@@ -1220,9 +1229,13 @@ def workspace_number(raw, count):
     return number - 1 if 1 <= number <= count else None
 
 
-def menu_loop(rows, tty_mode=False, fd=None):
-    note = ""
-    selected = selection_index(rows)
+def menu_loop(rows, tty_mode=False, fd=None, note="", preferred_id=None):
+    """The selector loop — the one loop every entry path ends in (the bare
+    selector, and `enter` after its attach detaches). note is shown once
+    above the footer (the enter verb's stale notice); preferred_id
+    preselects a workspace row (enter's parent workspace after a stale
+    pane). Returns 0 when the user quits."""
+    selected = selection_index(rows, preferred_id)
     while True:
         render(rows, note, selected)
         note = ""
@@ -1279,16 +1292,72 @@ def menu_loop(rows, tty_mode=False, fd=None):
             selected = selection_index(rows, preferred_id, previous_index)
 
 
-# ---------- direct addressing: attach/resolve/focus/link <token> ----------
+# ---------- direct addressing: attach/enter/resolve/focus/link <token> ----------
 # A TENDRIL session is addressable without the selector. The canonical token
-# is the herdr workspace_id ("w15"); pane ids ("w15:p1") resolve to their
-# parent workspace, pure digits to the workspace number, and an exact
-# case-sensitive label as the last resort. The subcommands are the machine
-# interface (phone shortcuts, deep links): non-interactive, safe over SSH.
+# is the herdr workspace_id ("w15"); pane ids ("w15:p1") address that exact
+# pane, pure digits the workspace number, and an exact case-sensitive label
+# as the last resort. The subcommands are the machine interface (phone
+# shortcuts, deep links, notification taps): non-interactive, safe over SSH.
 PANE_RE = re.compile(r"^[A-Za-z0-9]+:[A-Za-z0-9]+$")
 MAX_TOKEN = 129                             # beyond this the token is junk
-SUBCOMMANDS = ("attach", "resolve", "focus", "link")
+SUBCOMMANDS = ("attach", "enter", "resolve", "focus", "link")
 _RANK_NAME = {rank: name for name, rank in RANK.items()}
+STALE_NOTE = "That agent session has ended — choose another."
+
+
+def _pane_lookup(token):
+    """Live snapshot entry for a pane-shaped token, else None (stale).
+    One extra `herdr api snapshot`: collect() keeps only workspace rows,
+    and exact focus needs the pane's tab_id/workspace_id."""
+    if not PANE_RE.match(token):
+        return None
+    snap = snapshot()
+    if not snap:
+        return None
+    for p in snap.get("panes", []):
+        if p.get("pane_id") == token:
+            return p
+    return None
+
+
+def _focus_pane(pane):
+    """Exact focus: workspace -> tab -> pane, then VERIFY against the
+    snapshot's focused_pane_id. `herdr agent focus <pane_id>` is the CLI's
+    exact-pane focus (agent commands accept the pane hosting the agent);
+    panes without a recognized agent rely on the preceding tab focus
+    landing on the tab's own pane. False when verification cannot confirm
+    the pane is focused — the caller must treat it as stale and never
+    attach blind."""
+    pane_id = pane.get("pane_id") or ""
+    tab_id = pane.get("tab_id") or ""
+    ws_id = pane.get("workspace_id") or pane_id.split(":", 1)[0]
+    run([HERDR, "workspace", "focus", ws_id], 6)
+    if tab_id:
+        run([HERDR, "tab", "focus", tab_id], 6)
+    run([HERDR, "agent", "focus", pane_id], 6)
+    snap = snapshot()
+    return bool(snap) and snap.get("focused_pane_id") == pane_id
+
+
+def _selector_after(rows, note="", preferred_id=None):
+    """The selector loop, in this process — the single entry every attach
+    path falls back to. No re-exec, no recursion, no double selector."""
+    tty_mode = sys.stdin.isatty()
+    fd = sys.stdin.fileno() if tty_mode else None
+    return menu_loop(rows, tty_mode, fd, note=note, preferred_id=preferred_id)
+
+
+def _stale_pane_selector(rows, token):
+    """A stale (vanished or unverifiable) pane must never attach — not even
+    to its parent workspace's focused tab, which may be a different agent.
+    Open the selector in-process with a one-line notice, the parent
+    workspace preselected when it still exists."""
+    parent = token.split(":", 1)[0] if PANE_RE.match(token) else token
+    fresh = collect()
+    if fresh is None:
+        fresh = rows
+    preselect = parent if any(r["id"] == parent for r in fresh) else None
+    return _selector_after(fresh, note=STALE_NOTE, preferred_id=preselect)
 
 
 def resolve_token(rows, token):
@@ -1370,14 +1439,16 @@ def _resolve_session(rows, token):
     return None, 2
 
 
-def _session_link(row):
-    """tendril_link.describe() for a row, or None with a diagnostic."""
+def _session_link(row, pane=None):
+    """tendril_link.describe() for a row -- narrowed to the exact pane
+    when one is given -- or None with a diagnostic."""
     if tendril_link is None:
         print(f"{C_RED}tendril_link missing next to remote-agents - re-run install{C_RESET}",
               file=sys.stderr)
         return None
     try:
-        return tendril_link.describe(HOST_LABEL, row["id"], row["label"])
+        return tendril_link.describe(HOST_LABEL, row["id"], row["label"],
+                                     pane)
     except tendril_link.LinkError as exc:
         print(f"{C_RED}link error: {exc}{C_RESET}", file=sys.stderr)
         return None
@@ -1391,10 +1462,12 @@ def _herdr_running():
     return "unknown"
 
 
-def session_json(row):
+def session_json(row, pane=None):
     """One-line canonical JSON for resolve/focus: everything a notification
-    or deep-link consumer needs. link/payload_b64 come from tendril_link."""
-    link = _session_link(row)
+    or deep-link consumer needs. link/payload_b64 come from tendril_link.
+    With a live pane entry (pane-id tokens), pane_id/tab_id name the exact
+    pane and agent is THAT pane's agent, not the workspace's first."""
+    link = _session_link(row, pane.get("pane_id") if pane else None)
     if link is None:
         return None
     doc = {
@@ -1413,21 +1486,72 @@ def session_json(row):
         "payload_b64": link["payload_b64"],
         "herdr_status": _herdr_running(),
     }
+    if pane is not None:
+        doc["pane_id"] = pane.get("pane_id") or ""
+        doc["tab_id"] = pane.get("tab_id") or ""
+        doc["agent"] = pane.get("agent") or ""
     return json.dumps(doc, separators=(",", ":"))
 
 
+def _stale_pane_not_found(rows, token):
+    """The existing not-found path for a stale pane id: diagnostic + closest
+    live ids on stderr, non-zero exit (TEST LINK reports SESSION NOT FOUND)."""
+    print(f"{C_RED}no session matches '{token}' on {HOST_LABEL} "
+          f"(stale id? the agent session may have ended){C_RESET}", file=sys.stderr)
+    for r in _close_rows(rows, token):
+        print(f"{C_GRAY}  closest: {r['id']}  {r['label']}{C_RESET}", file=sys.stderr)
+    return 2
+
+
+def _enter_session(rows, token):
+    """enter <token> -- the notification entry lifecycle: resolve, exact
+    focus (verified), the same Ctrl+Home-bridged attach the selector uses,
+    then -- when the user detaches -- the normal selector loop in this same
+    process. A stale pane attaches nothing: the selector opens with a
+    one-line notice, the parent workspace preselected when it still exists."""
+    if PANE_RE.match(token):
+        pane = _pane_lookup(token)
+        row = None
+        if pane is not None:
+            parent = pane.get("workspace_id") or token.split(":", 1)[0]
+            row, _ = resolve_token(rows, parent)
+        if pane is None or row is None:
+            return _stale_pane_selector(rows, token)
+        if not attach(row, pane=pane):      # focus not verifiable: stale
+            return _stale_pane_selector(rows, token)
+    else:
+        row, code = _resolve_session(rows, token)
+        if row is None:
+            return code
+        attach(row)                         # workspace semantics, unchanged
+    fresh = collect()
+    if fresh is None:
+        fresh = rows
+    return _selector_after(fresh, preferred_id=row["id"])
+
+
 def _run_subcommand(cmd, token):
-    """attach/resolve/focus/link: never interactive, safe over plain SSH.
-    Exit codes: 0 ok, 1 Herdr unreachable, 2 unknown/stale token, 3 ambiguous."""
+    """attach/enter/resolve/focus/link: never interactive (enter falls into
+    the selector only after its attach detaches), safe over plain SSH.
+    Exit codes: 0 ok, 1 Herdr unreachable, 2 unknown/stale token, 3 ambiguous.
+    Pane ids are exact: the pane must exist (else the not-found path) and
+    focus verifies against the snapshot before anything attaches."""
     rows, code = _reachable_rows()
     if rows is None:
         return code
+    if cmd == "enter":
+        return _enter_session(rows, token)
+    pane = None
+    if cmd in ("attach", "resolve", "focus") and PANE_RE.match(token):
+        pane = _pane_lookup(token)
+        if pane is None:
+            return _stale_pane_not_found(rows, token)
     row, code = _resolve_session(rows, token)
     if row is None:
         return code
     if cmd == "attach":
         print(f"{C_GRAY}found session '{row['label']}' ({row['id']}){C_RESET}", flush=True)
-        attach(row)
+        attach(row, pane=pane)
         return 0
     if cmd == "link":
         link = _session_link(row)
@@ -1435,11 +1559,17 @@ def _run_subcommand(cmd, token):
             return 2
         print(link["uri"])
         return 0
-    doc = session_json(row)                 # resolve and focus print the same body
+    doc = session_json(row, pane=pane)      # resolve and focus print the same body
     if doc is None:
         return 2
     if cmd == "focus":                      # headless hook: focus only, no session attach
-        run([HERDR, "workspace", "focus", row["id"]], 6)
+        if pane is not None:
+            if not _focus_pane(pane):
+                print(f"{C_RED}could not verify focus for '{token}' "
+                      f"-- treat it as stale{C_RESET}", file=sys.stderr)
+                return 2
+        else:
+            run([HERDR, "workspace", "focus", row["id"]], 6)
     print(doc)
     return 0
 
@@ -1474,11 +1604,13 @@ def main():
     if len(args) == 2 and args[0] in SUBCOMMANDS:
         return _run_subcommand(args[0], args[1])
     if args:
-        print("usage: remote-agents [attach|resolve|focus|link] <session-token>",
+        print("usage: remote-agents [attach|enter|resolve|focus|link] <session-token>",
               file=sys.stderr)
         print("       <session-token>: workspace id (w15), pane id (w15:p1),",
               file=sys.stderr)
         print("       workspace number or exact label; no args opens the selector",
+              file=sys.stderr)
+        print("       enter: exact focus + attach, then the selector (notification taps)",
               file=sys.stderr)
         print("       remote-agents service status|start|stop|restart|logs",
               file=sys.stderr)
