@@ -4,6 +4,22 @@ All notable changes to TENDRIL are documented here.
 
 ## Unreleased
 
+- Fix (predates the cross-platform work): the installer's Herdr switching
+  merge looked conflicts up by action name in a map keyed by chord, so it
+  never noticed a `switch_tab` that already claims `prefix+1..9`/`alt+1..9`;
+  it proposed all three switching bindings, Herdr rejected the file, and the
+  valid one was rolled back too. `herdr-bindings.py switch` now decides each
+  proposal alone (exact chords after range and modifier expansion, then an
+  isolated `herdr config check` that ignores pre-existing warnings), appends
+  only conflict-free bindings, never edits existing lines, and the installer
+  and `?` help report what Ctrl+B/Alt/Ctrl + digit actually do.
+- Android fixes from a real S21 Ultra: the guided setup wrote the `agent`
+  wrapper through an old `agent -> tendril` symlink into `~/bin/tendril`,
+  where it exec'd itself forever; setup now stages and replaces files, and
+  the wrapper refuses a second hop. With the keyboard open and 7+
+  workspaces the masthead vanished entirely; paths now yield before the
+  brand does. A launcher with no alias lists `~/.ssh/config` hosts and exits.
+
 - macOS as a host and as a client. `./install` now runs unchanged on macOS
   (Apple silicon and Intel, stock `/bin/sh`, Xcode Command Line Tools
   Python 3.9+): no GNU `readlink -f`/`sed -i`/`\+` greps, package hints from

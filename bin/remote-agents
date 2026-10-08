@@ -7,6 +7,8 @@ no daemon, no tmux. Built for narrow Android screens (Termux + Mosh/SSH).
 import contextlib
 import difflib
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
@@ -1051,6 +1053,38 @@ def wait_for_key():
         read_key(fd)
 
 
+_DIGIT_WORDS = {"switch tab": "jump to tab", "switch workspace": "jump to workspace",
+                "focus agent": "focus agent"}
+
+
+def digit_rows(text=None):
+    """What digit chords really do in this user's Herdr config (the help
+    must not promise workspace jumps that a user binding overrides).
+    Falls back to Herdr's documented defaults without the helper."""
+    path = os.environ.get("HERDR_CONFIG_PATH") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+        "herdr", "config.toml")
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "herdr-bindings.py")
+    try:
+        if text is None:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        loader = importlib.machinery.SourceFileLoader("herdr_bindings", helper)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        pairs = mod.describe_digits(text)
+    except FileNotFoundError:
+        pairs = [("Ctrl+B 1..9", "switch tab")] if os.path.isfile(helper) else []
+    except Exception:
+        pairs = []
+    if not pairs:
+        return [("Ctrl+B 1..9", "jump (see Herdr config)")]
+    return [(keys, _DIGIT_WORDS.get(does, does)) for keys, does in pairs
+            if does != "unbound"]
+
+
 def help_screen():
     """Mobile key reference. Bindings mirror ~/.config/herdr/config.toml."""
     w = max(34, min(shutil.get_terminal_size(fallback=(48, 24)).columns, 48))
@@ -1070,8 +1104,7 @@ def help_screen():
         ("Alt+D", "detach to selector"),
         ("Ctrl+B d", "detach fallback"),
         ("Ctrl+Home", "detach (host bridge)"),
-        ("Ctrl+B 1..9", "jump to workspace"),
-        ("Alt+1..9", "jump without prefix"),
+    ] + digit_rows() + [
         ("Ctrl+B w", "workspace picker"),
         ("Ctrl+B n/p", "next / previous tab"),
         ("Alt+\u2190/\u2192", "previous / next tab"),

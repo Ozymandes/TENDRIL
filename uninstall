@@ -61,7 +61,7 @@ if [ -L "$BIN_DIR/tendril" ] && [ "$(readlink "$BIN_DIR/tendril")" = "remote-age
     say "removed: $BIN_DIR/tendril"
 fi
 
-for f in remote-agents herdr-notify tendril_link.py tendril_host.py; do
+for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py; do
     if [ -f "$BIN_DIR/$f" ]; then
         rm -f "$BIN_DIR/$f"
         say "removed: $BIN_DIR/$f"

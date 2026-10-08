@@ -383,6 +383,34 @@ class UninstallWithoutHelper(FakeDarwin):
         self.assertEqual(self.linux_calls(), [])
 
 
+class SwitchingOnClaimedDigits(FakeDarwin):
+    """Installer step 6 on the real config that exposed the merge bug
+    (switch_tab claims prefix+1..9 and alt+1..9): only the conflict-free
+    Ctrl indexed tabs are added, and the output says so."""
+
+    def test_only_conflict_free_switching_is_applied_and_reported(self):
+        fixture = os.path.join(REPO, "tests", "fixtures",
+                               "herdr_switch_tab_claims_digits.toml")
+        conf = os.path.join(self.home, ".config", "herdr", "config.toml")
+        os.makedirs(os.path.dirname(conf))
+        shutil.copy(fixture, conf)
+        with open(fixture) as f:
+            before = f.read()
+        # roots, host, alias, PATH n, ntfy n, watcher n, detach n, switching y
+        p = self.run_script(INSTALL, [], ["", "", "", "n", "", "n", "n", "y"])
+        out = p.stdout
+        self.assertEqual(p.returncode, 0, out + p.stderr)
+        self.assertRegex(out, r"SKIPPED +prefix workspace switching .*conflict with keys.switch_tab")
+        self.assertRegex(out, r"SKIPPED +Alt indexed workspaces .*conflict with keys.switch_tab")
+        self.assertRegex(out, r"ADDED +Ctrl indexed tabs")
+        self.assertNotIn("config check FAILED", out)
+        self.assertRegex(out, r"Alt\+1\.\.9 +switch tab")
+        with open(conf) as f:
+            after = f.read()
+        self.assertTrue(after.startswith(before))
+        self.assertEqual(after[len(before):], '\n[keys.indexed]\ntabs = "ctrl"\n')
+
+
 class DoctorDarwin(FakeDarwin):
     def test_doctor_is_read_only_and_darwin_native(self):
         p = self.run_script(INSTALL, ["--doctor"], [])

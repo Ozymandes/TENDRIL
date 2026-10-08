@@ -192,7 +192,7 @@ fi
 
 if [ -x "$HOME/.local/bin/remote-agents" ]; then
     # Already installed: refresh the programs only, keep config (per TENDRIL README)
-    for f in remote-agents herdr-notify tendril_link.py tendril_host.py; do
+    for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py; do
         [ -f "$REPO/bin/$f" ] || continue
         install -m 755 "$REPO/bin/$f" "$HOME/.local/bin/$f.new" \
             && mv -f "$HOME/.local/bin/$f.new" "$HOME/.local/bin/$f"

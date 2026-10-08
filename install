@@ -289,7 +289,7 @@ else
     printf '%s\n' "$CONF_BODY" > "$CONFIG"
     chmod 600 "$CONFIG"
 fi
-for f in remote-agents herdr-notify tendril_link.py tendril_host.py; do
+for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py; do
     [ -f "$BIN_DIR/$f" ] && backup "$BIN_DIR/$f"
     act "install $BIN_DIR/$f" install -m 755 "$PKG_DIR/bin/$f" "$BIN_DIR/$f"
 done
@@ -381,8 +381,9 @@ say "                   remote-agents bridges Ctrl+Home to Alt+D on TTY attaches
 say "                   by default (SSH/Mosh too; no phone env forwarding)"
 say "                   host opt-out: TENDRIL_DETACH_BRIDGE=0"
 say "     Prefix+D      universal fallback (prefix is Ctrl+B by default)"
-say "     Ctrl+B 1..9   jump to workspace (needs the switching bindings below)"
-say "     Alt+1..9      jump to workspace, no prefix (Termux: tap ALT then digit)"
+say "     Ctrl+B 1..9   digit shortcuts: Herdr switches tabs by default; TENDRIL"
+say "     Alt+1..9      proposes workspaces where those keys are free - the"
+say "     Ctrl+1..9     result below shows what yours actually do"
 say "     Ctrl+B n / p  next / previous tab (phone-safe)"
 say "     Alt+←/→       next / previous tab (desktop modifier encoding)"
 say "     Alt+Up        left unbound so Pi can edit steering messages"
@@ -421,112 +422,11 @@ herdr_restore_config() {
     fi
 }
 
-# plan|apply the workspace/tab switching bindings without disturbing anything else.
-# Requires herdr >= 0.9.3 (0.9.1 ignores switch_workspace and alt-indexed keys).
+# Workspace/tab switching: each proposal is decided on its own by the helper
+# (exact chord conflicts after range expansion, then an isolated
+# `herdr config check`); conflicting ones are skipped, never forced.
 herdr_switch() {
-    python3 - "$HERDR_CONF" "$1" <<'PYEOF'
-import os, re, sys
-path, mode = sys.argv[1], sys.argv[2]
-try:
-    with open(path) as config:
-        text = config.read()
-except FileNotFoundError:
-    text = ""
-
-
-def write_config(contents):
-    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-    if os.path.exists(path):
-        with open(path, "w") as config:
-            config.write(contents)
-    else:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(fd, "w") as config:
-            config.write(contents)
-
-def section_span(t, name):
-    m = re.search(r'^\[' + re.escape(name) + r'\][ \t]*$', t, re.M)
-    if not m:
-        return None
-    body = m.end()
-    nxt = re.search(r'^\[', t[body:], re.M)
-    end = body + (nxt.start() if nxt else len(t[body:]))
-    return body, end
-
-# every quoted chord in the file -> the keys that claim it
-used = {}
-for line in text.splitlines():
-    s = line.strip()
-    if not s or s.startswith("#") or "=" not in s:
-        continue
-    k, v = s.split("=", 1)
-    for c in re.findall(r'"([^"]+)"', v):
-        used.setdefault(c, set()).add(k.strip())
-
-def chord_free(c, key):
-    return all(k == key for k in used.get(c, ()))
-
-def insert_line(t, sec, line):
-    span = section_span(t, sec)
-    if span is None:
-        if not t:
-            return "[" + sec + "]" + chr(10) + line + chr(10)
-        if t and not t.endswith("\n"):
-            t += "\n"
-        return t + "\n[" + sec + "]\n" + line + "\n"
-    body, end = span
-    if end > 0 and t[end-1] != "\n":
-        t = t[:end] + "\n" + t[end:]
-        end += 1
-    return t[:end] + line + "\n" + t[end:]
-
-def set_scalar(t, sec, key, value):
-    span = section_span(t, sec)
-    pat = re.compile(r'^[ \t]*' + re.escape(key) + r'[ \t]*=[ \t]*(.+?)[ \t]*$', re.M)
-    if span:
-        m = pat.search(t, span[0], span[1])
-        if m:
-            return t, False                      # user's own binding wins
-    return insert_line(t, sec, key + " = " + value), True
-
-def merge_list(t, sec, key, defaults, chords):
-    """Ensure the chords are in key's list (create with defaults if absent)."""
-    span = section_span(t, sec)
-    pat = re.compile(r'^[ \t]*' + re.escape(key) + r'[ \t]*=[ \t]*(.+?)[ \t]*$', re.M)
-    m = pat.search(t, span[0], span[1]) if span else None
-    if not m:
-        line = key + " = [" + ", ".join('"%s"' % d for d in defaults) + "]"
-        return insert_line(t, sec, line), True
-    items = re.findall(r'"([^"]+)"', m.group(1))
-    add = [c for c in chords if c not in items and chord_free(c, key)]
-    if not add:
-        return t, False
-    newline = key + " = [" + ", ".join('"%s"' % i for i in items + add) + "]"
-    return t[:m.start()] + newline + t[m.end():], True
-
-added = []
-# switch_workspace takes the prefix+digit range unless switch_tab already claims it
-if "1..9" not in used.get("switch_tab", ()) and "prefix+1..9" not in used.get("switch_workspace", ()):
-    text, did = set_scalar(text, "keys", "switch_workspace", '"prefix+1..9"')
-    if did: added.append("switch_workspace=prefix+1..9")
-text, did = merge_list(text, "keys", "next_tab", ["prefix+n", "alt+right"], ["alt+right"])
-if did: added.append("next_tab+=alt+right")
-text, did = merge_list(text, "keys", "previous_tab", ["prefix+p", "alt+left"], ["alt+left"])
-if did: added.append("previous_tab+=alt+left")
-text, did = set_scalar(text, "keys", "next_workspace", '"alt+down"')
-if did: added.append("next_workspace=alt+down")
-# Leave Alt+Up to applications (Pi uses it to edit steering messages).
-text, did = set_scalar(text, "keys.indexed", "tabs", '"ctrl"')
-if did: added.append("indexed.tabs=ctrl")
-text, did = set_scalar(text, "keys.indexed", "workspaces", '"alt"')
-if did: added.append("indexed.workspaces=alt")
-
-if mode == "plan":
-    print("ADDED=" + ",".join(added))
-else:
-    if added:
-        write_config(text)
-PYEOF
+    python3 "$DETACH_HELPER" switch "$1" "$HERDR_CONF" "$HERDR_BIN"
 }
 
 if [ ! -f "$HERDR_CONF" ]; then
@@ -564,31 +464,48 @@ PLAN=$(herdr_detach plan)
         fi
     fi
     PLAN=$(herdr_switch plan)
-    ADDED=$(printf '%s\n' "$PLAN" | sed -n 's/^ADDED=//p')
-    if [ -z "$ADDED" ]; then
-        say "  switching bindings already complete - nothing to do"
+    ADDS=$(printf '%s\n' "$PLAN" | sed -n 's/^ADD=[^|]*|\([^|]*\)|.*/\1/p')
+    SKIPS=$(printf '%s\n' "$PLAN" | sed -n 's/^SKIP=[^|]*|\([^|]*\)|\(.*\)/\1: \2/p')
+    if [ -n "$SKIPS" ]; then
+        say "  switching bindings left alone:"
+        printf '%s\n' "$SKIPS" | grep -E ': (already|multi-line)' | sed 's/^/    KEPT     /'
+        printf '%s\n' "$SKIPS" | grep -vE ': (already|multi-line)' | sed 's/^/    SKIPPED  /'
+    fi
+    if [ -z "$ADDS" ]; then
+        say "  no switching bindings to add"
     else
-        say "  proposed switching bindings (adds: $ADDED):"
+        say "  proposed switching bindings (each validated on its own):"
+        printf '%s\n' "$ADDS" | sed 's/^/    ADD      /'
         say "  every existing binding is left exactly as it is."
         if confirm "Apply these switching bindings?"; then
-            BAK=$(herdr_backup_config)
             if [ "$DRY_RUN" = "1" ]; then
-                say "  [dry-run] write the keys above; then herdr config check + reload-config"
+                say "  [dry-run] append the bindings above; herdr config check; reload-config"
             else
-                herdr_switch apply
-                if "$HERDR_BIN" config check >/dev/null 2>&1; then
+                "$HERDR_BIN" config check >/dev/null 2>&1; BASE_RC=$?
+                BAK=$(herdr_backup_config)
+                if RESULT=$(herdr_switch apply) \
+                   && { [ "$BASE_RC" != 0 ] || "$HERDR_BIN" config check >/dev/null 2>&1; }; then
+                    PLAN=$RESULT
+                    printf '%s\n' "$RESULT" | sed -n 's/^ADD=[^|]*|\([^|]*\)|.*/    ADDED    \1/p'
                     "$HERDR_BIN" server reload-config >/dev/null 2>&1 \
                         && say "  applied + reloaded live (no server restart)"
                 else
                     say "  config check FAILED - restoring previous config"
+                    printf '%s\n' "$RESULT" | sed -n 's/^REFUSED=/    herdr: /p'
                     herdr_restore_config "$BAK"
                     "$HERDR_BIN" server reload-config >/dev/null 2>&1
+                    PLAN=$(herdr_switch digits)
                 fi
             fi
         else
             say "  skipped - your switching bindings are unchanged"
+            PLAN=$(herdr_switch digits)
         fi
     fi
+    say "  digit shortcuts in your Herdr config now:"
+    printf '%s\n' "$PLAN" | sed -n 's/^DIGITS=//p' | while IFS='|' read -r keys does; do
+        printf '    %-13s %s\n' "$keys" "$does"
+    done
 say ""
 
 # ---------------- 7. personalized Android setup ----------------
