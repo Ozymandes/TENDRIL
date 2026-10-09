@@ -1,8 +1,9 @@
 """LIVE MAP snapshot: `remote-agents snapshot` + phone launcher plumbing.
 
-The document is the read-only mirror TENDRIL Link's map renders (schema v1,
+The document is the read-only mirror TENDRIL Link's map renders (schema v2,
 documented in the app's Topology.kt). Contract points under test here:
-- exactly the v1 fields, nothing else — never cwd/terminal titles/sessions;
+- the v1 fields unchanged (never cwd/terminal titles/sessions), plus the
+  v2 `harness` tag and optional per-agent telemetry;
 - status vocabulary collapses to working/blocked/done/idle else "unknown";
 - stdout carries the ONE JSON line or NOTHING (reason on stderr, exit 1);
 - phone/tendril snapshot dials plain BatchMode SSH, never Mosh, no TTY.
@@ -68,7 +69,8 @@ SNAPSHOT = {"result": {"snapshot": {
 DOC_KEYS = {"version", "host", "generated_at", "focused_workspace",
             "focused_pane", "workspaces"}
 WS_KEYS = {"id", "label", "number", "focused", "agents"}
-AGENT_KEYS = {"pane_id", "tab_id", "agent", "status", "focused"}
+AGENT_KEYS = {"pane_id", "tab_id", "agent", "status", "focused",
+              "harness"}
 
 
 class SnapshotCommand(unittest.TestCase):
@@ -98,6 +100,12 @@ class SnapshotCommand(unittest.TestCase):
             mock.patch.object(ra.sys, "stdout", self.out),
             mock.patch.object(ra.sys, "stderr", self.err),
         ]
+        if ra.tendril_telemetry is not None:
+            # keep the telemetry cache out of the developer's real ~/.cache
+            ctx.append(mock.patch.object(ra.tendril_telemetry, "CACHE_FILE",
+                                         os.path.join(tempfile.mkdtemp(
+                                             prefix="tendril-snap-cache-"),
+                                             "telemetry-v1.json")))
         for c in ctx:
             c.start()
         try:
@@ -112,11 +120,11 @@ class SnapshotCommand(unittest.TestCase):
         self.assertEqual(len(lines), 1, "exactly ONE line of output")
         return json.loads(lines[0])
 
-    def test_schema_v1_exact_shape(self):
+    def test_schema_v2_exact_shape(self):
         self.assertEqual(self.main(["snapshot"]), 0)
         doc = self.doc()
         self.assertEqual(set(doc), DOC_KEYS)
-        self.assertEqual(doc["version"], 1)
+        self.assertEqual(doc["version"], 2)
         self.assertEqual(doc["host"], "testhost")
         self.assertEqual(doc["generated_at"], 1760000000)
         self.assertIsInstance(doc["generated_at"], int)
@@ -133,9 +141,9 @@ class SnapshotCommand(unittest.TestCase):
         agents = self.doc()["workspaces"][0]["agents"]
         self.assertEqual(agents, [
             {"pane_id": "w15:p1", "tab_id": "w15:t1", "agent": "pi",
-             "status": "working", "focused": True},
+             "status": "working", "focused": True, "harness": "pi"},
             {"pane_id": "w15:p2", "tab_id": "w15:t2", "agent": "claude",
-             "status": "unknown", "focused": False},
+             "status": "unknown", "focused": False, "harness": "claude"},
         ])
 
     def test_never_leaks_cwd_titles_or_sessions(self):
@@ -181,7 +189,7 @@ class SnapshotCommand(unittest.TestCase):
         # opens the selector, and the herdr snapshot call is what feeds it.
         self.assertEqual(self.main(["snapshot"]), 0)
         self.assertIn(["herdr", "api", "snapshot"], self.run_calls)
-        self.assertEqual(self.doc()["version"], 1)
+        self.assertEqual(self.doc()["version"], 2)
 
 
 class SnapshotLauncher(unittest.TestCase):

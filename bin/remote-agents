@@ -74,6 +74,10 @@ try:
     import tendril_phone         # --phone-* / --link-stage (thin dispatch below)
 except ImportError:
     tendril_phone = None
+try:
+    import tendril_telemetry     # schema v2 per-agent telemetry (read-only)
+except ImportError:              # stale install: v2 shape, no telemetry
+    tendril_telemetry = None
 
 # Canonical host identity (binding contract): config TENDRIL_HOST -> legacy
 # TAILSCALE_HOST (lowercased) -> short hostname, HOST_RE-gated, sanitized —
@@ -1418,27 +1422,37 @@ def resolve_token(rows, token):
 _LIVE_STATUS = ("working", "blocked", "done", "idle")
 
 
-def _snapshot_agent(a):
-    """One LIVE MAP agent row: exactly the five contract fields (schema v1,
-    TENDRIL Link Topology.kt). Never cwd, terminal titles or agent_session —
-    they do not leave the host."""
+def _snapshot_agent(a, tele=None):
+    """One LIVE MAP agent row: the five schema-v1 contract fields plus the
+    v2 `harness` tag and, when tendril_telemetry could derive them, the
+    v2 telemetry keys (TENDRIL Link Topology.kt, AgentTelemetry). Never cwd,
+    terminal titles or agent_session; telemetry carries only tool names and
+    sanitized file basenames inside `activity`, never transcript content."""
     st = a.get("agent_status")
     tab = a.get("tab_id")
-    return {
+    agent = a.get("agent") or "agent"
+    out = {
         "pane_id": a.get("pane_id") or "",
         "tab_id": tab if tab else None,
-        "agent": a.get("agent") or "agent",
+        "agent": agent,
         "status": st if st in _LIVE_STATUS else "unknown",
         "focused": bool(a.get("focused")),
+        "harness": str(agent).lower(),
     }
+    if tele:
+        out.update(tele)
+    return out
 
 
 def _snapshot_doc():
-    """(doc, 0) or (None, 1) — the LIVE MAP v1 document for TENDRIL Link's
-    phone map. ONE `herdr api snapshot` call feeds both the selector rows and
-    the raw document; workspaces in collect()'s order (selector order). The
-    gate is _reachable_rows' semantics, but diagnostics go to STDERR and
-    stdout stays empty on failure: consumers read one JSON line or nothing."""
+    """(doc, 0) or (None, 1) — the LIVE MAP document for TENDRIL Link's
+    phone map (schema v2: the v1 fields plus optional per-agent telemetry
+    derived read-only from each harness's own transcript by
+    tendril_telemetry; any failure there just omits that telemetry). ONE
+    `herdr api snapshot` call feeds both the selector rows and the raw
+    document; workspaces in collect()'s order (selector order). The gate is
+    _reachable_rows' semantics, but diagnostics go to STDERR and stdout
+    stays empty on failure: consumers read one JSON line or nothing."""
     if not HERDR:
         print("no compatible herdr client found", file=sys.stderr)
         return None, 1
@@ -1448,20 +1462,35 @@ def _snapshot_doc():
         print("cannot reach the Herdr server. Is it running? Try: herdr status",
               file=sys.stderr)
         return None, 1
+    agents_flat = [a for r in rows for a in r["agents"]]
+    tele = None
+    if tendril_telemetry is not None and agents_flat:
+        try:
+            tele = tendril_telemetry.for_agents(agents_flat)
+        except Exception:            # telemetry must never fail the map
+            tele = None
     focused_pane = snap.get("focused_pane_id") or None
-    return {
-        "version": 1,
-        "host": HOST_LABEL,
-        "generated_at": int(time.time()),
-        "focused_workspace": next((r["id"] for r in rows if r["focused"]), None),
-        "focused_pane": focused_pane,
-        "workspaces": [{
+    workspaces = []
+    idx = 0
+    for r in rows:
+        ags = []
+        for a in r["agents"]:
+            ags.append(_snapshot_agent(a, tele[idx] if tele else None))
+            idx += 1
+        workspaces.append({
             "id": r["id"],
             "label": r["label"],
             "number": r["number"],
             "focused": bool(r["focused"]),
-            "agents": [_snapshot_agent(a) for a in r["agents"]],
-        } for r in rows],
+            "agents": ags,
+        })
+    return {
+        "version": 2,
+        "host": HOST_LABEL,
+        "generated_at": int(time.time()),
+        "focused_workspace": next((r["id"] for r in rows if r["focused"]), None),
+        "focused_pane": focused_pane,
+        "workspaces": workspaces,
     }, 0
 
 

@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""tendril_telemetry — schema v2 per-agent telemetry for `remote-agents snapshot`.
+
+Derives, READ-ONLY, per-agent facts from the harness's own session transcript
+(pi JSONL, Claude Code JSONL) so the phone map can show model, effort, session
+age, context load, output tokens, cost, the current tool, an operational
+activity phrase, the last event and a short event trail (TENDRIL Link
+Topology.kt, AgentTelemetry).
+
+Privacy contract (enforced structurally, not by filtering output):
+- transcript CONTENT is never retained: no prompt text, no command lines, no
+  directories, no titles — only tool names and file BASENAMES (sanitized) may
+  surface, and only inside `activity`;
+- only regular files are read; pi paths must realpath under $HOME and end in
+  .jsonl; Claude ids must match ^[0-9a-f-]{36}$ before globbing;
+- nothing here prints or logs transcript content, ever.
+
+NEVER fabricate: a field that cannot be derived reliably is omitted (the key
+is absent). Sessions of other harnesses (codex, ...) get no telemetry.
+
+Performance: transcripts can be hundreds of MB with base64 image lines. Reads
+are incremental — a small cache (~/.cache/tendril/telemetry-v1.json keyed by
+realpath) stores accumulators and a byte offset, so each call only reads bytes
+appended since last time. Lines are pre-filtered with byte-substring markers
+BEFORE any json.loads; over-long lines are mined with bounded head/tail regex
+windows instead of being parsed. A wall-clock budget covers all agents per
+call; agents past it get no telemetry this round (their cache advances next
+time). A cold full backfill of one huge file may take a few seconds once.
+
+Stdlib only; every failure mode degrades to "no telemetry" — never an error.
+"""
+import glob
+import json
+import os
+import re
+import stat
+import time
+from datetime import datetime, timezone
+
+# ---------- tunables (module-level so tests can patch) ----------
+HOME = os.path.realpath(os.path.expanduser("~"))
+CACHE_DIR = os.path.expanduser("~/.cache/tendril")
+CACHE_FILE = os.path.join(CACHE_DIR, "telemetry-v1.json")
+BUDGET_S = 1.5              # wall-clock budget for ALL agents per call
+CATCHUP_GRACE_S = 8.5       # extra allowance for one cold full backfill
+OPEN_TOOL_TTL_S = 30 * 60   # an open tool older than this is stale
+HUGE_LINE = 256 * 1024      # above this: regex windows instead of json.loads
+HEAD_BYTES = 512            # bounded head window for over-long lines
+WINDOW_BYTES = 4096         # bounded window around a marker in over-long lines
+MAX_OPEN_CALLS = 64         # ring guard: unmatched tool calls we remember
+MAX_CACHE_ENTRIES = 1024
+TRAIL_MAX = 12
+UUID_RE = re.compile(r"^[0-9a-f-]{36}$")
+
+
+
+def _real_model(value):
+    """A model id worth reporting: harnesses stamp placeholders such as
+    Claude Code's "<synthetic>" on interrupt/error turns — those must never
+    replace the last REAL model."""
+    return isinstance(value, str) and bool(value) and not value.startswith("<")
+
+def _mono():
+    """Monotonic clock (module-level so tests can fake the time budget)."""
+    return time.monotonic()
+
+
+def _time():
+    """Host wall clock for staleness (tests pass `now` instead)."""
+    return time.time()
+
+
+# ---------- small parsers ----------
+_RE_ISO_TS = re.compile(rb'"timestamp":"([0-9T:.+\-Z]{10,40})"')
+_RE_PI_CALLID = re.compile(rb'"toolCallId":"([^"\\]{1,128})"')
+_RE_PI_TOOLNAME = re.compile(rb'"toolName":"([^"\\]{1,80})"')
+_RE_PI_MS_TS = re.compile(rb'"timestamp":(\d{10,16})')
+_RE_PI_INPUT = re.compile(rb'"input":(\d+)')
+_RE_PI_OUTPUT = re.compile(rb'"output":(\d+)')
+_RE_PI_CACHEREAD = re.compile(rb'"cacheRead":(\d+)')
+_RE_PI_CACHEWRITE = re.compile(rb'"cacheWrite":(\d+)')
+_RE_PI_COST = re.compile(rb'"cost":\{[^{}]{0,400}?"total":(\d+(?:\.\d+)?)')
+_RE_CL_INPUT = re.compile(rb'"input_tokens":(\d+)')
+_RE_CL_OUTPUT = re.compile(rb'"output_tokens":(\d+)')
+_RE_CL_CACHEREAD = re.compile(rb'"cache_read_input_tokens":(\d+)')
+_RE_CL_CACHEWRITE = re.compile(rb'"cache_creation_input_tokens":(\d+)')
+_RE_CL_USEID = re.compile(rb'"tool_use_id":"([^"\\]{1,160})"')
+
+
+def _num(v):
+    """int/float (bools excluded) else None."""
+    return v if type(v) in (int, float) else None
+
+
+def _ms(v):
+    """Message timestamp in epoch SECONDS from a millisecond int."""
+    v = _num(v)
+    return None if v is None or v <= 0 else v / 1000.0
+
+
+def _iso_to_epoch(s):
+    """ISO-8601 → epoch seconds; naive strings are treated as UTC."""
+    if not isinstance(s, str) or not s:
+        return None
+    try:
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        t = datetime.fromisoformat(s)
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return t.timestamp()
+    except ValueError:
+        return None
+
+
+def _rx1(rx, blob):
+    m = rx.search(blob)
+    return m.group(1) if m else None
+
+
+def _rx_int(rx, blob):
+    """First regex capture as int, else None."""
+    m = rx.search(blob)
+    return int(m.group(1)) if m else None
+
+
+# ---------- which transcript belongs to this agent (safety gate) ----------
+def _is_regular(path):
+    try:
+        return stat.S_ISREG(os.stat(path).st_mode)
+    except OSError:
+        return False
+
+
+def _under_home(realpath, home):
+    return realpath.startswith(home.rstrip(os.sep) + os.sep)
+
+
+def _spec(agent, home):
+    """(harness, transcript realpath or None). Only paths that passed the
+    safety gate come back; anything else is None."""
+    harness = str(agent.get("agent") or "").strip().lower()
+    sess = agent.get("agent_session")
+    if not isinstance(sess, dict):
+        return harness, None
+    kind, value = sess.get("kind"), sess.get("value")
+    if not isinstance(value, str) or not value:
+        return harness, None
+    if kind == "path" and harness == "pi":
+        if not value.endswith(".jsonl"):
+            return harness, None
+        rp = os.path.realpath(value)         # also collapses .. traversal
+        if not _under_home(rp, home) or not _is_regular(rp):
+            return harness, None
+        return harness, rp
+    if kind == "id" and harness == "claude":
+        if not UUID_RE.match(value):         # BEFORE any globbing
+            return harness, None
+        pattern = os.path.join(home, ".claude", "projects", "*", value + ".jsonl")
+        for hit in sorted(glob.glob(pattern)):
+            rp = os.path.realpath(hit)
+            if _under_home(rp, home) and _is_regular(rp):
+                return harness, rp
+    return harness, None
+
+
+# ---------- accumulators (cache entry) ----------
+def _fresh_entry(size, mtime):
+    return {"size": size, "mtime": mtime, "offset": 0,
+            "started_at": None, "model": None, "provider": None,
+            "effort": None, "context_tokens": None, "output_tokens": 0,
+            "cost_sum": None,            # pi: sum of usage.cost.total
+            "cost_last": None,           # claude: latest cost-state.totalCostUSD
+            "last_event": None, "trail": "", "last_seen_at": None,
+            "open_calls": {}}
+
+
+def _touch(entry, ts):
+    """Record an event time: seeds started_at, advances last_seen_at."""
+    if ts is None:
+        return
+    if entry["started_at"] is None:
+        entry["started_at"] = ts
+    if entry["last_seen_at"] is None or ts > entry["last_seen_at"]:
+        entry["last_seen_at"] = ts
+
+
+def _event(entry, kind, tool, error, ts):
+    """last_event + one trail char (P prompt, R reply, T tool ok, E error).
+    Never any content — only kind, tool NAME and time."""
+    ev = {"kind": kind}
+    if tool:
+        ev["tool"] = tool
+    if kind == "tool_result":
+        ev["error"] = bool(error)
+    if ts is not None:
+        ev["at"] = int(ts)
+    elif entry.get("last_seen_at"):
+        ev["at"] = int(entry["last_seen_at"])
+    if "at" in ev:
+        entry["last_event"] = ev
+    ch = "E" if (kind == "tool_result" and error) else \
+         {"prompt": "P", "reply": "R", "tool_result": "T"}.get(kind)
+    if ch:
+        entry["trail"] = (entry["trail"] + ch)[-TRAIL_MAX:]
+
+
+def _sanitize_base(name):
+    """File basename safe for the wire: [A-Za-z0-9._-], <= 40 chars."""
+    out = re.sub(r"[^A-Za-z0-9._-]", "_", name)[:40]
+    return out if out.strip("_") else None   # pure punctuation: nothing to show
+
+
+def _arg_base(args):
+    """Bounded path-argument extraction: a few known keys, basename only."""
+    if not isinstance(args, dict):
+        return None
+    for k in ("path", "file_path", "filePath", "file", "filename",
+              "notebook_path"):
+        v = args.get(k)
+        if isinstance(v, str) and 0 < len(v) <= 4096 and "://" not in v \
+                and not v.startswith("/dev/"):
+            return _sanitize_base(os.path.basename(v))
+    return None
+
+
+def _open_call(entry, cid, name, ts, args):
+    if not isinstance(cid, str) or not cid:
+        return
+    oc = entry["open_calls"]
+    if len(oc) >= MAX_OPEN_CALLS and cid not in oc:
+        oc.pop(next(iter(oc)))               # drop the oldest unmatched
+    oc[cid] = [name if isinstance(name, str) else "",
+               ts, _arg_base(args)]
+
+
+def _close_call(entry, cid):
+    rec = entry["open_calls"].pop(cid, None) if isinstance(cid, str) else None
+    return rec[0] if rec and rec[0] else None
+
+
+# ---------- pi transcript ----------
+def _pi_usage(entry, out, inp, cache_read, cache_write, cost_total):
+    if out is not None:
+        entry["output_tokens"] += int(out)
+    if out is not None or inp is not None or cache_read is not None \
+            or cache_write is not None:
+        entry["context_tokens"] = int((inp or 0) + (cache_read or 0)
+                                      + (cache_write or 0))
+    if cost_total is not None:
+        entry["cost_sum"] = (entry["cost_sum"] or 0.0) + float(cost_total)
+
+
+def _pi_obj(d, entry):
+    t = d.get("type")
+    if t == "model_change":
+        _touch(entry, _iso_to_epoch(d.get("timestamp")))
+        if isinstance(d.get("modelId"), str):
+            entry["model"] = d["modelId"]
+        if isinstance(d.get("provider"), str):
+            entry["provider"] = d["provider"]
+        return
+    if t == "thinking_level_change":
+        _touch(entry, _iso_to_epoch(d.get("timestamp")))
+        if isinstance(d.get("thinkingLevel"), str):
+            entry["effort"] = d["thinkingLevel"]
+        return
+    if t != "message":
+        return
+    m = d.get("message")
+    if not isinstance(m, dict):
+        return
+    role = m.get("role")
+    ts = _ms(m.get("timestamp"))
+    _touch(entry, ts)
+    if role == "assistant":
+        if _real_model(m.get("model")):
+            entry["model"] = m["model"]
+        if isinstance(m.get("provider"), str):
+            entry["provider"] = m["provider"]
+        if isinstance(m.get("thinkingLevel"), str):
+            entry["effort"] = m["thinkingLevel"]
+        u = m.get("usage")
+        if isinstance(u, dict):
+            c = u.get("cost")
+            _pi_usage(entry, _num(u.get("output")), _num(u.get("input")),
+                      _num(u.get("cacheRead")), _num(u.get("cacheWrite")),
+                      _num(c.get("total")) if isinstance(c, dict) else None)
+        has_tool = has_text = False
+        items = m.get("content")
+        if isinstance(items, list):
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                if it.get("type") == "toolCall":
+                    has_tool = True
+                    _open_call(entry, it.get("id"), it.get("name"), ts,
+                               it.get("arguments"))
+                elif it.get("type") == "text":
+                    has_text = True
+        if not has_tool and has_text:        # a tool-call turn is not a reply
+            _event(entry, "reply", None, False, ts)
+    elif role == "user":
+        items = m.get("content")
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict) and it.get("type") == "text":
+                    _event(entry, "prompt", None, False, ts)
+                    break
+        elif isinstance(items, str) and items.strip():
+            _event(entry, "prompt", None, False, ts)
+    elif role == "toolResult":
+        name = m.get("toolName")
+        _close_call(entry, m.get("toolCallId"))
+        _event(entry, "tool_result",
+               name if isinstance(name, str) else None,
+               bool(m.get("isError")), ts)
+
+
+def _pi_line(raw, entry):
+    if len(raw) > HUGE_LINE:
+        # NEVER json.loads image-bearing lines: bounded head/tail mining only.
+        head = raw[:HEAD_BYTES]
+        ts_iso = _rx1(_RE_ISO_TS, head)
+        _touch(entry, _iso_to_epoch(ts_iso.decode("utf-8", "replace")
+                                    if ts_iso else None))
+        if b'"toolCallId"' in head:
+            cid = _rx1(_RE_PI_CALLID, head)
+            name = _rx1(_RE_PI_TOOLNAME, head)
+            _close_call(entry, cid.decode("utf-8", "replace") if cid else None)
+            mts = _rx1(_RE_PI_MS_TS, raw[-HEAD_BYTES:])
+            _event(entry, "tool_result",
+                   name.decode("utf-8", "replace") if name else None,
+                   b'"isError":true' in raw,
+                   _ms(int(mts)) if mts else None)
+        elif b'"usage"' in raw:
+            at = raw.find(b'"usage"')
+            win = raw[at:at + WINDOW_BYTES]
+            cost = _rx1(_RE_PI_COST, win)
+            _pi_usage(entry, _rx_int(_RE_PI_OUTPUT, win),
+                      _rx_int(_RE_PI_INPUT, win),
+                      _rx_int(_RE_PI_CACHEREAD, win),
+                      _rx_int(_RE_PI_CACHEWRITE, win),
+                      float(cost) if cost else None)
+            if b'"toolCall"' not in raw and b'"text"' in raw:
+                _event(entry, "reply", None, False, None)
+        return
+    # cheapest markers first: toolResult lines dominate, then assistant usage
+    if b'"toolCallId"' in raw or b'"usage"' in raw or b'"role":"user"' in raw \
+            or b'"role":"assistant"' in raw or b'model_change' in raw \
+            or b'thinking_level_change' in raw:
+        try:
+            d = json.loads(raw)
+        except Exception:
+            return
+        if isinstance(d, dict):
+            _pi_obj(d, entry)
+
+
+# ---------- claude transcript ----------
+def _cl_usage(entry, out, inp, cache_read, cache_write):
+    if out is not None:
+        entry["output_tokens"] += int(out)
+    if out is not None or inp is not None or cache_read is not None \
+            or cache_write is not None:
+        entry["context_tokens"] = int((inp or 0) + (cache_read or 0)
+                                      + (cache_write or 0))
+
+
+def _cl_obj(d, entry):
+    t = d.get("type")
+    ts = _iso_to_epoch(d.get("timestamp"))
+    if t == "assistant":
+        _touch(entry, ts)
+        m = d.get("message")
+        if not isinstance(m, dict):
+            return
+        if _real_model(m.get("model")):
+            entry["model"] = m["model"]
+        if isinstance(d.get("effort"), str):     # recorded by the harness
+            entry["effort"] = d["effort"]
+        u = m.get("usage")
+        if isinstance(u, dict):
+            _cl_usage(entry, _num(u.get("output_tokens")),
+                      _num(u.get("input_tokens")),
+                      _num(u.get("cache_read_input_tokens")),
+                      _num(u.get("cache_creation_input_tokens")))
+        has_tool = has_text = False
+        items = m.get("content")
+        if isinstance(items, list):
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                if it.get("type") == "tool_use":
+                    has_tool = True
+                    _open_call(entry, it.get("id"), it.get("name"), ts,
+                               it.get("input"))
+                elif it.get("type") == "text":
+                    has_text = True
+        if not has_tool and has_text:
+            _event(entry, "reply", None, False, ts)
+    elif t == "user":
+        _touch(entry, ts)
+        m = d.get("message")
+        c = m.get("content") if isinstance(m, dict) else None
+        if isinstance(c, str):
+            if c.strip():
+                _event(entry, "prompt", None, False, ts)
+        elif isinstance(c, list):
+            saw_text = False
+            for it in c:
+                if not isinstance(it, dict):
+                    continue
+                if it.get("type") == "tool_result":
+                    _touch(entry, ts)
+                    _event(entry, "tool_result",
+                           _close_call(entry, it.get("tool_use_id")),
+                           bool(it.get("is_error")), ts)
+                elif it.get("type") == "text":
+                    saw_text = True
+            if saw_text:
+                _event(entry, "prompt", None, False, ts)
+    elif t == "cost-state":
+        v = _num(d.get("totalCostUSD"))
+        if v is not None:
+            entry["cost_last"] = float(v)
+
+
+def _cl_line(raw, entry):
+    if len(raw) > HUGE_LINE:
+        head = raw[:HEAD_BYTES]
+        ts_iso = _rx1(_RE_ISO_TS, head)
+        _touch(entry, _iso_to_epoch(ts_iso.decode("utf-8", "replace")
+                                    if ts_iso else None))
+        if b'"tool_use_id"' in head:
+            cid = _rx1(_RE_CL_USEID, head)
+            _close_call(entry, cid.decode("utf-8", "replace") if cid else None)
+            _event(entry, "tool_result", None, b'"is_error":true' in raw,
+                   _iso_to_epoch(_rx1(_RE_ISO_TS, raw[-HEAD_BYTES:])))
+        elif b'"usage"' in raw:
+            at = raw.find(b'"usage"')
+            win = raw[at:at + WINDOW_BYTES]
+            _cl_usage(entry, _rx_int(_RE_CL_OUTPUT, win),
+                      _rx_int(_RE_CL_INPUT, win),
+                      _rx_int(_RE_CL_CACHEREAD, win),
+                      _rx_int(_RE_CL_CACHEWRITE, win))
+            if b'"tool_use"' not in raw and b'"text"' in raw:
+                _event(entry, "reply", None, False, None)
+        return
+    if b'"type":"assistant"' in raw or b'"type":"user"' in raw \
+            or b'cost-state' in raw:
+        try:
+            d = json.loads(raw)
+        except Exception:
+            return
+        if isinstance(d, dict):
+            _cl_obj(d, entry)
+
+
+# ---------- incremental scan driver ----------
+_HANDLERS = {"pi": _pi_line, "claude": _cl_line}
+
+
+def _scan(path, entry, harness, deadline, hard_deadline):
+    """Read only bytes past entry["offset"]; update accumulators in place.
+    Truncation/rotation (file shrank) resets the entry. A partial final line
+    is left for the next call. Progress is persisted even when the time
+    budget ends mid-file, so a huge backfill advances across calls."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    if not stat.S_ISREG(st.st_mode):
+        return
+    size, mtime = st.st_size, st.st_mtime
+    if size < entry.get("size", 0) or entry["offset"] > size:
+        entry.clear()                        # truncated or replaced: reset
+        entry.update(_fresh_entry(size, mtime))
+    offset = entry["offset"]
+    if offset == size:
+        entry["size"], entry["mtime"] = size, mtime
+        return
+    limit = hard_deadline if offset == 0 else deadline
+    handle = _HANDLERS.get(harness)
+    if handle is None:
+        return
+    pos = offset
+    seen = 0
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            for raw in f:
+                if not raw.endswith(b"\n"):
+                    break                    # writer mid-line: come back later
+                seen += 1
+                try:
+                    handle(raw, entry)
+                except Exception:
+                    pass                     # one bad line never kills a scan
+                pos += len(raw)
+                if entry["started_at"] is None:
+                    ts = _rx1(_RE_ISO_TS, raw[:HEAD_BYTES])
+                    if ts:
+                        _touch(entry, _iso_to_epoch(
+                            ts.decode("utf-8", "replace")))
+                if (seen & 0x7FF) == 0 and _mono() > limit:
+                    break                    # budget out; offset keeps progress
+    except OSError:
+        return
+    entry["offset"] = pos
+    entry["size"], entry["mtime"] = size, mtime
+
+
+# ---------- activity phrase (operational, never content) ----------
+_EDIT_TOOLS = {"edit", "write", "apply_patch", "Edit", "Write", "MultiEdit",
+               "NotebookEdit"}
+_READ_TOOLS = {"read", "Read"}
+_RUN_TOOLS = {"bash", "Bash"}
+_SEARCH_TOOLS = {"grep", "glob", "find", "Grep", "Glob", "ls"}
+_WEB_TOOLS = {"web_search", "WebSearch", "fetch", "WebFetch", "web_fetch"}
+_DELEGATE_TOOLS = {"Task", "Agent"}
+
+
+def _tool_phrase(name, base):
+    if name in _DELEGATE_TOOLS or name.startswith("subagent"):
+        return "Delegating to a subagent"
+    if name in _EDIT_TOOLS:
+        return ("Editing " + base) if base else "Editing files"
+    if name in _READ_TOOLS:
+        return ("Reading " + base) if base else "Reading files"
+    if name in _RUN_TOOLS:
+        return "Running a command"           # never the command itself
+    if name in _SEARCH_TOOLS:
+        return "Searching the repository"
+    if name in _WEB_TOOLS:
+        return "Researching the web"
+    return "Using " + (_sanitize_base(name) or "tool")
+
+
+def _activity(status, tool_name, tool_base):
+    if status == "blocked":
+        return "Waiting for input"
+    if tool_name:
+        return _tool_phrase(tool_name, tool_base)
+    if status == "working":
+        return "Thinking"
+    if status == "idle":
+        return "Idle"
+    if status == "done":
+        return "Finished"
+    return None                              # unknown status: omit, don't guess
+
+
+# ---------- wire emit ----------
+def _emit(harness, entry, status, now):
+    out = {"harness": harness}
+    for k in ("model", "provider", "effort"):
+        v = entry.get(k)
+        if isinstance(v, str) and v:
+            out[k] = v
+    if entry.get("started_at"):
+        out["started_at"] = int(entry["started_at"])
+    if entry.get("context_tokens"):
+        out["context_tokens"] = int(entry["context_tokens"])
+    if entry.get("output_tokens"):
+        out["output_tokens"] = int(entry["output_tokens"])
+    cost = entry.get("cost_sum") if harness == "pi" else entry.get("cost_last")
+    if cost is not None:
+        out["cost_usd"] = round(float(cost), 4)
+    seen = entry.get("last_seen_at")
+    oc = entry.get("open_calls") or {}
+    tool_base = None
+    if oc and seen is not None and (now - seen) <= OPEN_TOOL_TTL_S:
+        _cid, rec = max(oc.items(), key=lambda kv: kv[1][1] or 0)
+        name, ts, tool_base = rec
+        if name:
+            out["tool"] = name
+            if ts:
+                out["tool_started_at"] = int(ts)
+        else:
+            tool_base = None
+    phrase = _activity(status, out.get("tool"), tool_base)
+    if phrase:
+        out["activity"] = phrase
+    ev = entry.get("last_event")
+    if isinstance(ev, dict) and "at" in ev:
+        out["last_event"] = dict(ev)
+    if entry.get("trail"):
+        out["trail"] = entry["trail"]
+    return out
+
+
+# ---------- cache ----------
+def _load_cache(path):
+    try:
+        with open(path, "rb") as f:
+            d = json.loads(f.read(4 * 1024 * 1024))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_cache(path, cache):
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(cache, f, separators=(",", ":"))
+        os.replace(tmp, path)
+        try:
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+    except OSError:
+        pass
+
+
+# ---------- entry point ----------
+def for_agents(agents, budget=BUDGET_S, cache_path=None, home=None, now=None):
+    """Telemetry wire dicts aligned with `agents` (raw herdr agent dicts);
+    None where nothing could be derived. Never raises."""
+    if not agents:
+        return []
+    home = home or HOME
+    cache_path = cache_path or CACHE_FILE
+    now = _time() if now is None else now
+    deadline = _mono() + budget
+    hard = deadline + CATCHUP_GRACE_S
+    cache = _load_cache(cache_path) if os.path.exists(cache_path) else {}
+    out, by_path, touched, keep = [], {}, False, set()
+    for a in agents:
+        res = None
+        try:
+            harness, path = _spec(a, home)
+            if path is not None and harness in _HANDLERS \
+                    and _mono() <= deadline:
+                res = by_path.get(path)
+                if res is None:
+                    try:
+                        st = os.stat(path)
+                    except OSError:
+                        st = None
+                    if st is None:
+                        cache.pop(path, None)
+                        touched = True
+                    else:
+                        entry = cache.get(path)
+                        if not isinstance(entry, dict) \
+                                or not isinstance(entry.get("offset"), int) \
+                                or not isinstance(entry.get("open_calls"), dict) \
+                                or not isinstance(entry.get("trail"), str):
+                            entry = _fresh_entry(st.st_size, st.st_mtime)
+                        _scan(path, entry, harness, deadline, hard)
+                        res = _emit(harness, entry,
+                                    str(a.get("agent_status") or ""), now)
+                        by_path[path] = res
+                        cache[path] = entry
+                        touched = True
+                        keep.add(path)
+        except Exception:
+            res = None                        # telemetry must never fail the map
+        out.append(res)
+    if touched:
+        # drop entries for files that vanished, then cap the cache size
+        cache = {p: e for p, e in cache.items()
+                 if p in keep or os.path.exists(p)}
+        while len(cache) > MAX_CACHE_ENTRIES:
+            cache.pop(next(iter(cache)))
+        _save_cache(cache_path, cache)
+    return out
