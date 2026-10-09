@@ -1,4 +1,13 @@
-# Android (Termux) setup
+## Android (Termux) setup
+
+## 0. Pair your phone (fastest path)
+
+On the host, run `tendril --pair`. It prints the host identity, the
+`TENDRIL1:` pairing code for the TENDRIL Link app (a scannable QR too,
+when `qrencode` is installed), the ntfy topic to subscribe to, and a
+paste-ready Termux setup block with every value filled in. Scan or paste
+the code in the app; it fills in the host. The manual steps below do the
+same thing by hand.
 
 ## 1. Install the base
 
@@ -18,7 +27,7 @@ ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -C "termux"
 ```
 Host <alias>                     # pick any short name, e.g. "home"
     HostName <tailscale-hostname-or-ip>
-    User <your-linux-username>
+    User <your-host-username>       # Linux or macOS
     IdentityFile ~/.ssh/id_ed25519
     IdentitiesOnly yes
     ServerAliveInterval 30
@@ -72,7 +81,7 @@ Set your alias once (or pass it every time: `tendril <alias>`;
 an existing `AGENT_ALIAS` keeps working):
 
 ```sh
-echo 'TENDRIL_ALIAS=<alias>' >> ~/.bashrc
+echo 'export TENDRIL_ALIAS=<alias>' >> ~/.bashrc
 ```
 
 ## 6. Notifications
@@ -145,14 +154,36 @@ older selectors need `Q` then Enter; the updated selector quits with `Q` alone.
 Run `tendril` again to start the updated selector; reconnecting Mosh alone is
 not enough.
 
+The supported one-command update is `tendril --upgrade` on the host (add
+`--verbose` to see the installer/git output): it fast-forwards the recorded
+checkout, refreshes the installed files, and — when `phone/tendril` or
+`phone/termux-url-opener` changed upstream — prints `android client update
+available` with the exact commands. They are the same on any phone; run them
+inside Termux:
+
+```sh
+scp 'HOST_ALIAS:/path/to/tendril/phone/tendril' ~/bin/tendril
+scp 'HOST_ALIAS:/path/to/tendril/phone/termux-url-opener' ~/bin/termux-url-opener
+chmod 700 ~/bin/tendril ~/bin/termux-url-opener
+```
+
+`HOST_ALIAS` is the SSH config alias from step 3 and the path is the host's
+tendril checkout (the upgrade prints both with your real values). A plain
+selector-only change never requires a phone refresh — the upgrade says
+`android     client current` instead.
+
 ## Deep links: tap a notification, land in the session
 
 Termux registers no URL schemes, so a bare notification tap cannot open
 Termux. What Termux does reliably: when a URL is **shared** to the Termux
 app it runs `~/bin/termux-url-opener <url>`. The repo ships that script —
 `phone/termux-url-opener` — and it recognizes TENDRIL links like
-`https://…/.tendril/w15` (also `?id=…`/`?p=…` pairs), validates the id and
-runs `tendril attach <id>` for you.
+`https://…/.tendril/w15` (also `?id=…`/`?p=…` pairs; the id may be an
+exact pane id like `w15:p3`), validates the id and runs
+`tendril enter <id>` for you: exact focus on the emitting agent's pane,
+the interactive session, and the selector after detach. `w15` is only an
+example: use a live id from the selector (or `tendril link` on the host);
+an unknown id exits with a clean "not found".
 
 Install it on the phone (`HOST` = ssh alias, `REPO` = host checkout path,
 as in step 5 above):
@@ -174,13 +205,16 @@ Two ways in:
    `io.heckel.ntfy.MESSAGE_RECEIVED` per message (enable "broadcast
    messages" in ntfy settings); MacroDroid turns that into a SEND intent
    to Termux (no extra permission) or a RUN_COMMAND call of
-   `~/bin/tendril attach <id>` (needs `allow-external-apps=true` and the
+   `~/bin/tendril enter <id>` (needs `allow-external-apps=true` and the
    `RUN_COMMAND` permission grant). Exact intent fields are in
    **docs/DEEPLINK.md**.
 
 On iOS the equivalent is an ntfy tap → Shortcut → `remote-agents focus`
 over SSH → Blink; the full recipe and the canonical `tendril://` link
 format also live in docs/DEEPLINK.md.
+
+On a Mac, `./install --client` gives you the same `tendril` command
+(Mosh preferred, SSH fallback) — see docs/MACOS.md.
 
 ## Troubleshooting
 

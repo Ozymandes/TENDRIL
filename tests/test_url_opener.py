@@ -61,12 +61,12 @@ class UrlOpenerTests(unittest.TestCase):
         with open(self.log) as fh:
             return fh.read()
 
-    def assert_attach(self, urls, session_id, extra_absent=None):
-        """Opener must exec the tendril stub with ['attach', session_id]."""
+    def assert_enter(self, urls, session_id, extra_absent=None):
+        """Opener must exec the tendril stub with ['enter', session_id]."""
         self.reset_log()
         r = self.run_opener(*urls)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn(f"tendril <attach> <{session_id}>", self.log_text())
+        self.assertIn(f"tendril <enter> <{session_id}>", self.log_text())
         self.assertNotIn("termux-open-url", self.log_text())
         self.assertNotIn("termux-open ", self.log_text())
         for absent in extra_absent or ():
@@ -84,50 +84,60 @@ class UrlOpenerTests(unittest.TestCase):
 
     # ---- accepted forms -------------------------------------------------
 
-    def test_path_form_attaches(self):
-        self.assert_attach(["https://host.example/.tendril/w15"], "w15")
+    def test_path_form_enters(self):
+        self.assert_enter(["https://host.example/.tendril/w15"], "w15")
 
     def test_path_form_with_query_junk(self):
-        self.assert_attach(
+        self.assert_enter(
             ["https://host.example/.tendril/w15?utm=1&x=%20"], "w15")
 
     def test_path_form_last_segment_wins(self):
-        self.assert_attach(
+        self.assert_enter(
             ["https://host.example/.tendril/old/.tendril/w15"], "w15")
 
     def test_query_p_form(self):
-        self.assert_attach(["https://host.example/page?p=wK"], "wK")
+        self.assert_enter(["https://host.example/page?p=wK"], "wK")
 
     def test_query_p_form_with_more_pairs(self):
-        self.assert_attach(["https://h/p?a=1&p=w15&b=2"], "w15")
+        self.assert_enter(["https://h/p?a=1&p=w15&b=2"], "w15")
 
     def test_fragment_p_form(self):
-        self.assert_attach(["https://host.example/page#p=wX"], "wX")
+        self.assert_enter(["https://host.example/page#p=wX"], "wX")
 
     def test_query_id_form(self):
-        self.assert_attach(["https://host.example/open?id=w13"], "w13")
+        self.assert_enter(["https://host.example/open?id=w13"], "w13")
 
     def test_fragment_id_form(self):
-        self.assert_attach(["https://host.example/open#id=w9"], "w9")
+        self.assert_enter(["https://host.example/open#id=w9"], "w9")
 
     def test_query_wins_when_both_query_and_fragment_carry_ids(self):
-        self.assert_attach(["https://h/x?id=w1#p=w2"], "w1")
+        self.assert_enter(["https://h/x?id=w1#p=w2"], "w1")
 
     def test_tendril_uri_form(self):
-        self.assert_attach(["tendril://host/h/workspace/w15"], "w15")
+        self.assert_enter(["tendril://host/h/workspace/w15"], "w15")
 
     def test_tendril_uri_form_with_label_query(self):
-        self.assert_attach(
+        self.assert_enter(
             ["tendril://host/h/workspace/w15?label=proj%20x"], "w15")
 
     def test_pane_id_accepted(self):
-        self.assert_attach(["https://h/.tendril/w15:p1"], "w15:p1")
+        self.assert_enter(["https://h/.tendril/w15:p1"], "w15:p1")
+
+    def test_pane_id_via_query_pair_routed_to_enter(self):
+        self.assert_enter(["https://h/open?p=w15:p3"], "w15:p3")
+        self.assert_enter(["https://h/open?id=wX:pB#junk"], "wX:pB")
+
+    def test_tendril_uri_with_pane_query_yields_the_workspace(self):
+        # the tendril:// form carries the workspace id; exact panes ride
+        # the /.tendril/<target> path carrier
+        self.assert_enter(["tendril://host/h/workspace/w15?pane=w15%3Ap3"],
+                          "w15")
 
     def test_max_id_128_accepted(self):
-        self.assert_attach(["https://h/.tendril/" + "a" * 128], "a" * 128)
+        self.assert_enter(["https://h/.tendril/" + "a" * 128], "a" * 128)
 
     def test_first_tendril_url_wins_and_suppresses_passthrough(self):
-        self.assert_attach(
+        self.assert_enter(
             ["https://example.com/page", "https://h/.tendril/w15"], "w15")
 
     # ---- rejected: known form, malformed id -----------------------------

@@ -100,6 +100,10 @@ Do these steps in a terminal **on the computer**.
 
 ### Step A1: Install the basic tools
 
+(These steps assume an Ubuntu/Debian computer. For a Mac, see
+[MACOS.md](MACOS.md): turn on Remote Login, run `xcode-select --install`,
+and `brew install mosh`.)
+
 ```sh
 sudo apt update
 sudo apt install -y openssh-server mosh git python3 curl
@@ -426,6 +430,11 @@ This only checks. It does not change anything.
 
 Get an alert when an agent finishes or needs you.
 
+> Your topic survives updates. Re-running `./install` keeps the existing
+> `notify.env` byte-for-byte unless you explicitly choose **Rotate
+> notification topic** — subscribed phones never need to resubscribe after
+> a normal `git pull && ./install`.
+
 ### Step N1: Find your topic (on the computer)
 
 ```sh
@@ -469,7 +478,8 @@ Alerts contain only these words and the workspace name. They never contain your 
 The setup script already copied the deep-link helper to
 `~/bin/termux-url-opener`. Android cannot open Termux from a bare
 notification tap, so today there are two supported paths: **share** any
-TENDRIL URL (like `https://…/.tendril/w15`) to the Termux app from any
+TENDRIL URL (like `https://…/.tendril/w15`; `w15` is an example — use a
+live id shown by the selector) to the Termux app from any
 share sheet (works right away, no extra setup), or set up Tasker or
 MacroDroid for real one-tap behavior (needs the ntfy "broadcast
 messages" setting). What each path can and cannot do is documented in
@@ -501,7 +511,7 @@ bash tendril-phone-setup.sh --check
 | The menu is empty | No workspaces yet. | Run `herdr` on the computer and start an agent. Or press **N** in the menu. |
 | Mosh connects, then freezes | The firewall blocks Mosh. | Use `tendril ssh` for now. Then do Step A5. |
 | ALT then D does nothing | The key went to the wrong place. | Use **Ctrl+B**, then **D**. |
-| No notifications | Wrong topic, or the watcher is stopped. | Check the topic in the ntfy app. On the computer: `systemctl --user status herdr-notify` |
+| No notifications | Wrong topic, or the watcher is stopped. | Check the topic in the ntfy app. On the computer: `tendril service status` (Linux also: `systemctl --user status herdr-notify`) |
 | Strange symbols on screen | The font lacks some characters. | In Termux: `pkg install font-firas-mono` |
 
 ### Useful check commands

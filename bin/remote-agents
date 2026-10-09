@@ -6,11 +6,15 @@ no daemon, no tmux. Built for narrow Android screens (Termux + Mosh/SSH).
 """
 import contextlib
 import difflib
+import getpass
 import hashlib
+import importlib.machinery
+import importlib.util
 import json
 import os
 import re
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -52,7 +56,6 @@ PROJECT_ROOTS = _root_list("PROJECT_ROOTS",
                            ["~/Projects", "~/src", "~/dev", "~/code", "~"])
 NOTIFY_BIN = os.path.expanduser(CONFIG.get("NOTIFY_BIN")
                                 or "~/.local/bin/herdr-notify")
-HOST_LABEL = CONFIG.get("TAILSCALE_HOST") or os.uname().nodename
 
 # ---------- canonical deep links (tendril-link, installed next to us) ----------
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -60,9 +63,32 @@ try:
     import tendril_link          # payload/uri codec for session addresses
 except ImportError:              # stale install: the selector keeps working
     tendril_link = None
+try:
+    import tendril_host          # the few host facts/lifecycle verbs per OS
+except ImportError:
+    tendril_host = None
+try:
+    import tendril_upgrade       # --version / --upgrade (thin dispatch below)
+except ImportError:
+    tendril_upgrade = None
+
+# Canonical host identity (binding contract): config TENDRIL_HOST -> legacy
+# TAILSCALE_HOST (lowercased) -> short hostname, HOST_RE-gated, sanitized —
+# the single name every deep link, notification and pairing code uses.
+if tendril_link is not None and hasattr(tendril_link, "host_identity"):
+    HOST_LABEL = tendril_link.host_identity(CONFIG)
+else:  # stale install without the resolver: the pre-contract behavior
+    HOST_LABEL = CONFIG.get("TAILSCALE_HOST") or (
+        tendril_host.short_hostname() if tendril_host else os.uname().nodename)
+
+NOTIFY_ENV = (os.environ.get("NOTIFY_ENV")
+              or os.path.expanduser("~/.config/remote-agents/notify.env"))
 
 
 # ---------- Herdr client detection (protocol-verified, newest-compatible) ----------
+HERDR_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
+
+
 def _herdr_candidates():
     out = []
     override = CONFIG.get("HERDR_BIN") or os.environ.get("HERDR_BIN")
@@ -71,6 +97,11 @@ def _herdr_candidates():
     found = shutil.which("herdr")
     if found:
         out.append(found)
+    # install.sh (~/.local/bin) and Homebrew locations: SSH/launchd PATHs omit them
+    for d in HERDR_DIRS:
+        p = os.path.join(os.path.expanduser(d), "herdr")
+        if os.path.isfile(p):
+            out.append(p)
     mise = os.path.expanduser("~/.local/share/mise/installs/herdr")
     latest = os.path.join(mise, "latest", "herdr")
     if os.path.isfile(latest):
@@ -102,12 +133,16 @@ def herdr_probe(path):
         v = subprocess.run([path, "--version"], capture_output=True,
                            text=True, timeout=6)
         version = (v.stdout or v.stderr).strip() or "(no version output)"
+    except subprocess.TimeoutExpired:
+        return False, "no answer to --version (timeout)"
     except OSError as e:
         return False, f"not runnable: {e}"
     try:
         s = subprocess.run([path, "status"], capture_output=True,
                            text=True, timeout=8)
         txt = (s.stdout or "") + (s.stderr or "")
+    except subprocess.TimeoutExpired:
+        return False, f"{version}; status timed out"
     except OSError as e:
         return False, f"{version}; status failed: {e}"
     running = re.search(r"status:\s*running", txt)
@@ -141,6 +176,8 @@ EXTRA_PATH = ":".join([
     os.path.expanduser("~/.local/share/mise/installs/pi/latest/pi"),
     os.path.expanduser("~/.local/share/mise/installs/claude/latest"),
     os.path.expanduser("~/.local/share/mise/installs/codex/latest/bin"),
+    "/opt/homebrew/bin",           # Homebrew (Apple Silicon / Intel): agents
+    "/usr/local/bin",              # installed there are absent from SSH PATH
 ])
 os.environ["PATH"] = os.environ.get("PATH", "") + ":" + EXTRA_PATH
 
@@ -154,8 +191,9 @@ SHORT = {"pi": "PI", "claude": "CL", "codex": "CX", "gemini": "GE",
 def terminal_name(env=None):
     """'termux' | 'blink' | generic terminal family name.
 
-    Termux self-identifies (TERMUX_VERSION, forwarded by its ssh).
-    Everything else is opt-in: users who want terminal-aware hints set
+    TERMUX_VERSION only arrives when the user forwards it (ssh SendEnv /
+    AcceptEnv): stock OpenSSH sends just TERM and LC_*, and mosh only its
+    colour count and locale. Everything else is opt-in: users who want terminal-aware hints set
     TENDRIL_TERMINAL=blink (Blink Shell) — Blink sends no distinguishing
     env over SSH. Unknown values pass through as-is so future clients
     need no code change."""
@@ -174,7 +212,10 @@ def pick_palette(colorterm):
     (COLORTERM), else the nearest 256-colour approximations. mosh < 1.4
     silently drops 38;2;r;g;b sequences (Ubuntu 22.04 ships 1.3.2), which
     rendered the whole phone UI monochrome; the 256-colour entries survive
-    every transport."""
+    every transport. COLORTERM proves the terminal, not the transport: a
+    COLORTERM forwarded into mosh < 1.4 still loses 38;2. Desktop terminals
+    need no special case: Apple Terminal sets no COLORTERM (256 colours);
+    iTerm2, Ghostty, WezTerm and kitty advertise truecolor."""
     if (colorterm or "").lower() in ("truecolor", "24bit"):
         return ("\033[38;2;203;253;117m", "\033[38;2;47;179;196m",
                 "\033[38;2;112;128;136m", "\033[38;2;232;92;111m")
@@ -351,8 +392,15 @@ def line(w, ch="\u2500"):
     return ch * w
 
 
+def tailscale_cli():
+    """PATH first, then the macOS app bundle's CLI."""
+    if tendril_host:
+        return tendril_host.tailscale_cli() or "tailscale"
+    return "tailscale"
+
+
 def tailscale_parts():
-    rc, out, _ = run(["tailscale", "ip", "-4"], 4)
+    rc, out, _ = run([tailscale_cli(), "ip", "-4"], 4)
     if rc == 0 and out.strip():
         return "ACTIVE", out.strip().splitlines()[0]
     return "DOWN", ""
@@ -409,8 +457,9 @@ def render(rows, note="", selected=None):
 
     compact = len(rows) > 6
     # Paths yield when needed to keep the menu and prompt on screen, or when
-    # dropping them buys the compact mark a slot. Otherwise preserve paths;
-    # masthead() can fall back to its caption tiers independently.
+    # dropping them buys the brand a tier: the compact mark, else the
+    # TENDRIL + slogan caption, else the one-line caption. Paths never push
+    # the whole brand off screen (a keyboard-open phone with 7+ workspaces).
     term_rows = shutil.get_terminal_size(fallback=(52, 24)).lines
     est = 4 + len(feet) + 2
     with_paths = est + sum(1 + (1 if r["path"] else 0) + (0 if compact else 1)
@@ -419,9 +468,11 @@ def render(rows, note="", selected=None):
     if note:
         with_paths += 1
         without += 1
-    mark = 7 + 1                                # compact tier + blank separator
+    # brand heights incl. the blank separator: compact mark, caption, title
+    brand = next((h for h in (7 + 1, 2 + 1, 1 + 1)
+                  if h + without + 1 <= term_rows), 0) if COLOR else 0
     show_paths = with_paths + 1 <= term_rows and (
-        mark + with_paths + 1 <= term_rows or mark + without + 1 > term_rows)
+        brand + with_paths + 1 <= term_rows)
 
     lines = []
     edge = f"{C_LIME}\u250c{line(inner)}\u2510{C_RESET}"
@@ -518,12 +569,20 @@ def _bridge_enabled():
     return True
 
 
-def attach(row):
+def attach(row, pane=None):
+    """One-shot attach (selector, `attach <token>`). pane=None focuses
+    the workspace -- the historical semantics, unchanged. With a live
+    pane entry the focus is exact (workspace -> tab -> pane, verified)
+    and a failed verification attaches nothing, returning False."""
     save_last(row)
-    run([HERDR, "workspace", "focus", row["id"]], 6)
+    if pane is not None:
+        if not _focus_pane(pane):
+            return False
+    else:
+        run([HERDR, "workspace", "focus", row["id"]], 6)
     if os.environ.get("HERDR_ENV") == "1":
         input(f"already inside Herdr — workspace '{row['label']}' focused. Enter...")
-        return
+        return True
     if _bridge_enabled():
         print(f"{C_GRAY}attaching {row['label']} \u2014 detach: Ctrl+Home \u00b7 Alt+D \u00b7 Ctrl+B d - menu returns here{C_RESET}",
               flush=True)
@@ -532,6 +591,7 @@ def attach(row):
         print(f"{C_GRAY}attaching {row['label']} \u2014 detach: Alt+D \u00b7 Ctrl+B then D fallback - menu returns here{C_RESET}",
               flush=True)
         subprocess.run([HERDR, "session", "attach", SESSION], check=False)
+    return True
 
 
 # ---------- Ctrl+Home detach bridge (default-on TENDRIL convenience) ----------
@@ -1017,6 +1077,38 @@ def wait_for_key():
         read_key(fd)
 
 
+_DIGIT_WORDS = {"switch tab": "jump to tab", "switch workspace": "jump to workspace",
+                "focus agent": "focus agent"}
+
+
+def digit_rows(text=None):
+    """What digit chords really do in this user's Herdr config (the help
+    must not promise workspace jumps that a user binding overrides).
+    Falls back to Herdr's documented defaults without the helper."""
+    path = os.environ.get("HERDR_CONFIG_PATH") or os.path.join(
+        os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"),
+        "herdr", "config.toml")
+    helper = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "herdr-bindings.py")
+    try:
+        if text is None:
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        loader = importlib.machinery.SourceFileLoader("herdr_bindings", helper)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        pairs = mod.describe_digits(text)
+    except FileNotFoundError:
+        pairs = [("Ctrl+B 1..9", "switch tab")] if os.path.isfile(helper) else []
+    except Exception:
+        pairs = []
+    if not pairs:
+        return [("Ctrl+B 1..9", "jump (see Herdr config)")]
+    return [(keys, _DIGIT_WORDS.get(does, does)) for keys, does in pairs
+            if does != "unbound"]
+
+
 def help_screen():
     """Mobile key reference. Bindings mirror ~/.config/herdr/config.toml."""
     w = max(34, min(shutil.get_terminal_size(fallback=(48, 24)).columns, 48))
@@ -1036,8 +1128,7 @@ def help_screen():
         ("Alt+D", "detach to selector"),
         ("Ctrl+B d", "detach fallback"),
         ("Ctrl+Home", "detach (host bridge)"),
-        ("Ctrl+B 1..9", "jump to workspace"),
-        ("Alt+1..9", "jump without prefix"),
+    ] + digit_rows() + [
         ("Ctrl+B w", "workspace picker"),
         ("Ctrl+B n/p", "next / previous tab"),
         ("Alt+\u2190/\u2192", "previous / next tab"),
@@ -1082,6 +1173,8 @@ def help_screen():
                       "these hints."]
     else:
         notes[1:1] = ["Ctrl+Home bridge: default on.",
+                      "Mac: Fn+Ctrl+Left = Ctrl+Home.",   # stock Terminal/iTerm2
+                      "No Home key? Ctrl+B then D.",      # send neither combo
                       "Disable on host with:",
                       "TENDRIL_DETACH_BRIDGE=0",
                       "(false/no/off/empty also disable)."]
@@ -1104,24 +1197,18 @@ def help_screen():
 
 
 def info():
-    host = os.uname().nodename
-    rc, ip, _ = run(["tailscale", "ip", "-4"], 4)
-    ts = ip.strip().splitlines()[0] if rc == 0 and ip.strip() else "down"
-    _, up, _ = run(["uptime", "-p"], 3)
-    load = open("/proc/loadavg").read().split()[:3]
-    mem = {}
-    for ln in open("/proc/meminfo"):
-        k, v = ln.split(":")
-        mem[k] = int(v.split()[0]) // 1024
-    disk = run(["df", "-h", "/"], 3)[1].splitlines()[-1].split()
-    bat = ""
-    for b in ("/sys/class/power_supply/BAT0/capacity",
-              "/sys/class/power_supply/BAT1/capacity"):
-        try:
-            bat = open(b).read().strip() + "%"
-            break
-        except OSError:
-            pass
+    host = tendril_host.short_hostname() if tendril_host else os.uname().nodename
+    status, ip = tailscale_parts()
+    ts = ip if status == "ACTIVE" else "down"
+    if tendril_host:
+        up = tendril_host.format_uptime(tendril_host.uptime_seconds(run))
+        load = tendril_host.load_average()
+        mem = tendril_host.memory_mb(run)
+        bat = tendril_host.battery(run)
+    else:
+        up, load, mem, bat = "?", ("?", "?", "?"), None, ""
+    disk = run(["df", "-h", "/"], 3)[1].splitlines()[-1:] or [""]
+    disk = disk[0].split()
     rows = collect() or []
     nws = len(rows)
     counts = {}
@@ -1129,17 +1216,19 @@ def info():
         for a in r["agents"]:
             counts[a.get("agent", "?")] = counts.get(a.get("agent", "?"), 0) + 1
     agents = " ".join(f"{k}:{v}" for k, v in sorted(counts.items())) or "none"
+    memtxt = f"{mem[0]}/{mem[1]}M free" if mem else "n/a"
     print(f"{C_LIME}{host}{C_RESET}  {C_GRAY}tailscale{C_RESET} {C_TEAL}{ts}{C_RESET}"
           f"  {C_GRAY}battery {bat or 'n/a'}{C_RESET}")
-    print(f"{C_GRAY}up {up.strip()}{C_RESET}")
+    print(f"{C_GRAY}up {up}{C_RESET}")
     print(f"{C_GRAY}load {load[0]} {load[1]} {load[2]}   "
-          f"mem {mem['MemAvailable']}/{mem['MemTotal']}M free   "
-          f"disk {disk[2]} used{C_RESET}")
+          f"mem {memtxt}   "
+          f"disk {disk[2] if len(disk) > 2 else '?'} used{C_RESET}")
     print(f"{C_GRAY}herdr {nws} workspaces   agents {agents}{C_RESET}")
     env_ok = os.path.isfile(os.path.expanduser("~/.config/remote-agents/notify.env"))
     push = f"{C_TEAL}ACTIVE{C_RESET}" if env_ok else f"{C_GRAY}NOT CONFIGURED{C_RESET}"
-    rc_n, _, _ = run(["systemctl", "--user", "is-active", "herdr-notify"], 3)
-    watch = f"{C_TEAL}RUNNING{C_RESET}" if rc_n == 0 else f"{C_GRAY}STOPPED{C_RESET}"
+    svc = tendril_host.backend(run) if tendril_host else None
+    running = bool(svc) and svc.status() == "running"
+    watch = f"{C_TEAL}RUNNING{C_RESET}" if running else f"{C_GRAY}STOPPED{C_RESET}"
     print(f"{C_GRAY}Push       {push}{C_RESET}   {C_GRAY}Watcher    {watch}{C_RESET}")
     print(f"{C_GRAY}press any key to continue...{C_RESET}", end="", flush=True)
     wait_for_key()
@@ -1155,9 +1244,13 @@ def workspace_number(raw, count):
     return number - 1 if 1 <= number <= count else None
 
 
-def menu_loop(rows, tty_mode=False, fd=None):
-    note = ""
-    selected = selection_index(rows)
+def menu_loop(rows, tty_mode=False, fd=None, note="", preferred_id=None):
+    """The selector loop — the one loop every entry path ends in (the bare
+    selector, and `enter` after its attach detaches). note is shown once
+    above the footer (the enter verb's stale notice); preferred_id
+    preselects a workspace row (enter's parent workspace after a stale
+    pane). Returns 0 when the user quits."""
+    selected = selection_index(rows, preferred_id)
     while True:
         render(rows, note, selected)
         note = ""
@@ -1214,16 +1307,72 @@ def menu_loop(rows, tty_mode=False, fd=None):
             selected = selection_index(rows, preferred_id, previous_index)
 
 
-# ---------- direct addressing: attach/resolve/focus/link <token> ----------
+# ---------- direct addressing: attach/enter/resolve/focus/link <token> ----------
 # A TENDRIL session is addressable without the selector. The canonical token
-# is the herdr workspace_id ("w15"); pane ids ("w15:p1") resolve to their
-# parent workspace, pure digits to the workspace number, and an exact
-# case-sensitive label as the last resort. The subcommands are the machine
-# interface (phone shortcuts, deep links): non-interactive, safe over SSH.
+# is the herdr workspace_id ("w15"); pane ids ("w15:p1") address that exact
+# pane, pure digits the workspace number, and an exact case-sensitive label
+# as the last resort. The subcommands are the machine interface (phone
+# shortcuts, deep links, notification taps): non-interactive, safe over SSH.
 PANE_RE = re.compile(r"^[A-Za-z0-9]+:[A-Za-z0-9]+$")
 MAX_TOKEN = 129                             # beyond this the token is junk
-SUBCOMMANDS = ("attach", "resolve", "focus", "link")
+SUBCOMMANDS = ("attach", "enter", "resolve", "focus", "link")
 _RANK_NAME = {rank: name for name, rank in RANK.items()}
+STALE_NOTE = "That agent session has ended — choose another."
+
+
+def _pane_lookup(token):
+    """Live snapshot entry for a pane-shaped token, else None (stale).
+    One extra `herdr api snapshot`: collect() keeps only workspace rows,
+    and exact focus needs the pane's tab_id/workspace_id."""
+    if not PANE_RE.match(token):
+        return None
+    snap = snapshot()
+    if not snap:
+        return None
+    for p in snap.get("panes", []):
+        if p.get("pane_id") == token:
+            return p
+    return None
+
+
+def _focus_pane(pane):
+    """Exact focus: workspace -> tab -> pane, then VERIFY against the
+    snapshot's focused_pane_id. `herdr agent focus <pane_id>` is the CLI's
+    exact-pane focus (agent commands accept the pane hosting the agent);
+    panes without a recognized agent rely on the preceding tab focus
+    landing on the tab's own pane. False when verification cannot confirm
+    the pane is focused — the caller must treat it as stale and never
+    attach blind."""
+    pane_id = pane.get("pane_id") or ""
+    tab_id = pane.get("tab_id") or ""
+    ws_id = pane.get("workspace_id") or pane_id.split(":", 1)[0]
+    run([HERDR, "workspace", "focus", ws_id], 6)
+    if tab_id:
+        run([HERDR, "tab", "focus", tab_id], 6)
+    run([HERDR, "agent", "focus", pane_id], 6)
+    snap = snapshot()
+    return bool(snap) and snap.get("focused_pane_id") == pane_id
+
+
+def _selector_after(rows, note="", preferred_id=None):
+    """The selector loop, in this process — the single entry every attach
+    path falls back to. No re-exec, no recursion, no double selector."""
+    tty_mode = sys.stdin.isatty()
+    fd = sys.stdin.fileno() if tty_mode else None
+    return menu_loop(rows, tty_mode, fd, note=note, preferred_id=preferred_id)
+
+
+def _stale_pane_selector(rows, token):
+    """A stale (vanished or unverifiable) pane must never attach — not even
+    to its parent workspace's focused tab, which may be a different agent.
+    Open the selector in-process with a one-line notice, the parent
+    workspace preselected when it still exists."""
+    parent = token.split(":", 1)[0] if PANE_RE.match(token) else token
+    fresh = collect()
+    if fresh is None:
+        fresh = rows
+    preselect = parent if any(r["id"] == parent for r in fresh) else None
+    return _selector_after(fresh, note=STALE_NOTE, preferred_id=preselect)
 
 
 def resolve_token(rows, token):
@@ -1305,14 +1454,16 @@ def _resolve_session(rows, token):
     return None, 2
 
 
-def _session_link(row):
-    """tendril_link.describe() for a row, or None with a diagnostic."""
+def _session_link(row, pane=None):
+    """tendril_link.describe() for a row -- narrowed to the exact pane
+    when one is given -- or None with a diagnostic."""
     if tendril_link is None:
         print(f"{C_RED}tendril_link missing next to remote-agents - re-run install{C_RESET}",
               file=sys.stderr)
         return None
     try:
-        return tendril_link.describe(HOST_LABEL, row["id"], row["label"])
+        return tendril_link.describe(HOST_LABEL, row["id"], row["label"],
+                                     pane)
     except tendril_link.LinkError as exc:
         print(f"{C_RED}link error: {exc}{C_RESET}", file=sys.stderr)
         return None
@@ -1326,10 +1477,12 @@ def _herdr_running():
     return "unknown"
 
 
-def session_json(row):
+def session_json(row, pane=None):
     """One-line canonical JSON for resolve/focus: everything a notification
-    or deep-link consumer needs. link/payload_b64 come from tendril_link."""
-    link = _session_link(row)
+    or deep-link consumer needs. link/payload_b64 come from tendril_link.
+    With a live pane entry (pane-id tokens), pane_id/tab_id name the exact
+    pane and agent is THAT pane's agent, not the workspace's first."""
+    link = _session_link(row, pane.get("pane_id") if pane else None)
     if link is None:
         return None
     doc = {
@@ -1348,21 +1501,72 @@ def session_json(row):
         "payload_b64": link["payload_b64"],
         "herdr_status": _herdr_running(),
     }
+    if pane is not None:
+        doc["pane_id"] = pane.get("pane_id") or ""
+        doc["tab_id"] = pane.get("tab_id") or ""
+        doc["agent"] = pane.get("agent") or ""
     return json.dumps(doc, separators=(",", ":"))
 
 
+def _stale_pane_not_found(rows, token):
+    """The existing not-found path for a stale pane id: diagnostic + closest
+    live ids on stderr, non-zero exit (TEST LINK reports SESSION NOT FOUND)."""
+    print(f"{C_RED}no session matches '{token}' on {HOST_LABEL} "
+          f"(stale id? the agent session may have ended){C_RESET}", file=sys.stderr)
+    for r in _close_rows(rows, token):
+        print(f"{C_GRAY}  closest: {r['id']}  {r['label']}{C_RESET}", file=sys.stderr)
+    return 2
+
+
+def _enter_session(rows, token):
+    """enter <token> -- the notification entry lifecycle: resolve, exact
+    focus (verified), the same Ctrl+Home-bridged attach the selector uses,
+    then -- when the user detaches -- the normal selector loop in this same
+    process. A stale pane attaches nothing: the selector opens with a
+    one-line notice, the parent workspace preselected when it still exists."""
+    if PANE_RE.match(token):
+        pane = _pane_lookup(token)
+        row = None
+        if pane is not None:
+            parent = pane.get("workspace_id") or token.split(":", 1)[0]
+            row, _ = resolve_token(rows, parent)
+        if pane is None or row is None:
+            return _stale_pane_selector(rows, token)
+        if not attach(row, pane=pane):      # focus not verifiable: stale
+            return _stale_pane_selector(rows, token)
+    else:
+        row, code = _resolve_session(rows, token)
+        if row is None:
+            return code
+        attach(row)                         # workspace semantics, unchanged
+    fresh = collect()
+    if fresh is None:
+        fresh = rows
+    return _selector_after(fresh, preferred_id=row["id"])
+
+
 def _run_subcommand(cmd, token):
-    """attach/resolve/focus/link: never interactive, safe over plain SSH.
-    Exit codes: 0 ok, 1 Herdr unreachable, 2 unknown/stale token, 3 ambiguous."""
+    """attach/enter/resolve/focus/link: never interactive (enter falls into
+    the selector only after its attach detaches), safe over plain SSH.
+    Exit codes: 0 ok, 1 Herdr unreachable, 2 unknown/stale token, 3 ambiguous.
+    Pane ids are exact: the pane must exist (else the not-found path) and
+    focus verifies against the snapshot before anything attaches."""
     rows, code = _reachable_rows()
     if rows is None:
         return code
+    if cmd == "enter":
+        return _enter_session(rows, token)
+    pane = None
+    if cmd in ("attach", "resolve", "focus") and PANE_RE.match(token):
+        pane = _pane_lookup(token)
+        if pane is None:
+            return _stale_pane_not_found(rows, token)
     row, code = _resolve_session(rows, token)
     if row is None:
         return code
     if cmd == "attach":
         print(f"{C_GRAY}found session '{row['label']}' ({row['id']}){C_RESET}", flush=True)
-        attach(row)
+        attach(row, pane=pane)
         return 0
     if cmd == "link":
         link = _session_link(row)
@@ -1370,13 +1574,229 @@ def _run_subcommand(cmd, token):
             return 2
         print(link["uri"])
         return 0
-    doc = session_json(row)                 # resolve and focus print the same body
+    doc = session_json(row, pane=pane)      # resolve and focus print the same body
     if doc is None:
         return 2
     if cmd == "focus":                      # headless hook: focus only, no session attach
-        run([HERDR, "workspace", "focus", row["id"]], 6)
+        if pane is not None:
+            if not _focus_pane(pane):
+                print(f"{C_RED}could not verify focus for '{token}' "
+                      f"-- treat it as stale{C_RESET}", file=sys.stderr)
+                return 2
+        else:
+            run([HERDR, "workspace", "focus", row["id"]], 6)
     print(doc)
     return 0
+
+
+SERVICE_VERBS = ("status", "start", "stop", "restart", "logs")
+
+
+def _service(args):
+    """`tendril service <verb>`: the notification watcher, on whichever
+    service manager this host has (launchd LaunchAgent / systemd user unit)."""
+    if len(args) != 1 or args[0] not in SERVICE_VERBS:
+        print("usage: remote-agents service " + "|".join(SERVICE_VERBS),
+              file=sys.stderr)
+        return 2
+    if tendril_host is None:
+        print("tendril_host.py is missing next to remote-agents; re-run ./install",
+              file=sys.stderr)
+        return 1
+    return tendril_host.main(["service", args[0]])
+
+
+def _pair_ssh_target():
+    """Where the phone dials: config SSH_TARGET -> the Tailscale MagicDNS
+    FQDN when answerable -> config SSH_ALIAS -> the host identity itself
+    (binding contract; display-only in the Link app, dialled by the block
+    `--pair` prints)."""
+    target = (CONFIG.get("SSH_TARGET") or "").strip()
+    if target:
+        return target
+    if tendril_host is not None:
+        try:
+            fqdn = tendril_host.tailscale_identity()[1]
+        except Exception:                       # never let pairing crash on it
+            fqdn = ""
+        if fqdn:
+            return fqdn
+    return (CONFIG.get("SSH_ALIAS") or "").strip() \
+        or (tendril_link.host_identity(CONFIG)
+            if tendril_link is not None and hasattr(tendril_link, "host_identity")
+            else HOST_LABEL)
+
+
+def _pair_source_dir():
+    """The checkout the launchers are copied from: install.json provenance
+    first, then the checkout this command runs from (realpath), but only
+    when it actually contains phone/tendril. None when nothing is provable."""
+    try:
+        with open(os.path.expanduser(
+                "~/.config/remote-agents/install.json"), encoding="utf-8") as f:
+            src = (json.load(f) or {}).get("source_dir")
+        if src and os.path.isfile(os.path.join(src, "phone", "tendril")):
+            return src
+    except (OSError, ValueError):
+        pass
+    repo = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    if os.path.isfile(os.path.join(repo, "phone", "tendril")):
+        return repo
+    return None
+
+
+def _notify_subscribe_url():
+    """ntfy server/topic from notify.env, joined for a subscribe URL —
+    printed so the phone can subscribe; never encoded into any payload."""
+    url = topic = ""
+    try:
+        with open(NOTIFY_ENV, encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln.startswith("NTFY_URL="):
+                    url = ln.split("=", 1)[1].strip().strip('"').strip("'")
+                elif ln.startswith("NTFY_TOPIC="):
+                    topic = ln.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return f"{url}/{topic}" if url and topic else ""
+
+
+def _pair_print(code, host, target, user):
+    """The human block: identity summary, code, optional QR (only when
+    qrencode is on PATH; never a dependency), the ntfy subscribe URL, and
+    a paste-ready Termux setup with every value filled in."""
+    reach = f"{user}@{target}"
+    transport = "Tailscale + Mosh" if shutil.which("mosh") else "Tailscale + SSH"
+    print(f"{C_LIME}TENDRIL // PHONE PAIRING{C_RESET}")
+    print(f"{C_GRAY}  Host     {C_RESET}{host}")
+    print(f"{C_GRAY}  Reach    {C_RESET}{reach}  ({transport})")
+    print(f"{C_GRAY}  Pairing  {C_RESET}{code}")
+    qrencode = shutil.which("qrencode")
+    if qrencode:
+        try:
+            qr = subprocess.run([qrencode, "-t", "ansiutf8", code],
+                                capture_output=True, text=True, timeout=15)
+            if qr.returncode == 0 and qr.stdout:
+                print(qr.stdout.rstrip("\n"))
+        except (OSError, subprocess.TimeoutExpired):
+            pass                            # QR is garnish, never load-bearing
+    subscribe = _notify_subscribe_url()
+    if subscribe:
+        print(f"{C_GRAY}  ntfy: subscribe to {C_RESET}{subscribe}")
+    else:
+        print(f"{C_GRAY}  ntfy: not configured ({NOTIFY_ENV}); "
+              f"push setup: re-run ./install{C_RESET}")
+    src = _pair_source_dir()
+    print("")
+    print("Termux setup (paste into Termux):")
+    lines = [
+        "pkg install -y openssh mosh",
+        "[ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519",
+        f"ssh-copy-id {reach}",
+        "mkdir -p ~/bin ~/.config/tendril",
+    ]
+    if src:
+        lines += [
+            f"scp {shlex.quote(f'{reach}:{src}/phone/tendril')} ~/bin/tendril",
+            f"scp {shlex.quote(f'{reach}:{src}/phone/termux-url-opener')} ~/bin/termux-url-opener",
+        ]
+    else:
+        lines += [
+            "# no recorded source checkout: copy phone/tendril and",
+            "# phone/termux-url-opener from your TENDRIL checkout to ~/bin/ first",
+        ]
+    lines += [
+        "chmod 700 ~/bin/tendril ~/bin/termux-url-opener",
+        f"printf '%s\\n' '{reach}' > ~/.config/tendril/alias",
+        "hash -r && tendril",
+    ]
+    for ln in lines:
+        print(f"  {ln}")
+    if subscribe:
+        print("")
+        print(f"Then subscribe the ntfy app to: {subscribe}")
+    return 0
+
+
+def _pair(args):
+    """`tendril --pair`: the phone pairing code for the TENDRIL Link app,
+    plus the setup block. Deliberately flags-only like --upgrade — no bare
+    `pair` word: a single word is a session-token position and a workspace
+    may legitimately be labeled "pair". All payload values are validated;
+    on any invalid value: one clear error, no code."""
+    rest = [a for a in args if a != "--pair"]
+    code_only = "--code" in rest
+    rest = [a for a in rest if a != "--code"]
+    if rest or args.count("--pair") != 1:
+        print("usage: tendril --pair [--code]", file=sys.stderr)
+        return 2
+    if tendril_link is None or not hasattr(tendril_link, "pairing_code"):
+        print("tendril_link.py is missing or stale next to remote-agents; "
+              "re-run ./install", file=sys.stderr)
+        return 1
+    host = tendril_link.host_identity(CONFIG)
+    target = _pair_ssh_target()
+    try:
+        user = getpass.getuser() or ""
+    except Exception:
+        user = ""
+    try:
+        code = tendril_link.pairing_code(host, target, user)
+    except tendril_link.LinkError as exc:
+        print(f"cannot pair: {exc}", file=sys.stderr)
+        return 1
+    if code_only:
+        print(code)
+        return 0
+    return _pair_print(code, host, target, user)
+
+
+HELP = """\
+TENDRIL host console (remote-agents) — a thin mobile control plane for
+persistent AI agents.
+
+  tendril                     the workspace selector (the console)
+  tendril attach|enter|resolve|focus|link <token>
+                              direct addressing: workspace id (w15), pane id
+                              (w15:p1), workspace number, or exact label
+  tendril service status|start|stop|restart|logs
+                              the notification watcher, on launchd or systemd
+  tendril --pair [--code]
+                              the phone pairing code for the TENDRIL Link
+                              app (scan or paste), the ntfy subscribe URL
+                              and a paste-ready Termux setup block; --code
+                              prints only the code (for scripting)
+  tendril --upgrade [--verbose]
+                              self-update: fetch + fast-forward the recorded
+                              source checkout, then ./install --upgrade
+                              (binaries, symlink, PATH block, watcher unit;
+                              config and notify.env stay byte-identical)
+  tendril --version           the installed version and commit
+  tendril --help              this help
+
+Upgrade and pair are flags-only on purpose: a bare word is a session-token
+position and a workspace may legitimately be labeled "upgrade" or "pair".
+Also:
+  --detect                    herdr client detection detail
+"""
+
+
+def _upgrade(args):
+    """`tendril --upgrade`: self-update from the recorded source checkout.
+    Deliberately flags-only — no bare `upgrade` word: a single word is a
+    session-token position and a workspace may legitimately be labeled
+    "upgrade"; --upgrade cannot collide."""
+    verbose = "--verbose" in args
+    extra = [a for a in args if a not in ("--upgrade", "--verbose")]
+    if extra or args.count("--upgrade") != 1:
+        print("usage: tendril --upgrade [--verbose]", file=sys.stderr)
+        return 2
+    if tendril_upgrade is None:
+        print("tendril_upgrade.py is missing next to remote-agents; re-run ./install",
+              file=sys.stderr)
+        return 1
+    return tendril_upgrade.upgrade_main(verbose=verbose)
 
 
 def main():
@@ -1387,14 +1807,36 @@ def main():
         print("chosen:", HERDR or "NONE")
         return 0
     args = sys.argv[1:]
+    if "--version" in args:
+        if tendril_upgrade is not None:
+            print(tendril_upgrade.version_line())
+        else:
+            print("tendril (unknown - tendril_upgrade.py missing; re-run ./install)")
+        return 0
+    if "--help" in args or "-h" in args:
+        print(HELP, end="")
+        return 0
+    if "--upgrade" in args:
+        return _upgrade(args)
+    if "--pair" in args:
+        return _pair(args)
+    if args[:1] == ["service"]:
+        return _service(args[1:])
     if len(args) == 2 and args[0] in SUBCOMMANDS:
         return _run_subcommand(args[0], args[1])
     if args:
-        print("usage: remote-agents [attach|resolve|focus|link] <session-token>",
+        print("usage: remote-agents [attach|enter|resolve|focus|link] <session-token>",
               file=sys.stderr)
         print("       <session-token>: workspace id (w15), pane id (w15:p1),",
               file=sys.stderr)
         print("       workspace number or exact label; no args opens the selector",
+              file=sys.stderr)
+        print("       enter: exact focus + attach, then the selector (notification taps)",
+              file=sys.stderr)
+        print("       remote-agents service status|start|stop|restart|logs",
+              file=sys.stderr)
+        print("       remote-agents --pair [--code] | --upgrade [--verbose] "
+              "| --version | --help",
               file=sys.stderr)
         return 2
     rows, code = _reachable_rows()

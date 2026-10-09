@@ -36,7 +36,7 @@ verify() {
         ok "mosh connection works"
     else
         note "mosh did not connect (tendril will fall back to SSH)" \
-             "allow UDP 60000-61000 on the computer, e.g.: sudo ufw allow in on tailscale0 to any port 60000:61000 proto udp"
+             "allow UDP 60000-61000 on the computer (Linux: sudo ufw allow in on tailscale0 to any port 60000:61000 proto udp; macOS: allow mosh-server in System Settings > Network > Firewall)"
     fi
 
     echo " Computer:"
@@ -59,10 +59,12 @@ verify() {
     fi
     if remote 'test -f ~/.config/remote-agents/notify.env'; then
         ok "notifications configured (notify.env)"
-        if remote 'systemctl --user is-active --quiet herdr-notify'; then
+        # `remote-agents service status` covers launchd (macOS) and systemd (Linux)
+        if remote '"$HOME/.local/bin/remote-agents" service status' | grep -q '^running' \
+           || remote 'systemctl --user is-active --quiet herdr-notify'; then
             ok "notification watcher is running"
         else
-            note "notification watcher not running" "on the computer: systemctl --user enable --now herdr-notify"
+            note "notification watcher not running" "on the computer: cd ~/TENDRIL && ./install  (step 5), then: tendril service status"
         fi
     else
         note "notifications not set up (optional)" "on the computer: cd ~/TENDRIL && ./install  (answer yes to ntfy)"
@@ -80,15 +82,28 @@ if [ "$1" = "--check" ]; then
 fi
 
 echo "== TENDRIL phone setup =="
-HOST_ADDR=$(ask "Computer's Tailscale name or 100.x IP" "")
-[ -z "$HOST_ADDR" ] && { echo "A host address is required."; exit 1; }
-HOST_USER=$(ask "Your Linux username on that computer" "")
-[ -z "$HOST_USER" ] && { echo "A username is required."; exit 1; }
-ALIAS=$(ask "Short name for this computer" "home")
-REPO=$(ask "TENDRIL folder on the computer" "TENDRIL")
+# All four answers can come from the environment (or the host's
+# `tendril --pair` output): when TENDRIL_HOST_ADDR, TENDRIL_HOST_USER,
+# TENDRIL_ALIAS_NAME and TENDRIL_REPO_DIR are all set the questions are
+# skipped entirely; otherwise they become the defaults.
+if [ -n "$TENDRIL_HOST_ADDR" ] && [ -n "$TENDRIL_HOST_USER" ] \
+   && [ -n "$TENDRIL_ALIAS_NAME" ] && [ -n "$TENDRIL_REPO_DIR" ]; then
+    HOST_ADDR=$TENDRIL_HOST_ADDR HOST_USER=$TENDRIL_HOST_USER
+    ALIAS=$TENDRIL_ALIAS_NAME REPO=$TENDRIL_REPO_DIR
+else
+    HOST_ADDR=$(ask "Computer's Tailscale name or 100.x IP" "${TENDRIL_HOST_ADDR:-}")
+    [ -z "$HOST_ADDR" ] && { echo "A host address is required."; exit 1; }
+    HOST_USER=$(ask "Your username on that computer (Linux or Mac)" "${TENDRIL_HOST_USER:-}")
+    [ -z "$HOST_USER" ] && { echo "A username is required."; exit 1; }
+    ALIAS=$(ask "Short name for this computer" "${TENDRIL_ALIAS_NAME:-home}")
+    REPO=$(ask "TENDRIL folder on the computer" "${TENDRIL_REPO_DIR:-TENDRIL}")
+fi
 
 # These values are embedded in remote SSH commands below; spaces or quotes
 # would break the hand-off (or the ssh config). Keep them simple.
+case "$HOST_ADDR" in                  # goes into ~/.ssh/config verbatim
+    *[!A-Za-z0-9.:-]*) echo "Host address must be a name or IP (letters, digits, . : -). Got: '$HOST_ADDR'"; exit 1 ;;
+esac
 case "$ALIAS$HOST_USER$REPO" in
     *[!A-Za-z0-9._/-]*)
         echo "Alias, username and folder must be simple: letters, digits,"
@@ -132,7 +147,7 @@ Host $ALIAS
 EOF
 echo "   '$ALIAS' -> $HOST_USER@$HOST_ADDR"
 
-echo; echo "4) Copying the key to the computer (enter your Linux password once)..."
+echo; echo "4) Copying the key to the computer (enter your computer password once)..."
 if ssh -o BatchMode=yes -o ConnectTimeout=5 "$ALIAS" true 2>/dev/null; then
     echo "   key already works"
 else
@@ -155,13 +170,18 @@ REPO="$HOME/$1"
 export PATH="$HOME/.local/bin:$PATH"
 say() { echo "   $*"; }
 
-# ~/.local/bin on PATH for future logins (Herdr and the menu live there)
-for f in "$HOME/.profile" "$HOME/.bashrc"; do
+# ~/.local/bin on PATH for future logins (Herdr and the menu live there).
+# zsh (the macOS default) reads only ~/.zshenv for SSH commands.
+for f in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshenv"; do
+    case "$f:${SHELL:-}" in *.zshenv:*/zsh) ;; *.zshenv:*) continue ;; esac
     grep -q '\.local/bin' "$f" 2>/dev/null \
         || { echo 'export PATH="$HOME/.local/bin:$PATH"' >> "$f"; say "added ~/.local/bin to PATH in $f"; }
 done
 
-command -v python3 >/dev/null || { say "MISSING python3 - on the computer run: sudo apt install python3"; exit 1; }
+python3 -c 'import sys' 2>/dev/null || {
+    if [ "$(uname -s)" = Darwin ]; then say "MISSING python3 - on the Mac run: xcode-select --install"
+    else say "MISSING python3 - on the computer run: sudo apt install python3"; fi
+    exit 1; }
 
 if command -v herdr >/dev/null; then
     say "herdr already installed ($(herdr --version 2>/dev/null))"
@@ -182,11 +202,14 @@ fi
 
 if [ -x "$HOME/.local/bin/remote-agents" ]; then
     # Already installed: refresh the programs only, keep config (per TENDRIL README)
-    for f in remote-agents herdr-notify tendril_link.py; do
+    for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py; do
+        [ -f "$REPO/bin/$f" ] || continue
         install -m 755 "$REPO/bin/$f" "$HOME/.local/bin/$f.new" \
             && mv -f "$HOME/.local/bin/$f.new" "$HOME/.local/bin/$f"
     done
+    # restart the watcher only if it is already running (systemd / launchd)
     systemctl --user try-restart herdr-notify 2>/dev/null || true
+    launchctl kickstart -k "gui/$(id -u)/com.tendril.herdr-notify" 2>/dev/null || true
     say "menu (remote-agents) refreshed"
 else
     say "running the TENDRIL installer (press Enter for text questions; type y for every yes/no question)"
@@ -196,7 +219,9 @@ fi
 
 CONF="$HOME/.config/remote-agents/config"
 if [ -f "$CONF" ] && grep -q '^HERDR_BIN=$' "$CONF"; then
-    sed -i "s|^HERDR_BIN=\$|HERDR_BIN=$(command -v herdr)|" "$CONF"
+    # portable (BSD sed has no GNU -i); keep the config private
+    sed "s|^HERDR_BIN=\$|HERDR_BIN=$(command -v herdr)|" "$CONF" > "$CONF.tmp" \
+        && chmod 600 "$CONF.tmp" && mv -f "$CONF.tmp" "$CONF"
     say "pinned HERDR_BIN=$(command -v herdr) in $CONF"
 fi
 [ -x "$HOME/.local/bin/remote-agents" ] && say "computer side ready" \
@@ -208,16 +233,27 @@ ssh -t "$ALIAS" "bash ~/.tendril-host-setup.sh '$REPO'; rc=\$?; rm -f ~/.tendril
     || { echo "   computer setup failed - see the messages above"; exit 1; }
 
 echo; echo "6) Installing the phone launchers and deep-link helper..."
-mkdir -p ~/bin
+# Fetch into a fresh directory, then REPLACE each file: copying straight onto
+# ~/bin would write through an old `agent -> tendril` symlink and leave the
+# agent wrapper in place of the launcher.
+mkdir -p "$HOME/bin"
+STAGE=$(mktemp -d "${TMPDIR:-$HOME}/tendril-launchers.XXXXXX")
 if scp -q "$ALIAS:$REPO/phone/tendril" "$ALIAS:$REPO/phone/agent" \
-        "$ALIAS:$REPO/phone/termux-url-opener" ~/bin/ 2>/dev/null; then
+        "$ALIAS:$REPO/phone/termux-url-opener" "$STAGE/" 2>/dev/null; then
     echo "   copied from $ALIAS:$REPO"
 else
     echo "   not found at $ALIAS:~/$REPO - downloading from GitHub instead"
     for f in tendril agent termux-url-opener; do
-        curl -fsSL "https://raw.githubusercontent.com/Ozymandes/TENDRIL/main/phone/$f" -o ~/bin/$f
+        curl -fsSL "https://raw.githubusercontent.com/Ozymandes/TENDRIL/main/phone/$f" -o "$STAGE/$f"
     done
 fi
+# the launcher must be the launcher, the wrapper the wrapper
+grep -q '^# tendril — TENDRIL' "$STAGE/tendril" && grep -q '^# agent — compatibility alias' "$STAGE/agent" \
+    || { echo "   downloaded launchers look wrong - not installing them"; rm -rf "$STAGE"; exit 1; }
+for f in tendril agent termux-url-opener; do
+    rm -f "$HOME/bin/$f" && mv "$STAGE/$f" "$HOME/bin/$f"
+done
+rmdir "$STAGE" 2>/dev/null
 chmod 700 ~/bin/tendril ~/bin/agent ~/bin/termux-url-opener
 grep -q 'HOME/bin' ~/.bashrc 2>/dev/null || echo 'export PATH=$HOME/bin:$PATH' >> ~/.bashrc
 sed -i '/^export TENDRIL_ALIAS=/d' ~/.bashrc 2>/dev/null || true

@@ -29,9 +29,11 @@
 #   any query or fragment pair:  p=<workspace-id>  or  id=<workspace-id>
 #   tendril://<h>/workspace/<workspace-id>              (accepted, but a bare
 #     tendril:// tap cannot reach Termux on Android — no scheme handler)
-# On a match: exec `tendril attach <id>` (PATH, then $HOME/bin), so
-# $TENDRIL_ALIAS is respected naturally by the phone launcher. Anything
-# else passes through to termux-open-url / termux-open.
+# On a match: exec `tendril enter <id>` (PATH, then $HOME/bin), so a tap
+# gets the full notification lifecycle: exact focus, attach, and the
+# selector after detach. $TENDRIL_ALIAS is respected naturally by the
+# phone launcher. Anything else passes through to termux-open-url /
+# termux-open.
 #
 # Safety: ids are validated, never decoded and never evaluated. Valid ids
 # are [A-Za-z0-9._:-] so URL-decoding has nothing to add; a percent-encoded
@@ -128,13 +130,13 @@ for url in "$@"; do
     classify "$url"
     if [ "$KNOWN" -eq 1 ]; then
         if valid_id "$ID"; then
-            printf '[tendril-url-opener] attach %s\n' "$ID" >&2
+            printf '[tendril-url-opener] enter %s\n' "$ID" >&2
             TENDRIL_BIN="$(find_tendril)" || {
                 printf '%s\n' "[tendril-url-opener] 'tendril' launcher not found in PATH or \$HOME/bin." >&2
                 printf '%s\n' "  install it: docs/ANDROID.md step 5 (scp phone/tendril to ~/bin/tendril)" >&2
                 exit 127
             }
-            exec "$TENDRIL_BIN" attach "$ID"
+            exec "$TENDRIL_BIN" enter "$ID"
         fi
         printf '%s\n' "[tendril-url-opener] looks like a TENDRIL link but the session id is malformed." >&2
         printf '%s\n' "  ids: A-Z a-z 0-9 . _ : - only, 1..128 chars. Nothing was executed." >&2

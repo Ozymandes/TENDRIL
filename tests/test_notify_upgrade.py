@@ -177,6 +177,14 @@ class Compose(unittest.TestCase):
                    hn.human_elapsed, hn.click_headers, hn.link_fields):
             self.assertNotIn("subprocess", inspect.getsource(fn))
 
+    def test_output_is_deterministic(self):
+        # same inputs -> byte-identical alert, call after call
+        outs = {hn.compose("pi", "research", cls, T0, "/home/op/research",
+                           now=T0 + 1080)
+                for cls in (hn.NEEDS_INPUT, hn.DONE, hn.NUDGE)
+                for _ in range(3)}
+        self.assertEqual(len(outs), 3)  # one tuple per class, no jitter
+
 
 class RenderTemplate(unittest.TestCase):
     def fields(self, label="my label"):
@@ -236,6 +244,128 @@ class RenderTemplate(unittest.TestCase):
         self.assertIsNone(hn.link_fields("", "w1", "research"))
 
 
+class CanonicalDeepLinkClick(unittest.TestCase):
+    """{uri} puts the frozen tendril:// deep link on Click + Actions —
+    the exact contract TENDRIL Link will claim on Android."""
+
+    def fields(self):
+        return hn.link_fields("testhost", "w15", "research")
+
+    def test_uri_template_renders_canonical_link(self):
+        url, actions = hn.click_headers({"NTFY_CLICK_TEMPLATE": "{uri}"},
+                                        self.fields())
+        self.assertEqual(url, "tendril://host/testhost/workspace/w15"
+                              "?label=research")
+        self.assertEqual(actions, f"view, Attach, {url}, clear=true")
+
+    def test_uri_round_trips_through_the_link_module(self):
+        url, _ = hn.click_headers({"NTFY_CLICK_TEMPLATE": "{uri}"},
+                                  self.fields())
+        self.assertEqual(tl.parse_uri(url),
+                         {"host": "testhost", "workspace_id": "w15",
+                          "label": "research"})
+
+    def test_hostile_label_cannot_break_headers(self):
+        # CRLF injection, Actions-field smuggling via commas, template-brace
+        # spoofing: the label is cleaned + percent-encoded, so Click and
+        # Actions stay single-line, four-field, and parse back to one URI
+        hostile = "a,b\r\nTags: x\r\n, clear=true {payload_b64}"
+        fields = hn.link_fields("testhost", "w15", hostile)
+        url, actions = hn.click_headers({"NTFY_CLICK_TEMPLATE": "{uri}"},
+                                        fields)
+        for header in (url, actions):
+            self.assertIsNotNone(header)
+            self.assertNotIn("\r", header)
+            self.assertNotIn("\n", header)
+        self.assertTrue(actions.startswith("view, Attach, "))
+        self.assertTrue(actions.endswith(", clear=true"))
+        # the smuggled text is percent-encoded inside the query, not parsed
+        self.assertNotIn("clear=true?label", actions)
+        self.assertIn("label=a%2Cb", url)
+        # and the decoded link still yields the cleaned label, nothing more
+        self.assertEqual(tl.parse_uri(url)["label"],
+                         tl.clean_label(hostile))
+
+
+class PaneTargetedLinks(unittest.TestCase):
+    """The wrong-tab root cause: ONE workspace with several tabs and two
+    different emitting agents while a THIRD tab is focused. Every
+    notification's uri/target must name the EMITTING agent's own pane
+    (snapshot pane_id), never the workspace's focused tab."""
+
+    CFG = {"NTFY_URL": "https://ntfy.example", "NTFY_TOPIC": "topic",
+           "NTFY_CLICK_TEMPLATE": "{uri}|{pane_id}|{target}"}
+
+    def snap(self, agents):
+        return {
+            "workspaces": [{"workspace_id": "w1", "label": "research"}],
+            "agents": agents,
+            # a third tab is focused: nothing in the notification plumbing
+            # may derive the click target from it
+            "focused_pane_id": "w1:p9",
+            "focused_tab_id": "w1:t9",
+            "focused_workspace_id": "w1",
+        }
+
+    def drive(self, agents):
+        snap = self.snap(agents)
+        state = {a["pane_id"]: ("working", T0, 0.0) for a in agents}
+        _, reqs = drive_poll([(snap, T0 + 8)], self.CFG, state=state)
+        return reqs
+
+    def agent(self, pid, kind, status):
+        return {"pane_id": pid, "tab_id": pid.replace("p", "t", 1),
+                "agent": kind, "agent_status": status, "workspace_id": "w1",
+                "cwd": "/home/op/research"}
+
+    def test_each_notification_names_its_own_pane(self):
+        reqs = self.drive([self.agent("w1:p2", "pi", "blocked"),
+                           self.agent("w1:p3", "claude", "idle")])
+        self.assertEqual(len(reqs), 2)
+        first = reqs[0].get_header("Click").decode("utf-8")
+        uri0, pane0, target0 = first.split("|")
+        self.assertEqual(pane0, "w1:p2")           # pi in tab A...
+        self.assertEqual(target0, "w1:p2")
+        self.assertEqual(
+            uri0, "tendril://host/testhost/workspace/w1"
+                  "?pane=w1:p2&label=research")
+        second = reqs[1].get_header("Click").decode("utf-8")
+        uri1, pane1, target1 = second.split("|")
+        self.assertEqual(pane1, "w1:p3")           # ...claude in tab B
+        self.assertEqual(target1, "w1:p3")
+        self.assertEqual(
+            uri1, "tendril://host/testhost/workspace/w1"
+                  "?pane=w1:p3&label=research")
+        # the third (focused) tab must appear nowhere
+        for header in (first, second):
+            self.assertNotIn("w1:t9", header)
+            self.assertNotIn("w1:p9", header)
+
+    def test_uri_with_pane_parses_back_to_the_exact_pane(self):
+        reqs = self.drive([self.agent("w1:p2", "pi", "blocked")])
+        url = reqs[0].get_header("Click").decode("utf-8").split("|")[0]
+        self.assertEqual(tl.parse_uri(url),
+                         {"host": "testhost", "workspace_id": "w1",
+                          "label": "research", "pane": "w1:p2"})
+
+    def test_actions_header_carries_the_pane_uri(self):
+        reqs = self.drive([self.agent("w1:p2", "pi", "blocked")])
+        actions = reqs[0].get_header("Actions").decode("utf-8")
+        self.assertTrue(actions.startswith("view, Attach, tendril://host/"))
+        self.assertIn("pane=w1:p2", actions)
+        self.assertTrue(actions.endswith(", clear=true"))
+
+    def test_malformed_pane_id_falls_back_to_workspace_link(self):
+        bad = self.agent("garbage", "pi", "blocked")
+        reqs = self.drive([bad])
+        self.assertEqual(len(reqs), 1)
+        uri, pane_id, target = reqs[0].get_header("Click").decode("utf-8").split("|")
+        self.assertEqual(uri, "tendril://host/testhost/workspace/w1"
+                              "?label=research")
+        self.assertEqual(target, "w1")
+        self.assertEqual(pane_id, "garbage")
+
+
 class PollTransitions(unittest.TestCase):
     def drive(self, steps, cfg, state=None):
         return drive_poll(steps, cfg, state)
@@ -246,7 +376,7 @@ class PollTransitions(unittest.TestCase):
                                  CFG_CLICK, state=state)
         self.assertEqual(len(reqs), 1)
         req = reqs[0]
-        payload = tl.payload_b64("testhost", "w1", "research")
+        payload = tl.payload_b64("testhost", "w1", "research", "w1:p1")
         url = f"https://phone.example/open?payload={payload}&host=testhost"
         self.assertEqual(req.get_header("Click"),
                          url.encode("utf-8"))

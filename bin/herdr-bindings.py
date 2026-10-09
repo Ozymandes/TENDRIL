@@ -216,6 +216,240 @@ def apply_detach(text, plan):
     return prefix + "\n[keys]\n" + newline + "\n"
 
 
+# ---------------------------------------------------------------- switching
+# Each proposal: (section, key, TOML value, human description). Scalars are
+# only ever added when absent; list entries are appended. A proposal is
+# skipped - never forced - when any chord it would bind is already claimed
+# by another action (exact chords after range/modifier expansion, so
+# alt+d never collides with alt+down).
+SWITCH_PROPOSALS = (
+    ("keys", "switch_workspace", '"prefix+1..9"', "prefix workspace switching (Ctrl+B 1..9)"),
+    ("keys.indexed", "workspaces", '"alt"', "Alt indexed workspaces (Alt+1..9)"),
+    ("keys.indexed", "tabs", '"ctrl"', "Ctrl indexed tabs (Ctrl+1..9)"),
+    ("keys", "next_tab", '"alt+right"', "next tab on Alt+Right"),
+    ("keys", "previous_tab", '"alt+left"', "previous tab on Alt+Left"),
+    ("keys", "next_workspace", '"alt+down"', "next workspace on Alt+Down"),
+)
+# list keys keep Herdr's phone-safe default when we create them
+LIST_DEFAULTS = {"next_tab": "prefix+n", "previous_tab": "prefix+p"}
+INDEXED = "keys.indexed"
+
+
+def _norm(chord):
+    """Canonical chord: lowercase, modifiers sorted, key last."""
+    parts = [p for p in chord.strip().lower().split("+") if p]
+    if not parts:
+        return ""
+    key = parts[-1]
+    mods = sorted(parts[:-1], key=lambda m: (m != "prefix", m))
+    return "+".join(mods + [key])
+
+
+def _expand(chord):
+    """'alt+1..9' -> {'alt+1', ..., 'alt+9'}; anything else -> {itself}."""
+    c = chord.strip().lower()
+    m = re.fullmatch(r"(.*\+)?(\d)\.\.(\d)", c)
+    if m:
+        lo, hi = int(m.group(2)), int(m.group(3))
+        return {_norm((m.group(1) or "") + str(d)) for d in range(lo, hi + 1)}
+    return {_norm(c)}
+
+
+def _claims(action, chord):
+    """Chords bound by one config value: [keys.indexed] values are a
+    modifier set for the digits 1..9."""
+    if action.startswith(INDEXED + "."):
+        return _expand(chord + "+1..9") if chord.strip() else set()
+    return _expand(chord)
+
+
+def claimed(text):
+    """expanded chord -> set of actions that bind it in this config."""
+    out = {}
+    for chord, actions in _conflicts(text).items():
+        for action in actions:
+            for c in _claims(action, chord):
+                out.setdefault(c, set()).add(action)
+    return out
+
+
+def _assignment(text, section, key):
+    """(start, end, value) of section.key's single-line assignment."""
+    offset = 0
+    for _, sec, line in _sections(text):
+        if sec == section and not line.lstrip().startswith("#"):
+            m = re.match(r"^[ \t]*" + re.escape(key) + r"[ \t]*=[ \t]*(.*?)(?:\r?\n)?$", line)
+            if m:
+                return offset, offset + len(line), _uncomment(m.group(1)).strip()
+        offset += len(line)
+    return None
+
+
+def _insert(text, section, line):
+    """Append `line` at the end of [section] (creating it at the end)."""
+    offset, end_of_section = 0, None
+    inside = False
+    for _, sec, raw in _sections(text):
+        header = re.fullmatch(r"\[([^]]+)\]", _uncomment(raw).strip())
+        if header:
+            if inside:
+                break
+            inside = header.group(1).strip() == section
+        if inside:
+            end_of_section = offset + len(raw)
+            if raw.strip():                 # skip trailing blank lines
+                last_content = end_of_section
+        offset += len(raw)
+    if end_of_section is None:
+        base = text if not text or text.endswith("\n") else text + "\n"
+        return base + ("\n" if base else "") + "[%s]\n%s\n" % (section, line)
+    pos = last_content
+    if not text[:pos].endswith("\n"):
+        return text[:pos] + "\n" + line + "\n" + text[pos:]
+    return text[:pos] + line + "\n" + text[pos:]
+
+
+def _with(text, proposal):
+    """(new_text, None) or (text, reason it does not apply)."""
+    section, key, value, _ = proposal
+    action = section + "." + key
+    chords = _chords(value)
+    taken = claimed(text)
+    want = set()
+    for c in chords:
+        want |= _claims(action, c)
+    clash = sorted({a for c in want for a in taken.get(c, ()) if a != action})
+    found = _assignment(text, section, key)
+    if key in LIST_DEFAULTS and found and _bracket_balance(found[2]) > 0:
+        return text, "multi-line list; left as you wrote it"
+    if key in LIST_DEFAULTS and found and found[2].startswith("["):
+        have = {_norm(c) for c in _chords(found[2])}
+        if want <= have:
+            return text, "already present"
+        if clash:
+            return text, "conflict with " + ", ".join(clash)
+        start, end, old = found
+        new = old.rstrip()[:-1].rstrip()
+        new = (new + (", " if new.rstrip("[").strip() else "")) + value + "]"
+        line = text[start:end]
+        return text[:start] + line.replace(old, new, 1) + text[end:], None
+    if found:
+        return text, "already set by you (%s = %s)" % (key, found[2])
+    if clash:
+        return text, "conflict with " + ", ".join(clash)
+    if key in LIST_DEFAULTS:
+        value = '["%s", %s]' % (LIST_DEFAULTS[key], value)
+    return _insert(text, section, "%s = %s" % (key, value)), None
+
+
+def herdr_issues(binary, text):
+    """(rc, set of issue lines) from `herdr config check` on an isolated
+    copy of text; never touches the live config."""
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "config.toml")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        env = dict(os.environ, HERDR_CONFIG_PATH=path)
+        try:
+            r = subprocess.run([binary, "config", "check"], env=env,
+                               capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired) as e:
+            return 125, {"herdr config check could not run: %s" % e}
+    lines = {ln.strip() for ln in (r.stdout + r.stderr).splitlines()
+             if ln.strip() and not ln.startswith("config:")}
+    return r.returncode, lines
+
+
+def plan_switch(text, binary=None):
+    """Decide each proposal on its own. Returns (new_text, results) with
+    results = [(action, description, 'ADD'|'SKIP', reason)]."""
+    base_issues = herdr_issues(binary, text)[1] if binary else set()
+    results = []
+    for proposal in SWITCH_PROPOSALS:
+        section, key, _, desc = proposal
+        action = section + "." + key
+        candidate, reason = _with(text, proposal)
+        if reason is None and binary:
+            _, issues = herdr_issues(binary, candidate)
+            new = sorted(issues - base_issues)
+            if new:
+                reason = "rejected by herdr config check: " + new[0]
+        if reason is None:
+            text = candidate
+            results.append((action, desc, "ADD", ""))
+        else:
+            results.append((action, desc, "SKIP", reason))
+    return text, results
+
+
+def digit_map(text):
+    """What Ctrl+B/Alt/Ctrl + digit do under this config (Herdr's default
+    switch_tab = prefix+1..9 applies when nothing claims those chords)."""
+    taken = claimed(text)
+    out = {}
+    for label, mod in (("Ctrl+B 1..9", "prefix+"), ("Alt+1..9", "alt+"),
+                       ("Ctrl+1..9", "ctrl+")):
+        actions = sorted(taken.get(_norm(mod + "1"), ()))
+        if not actions and mod == "prefix+":
+            actions = ["keys.switch_tab"]
+        out[label] = actions[0] if actions else ""
+    return out
+
+
+_MEANING = {"keys.switch_tab": "switch tab", "keys.indexed.tabs": "switch tab",
+            "keys.switch_workspace": "switch workspace",
+            "keys.indexed.workspaces": "switch workspace",
+            "keys.focus_agent": "focus agent", "keys.indexed.agents": "focus agent"}
+
+
+def describe_digits(text):
+    return [(label, _MEANING.get(action, action.split(".")[-1]) if action else "unbound")
+            for label, action in digit_map(text).items()]
+
+
+def _write(path, text):
+    if os.path.exists(path):
+        d = os.path.dirname(os.path.abspath(path))
+        mode = os.stat(path).st_mode & 0o777
+        fd, tmp = tempfile.mkstemp(prefix=".tendril-", dir=d)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, os.path.realpath(path) if os.path.islink(path) else path)
+    else:
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+
+
+def switch_main(mode, path, binary):
+    try:
+        with open(path, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        text = ""
+    if mode == "digits":
+        for label, meaning in describe_digits(text):
+            print("DIGITS=%s|%s" % (label, meaning))
+        return 0
+    new, results = plan_switch(text, binary or None)
+    for action, desc, verdict, reason in results:
+        print("%s=%s|%s|%s" % (verdict, action, desc, reason))
+    if mode == "apply" and new != text:
+        if binary:                         # final whole-file gate
+            rc, issues = herdr_issues(binary, new)
+            base = herdr_issues(binary, text)[1]
+            if issues - base:
+                print("REFUSED=" + sorted(issues - base)[0])
+                return 3
+        _write(path, new)
+        print("WROTE=" + path)
+    for label, meaning in describe_digits(new if mode == "apply" else text):
+        print("DIGITS=%s|%s" % (label, meaning))
+    return 0
+
+
 def herdr_supports_chord(binary, chord):
     """Ask this installed Herdr CLI to validate a chord without touching config."""
     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8") as config:
@@ -234,6 +468,9 @@ def herdr_supports_chord(binary, chord):
 def main(argv):
     if len(argv) == 4 and argv[1] == "supports":
         return 0 if herdr_supports_chord(argv[2], argv[3]) else 1
+    # switch plan|apply|digits CONFIG [HERDR_BIN]
+    if len(argv) in (4, 5) and argv[1] == "switch" and argv[2] in ("plan", "apply", "digits"):
+        return switch_main(argv[2], argv[3], argv[4] if len(argv) == 5 else "")
     if len(argv) != 4 or argv[1] not in ("plan", "apply"):
         print("usage: herdr-bindings.py plan|apply CONFIG ctrl-home-supported(0|1)",
               file=sys.stderr)

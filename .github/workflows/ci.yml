@@ -1,0 +1,116 @@
+# TENDRIL CI — fast, dependency-free: stdlib unittest + POSIX sh checks only.
+#
+# Runner facts (verified 2026-10-08 against actions/runner-images):
+#   * macos-latest = macOS 26 Arm64. Its `python3` on PATH is the image's
+#     3.14.7; /usr/bin/python3 is the Xcode Command Line Tools python —
+#     3.9.6, the only interpreter a stock Mac has.
+#     https://github.com/actions/runner-images/blob/main/README.md
+#     https://github.com/actions/runner-images/blob/main/images/macos/macos-26-arm64-Readme.md
+#   * macOS images cache Pythons 3.11-3.14 only, so the 3.9 matrix legs
+#     download a python-versions darwin/arm64 build on first run (exists:
+#     3.9.13). https://github.com/actions/python-versions
+#   * shellcheck is preinstalled on ubuntu runners (0.9.0).
+#     https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2404-Readme.md
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: unittest · ${{ matrix.os }} · py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.9 = the Xcode CLT python floor on macOS, 3.13 = current stable.
+        # Quoted: bare 3.9 would be a YAML float.
+        python: ["3.9", "3.13"]
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      # No herdr in CI: the two pty/masthead tests skip on their own
+      # (skipUnless herdr_reachable()) and the herdr-CLI tests skip via
+      # shutil.which("herdr"); everything else is stubbed. ~20s.
+      # tests/run_suite.py = the same discover run, plus: test names printed
+      # before each test, failures printed live, and a per-test watchdog that
+      # dumps every Python stack + the child process tree, then exits 3.
+      - name: Stdlib unittest suite
+        env:
+          TENDRIL_TEST_TIMEOUT: "90"
+          PYTHONFAULTHANDLER: "1"
+        run: python3 -u tests/run_suite.py
+
+  # A stock Mac has exactly one python3: /usr/bin/python3 from the Xcode
+  # Command Line Tools (3.9.6). Run the suite on it, then smoke the
+  # installer on the PATH sshd hands out, in a HOME with a space in it.
+  test-system-python:
+    name: unittest · macos-latest · /usr/bin/python3 (stock CLT Mac)
+    runs-on: macos-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Which system python (expect Python 3.9.x)
+        run: /usr/bin/python3 -V
+      - name: Stdlib unittest suite under the CLT python
+        env:
+          TENDRIL_TEST_TIMEOUT: "90"
+          PYTHONFAULTHANDLER: "1"
+        run: /usr/bin/python3 -u tests/run_suite.py
+      - name: Smoke installer + launchd plist (stock PATH, HOME with a space)
+        run: |
+          HOME_DIR="$RUNNER_TEMP/home with space"
+          mkdir -p "$HOME_DIR"
+
+          # exactly the PATH a non-interactive sshd session gets on macOS;
+          # makes `python3` the CLT 3.9 and /bin/sh the macOS bash 3.2
+          export PATH="/usr/bin:/bin:/usr/sbin:/sbin"
+          export HOME="$HOME_DIR"
+          export TENDRIL_ALIAS=ci-host
+
+          sh -n install
+          # read-only doctor: must exit 0 with no herdr client installed
+          /bin/sh ./install --doctor
+          # operator-side install: must exit 0 with nothing on stdin, no writes
+          /bin/sh ./install --client --dry-run < /dev/null
+
+          # render the LaunchAgent plist exactly as the installer would
+          # (Launchd.render() is pure: bytes on stdout, no side effects)
+          python3 -c 'import sys; sys.path.insert(0, "bin"); import tendril_host as host; sys.stdout.buffer.write(host.Launchd().render("/usr/bin/python3", host.home(".local", "bin", "herdr-notify")))' > "$HOME_DIR/tendril-watcher.plist"
+          plutil -lint "$HOME_DIR/tendril-watcher.plist"
+
+  lint:
+    name: lint · sh -n · py_compile · shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: POSIX sh syntax
+        run: |
+          sh -n install uninstall phone/tendril phone/agent \
+             phone/termux-url-opener docs/scripts/tendril-phone-setup.sh
+      - name: Python sources compile (runner python 3.12 is enough for this)
+        run: python3 -m py_compile bin/remote-agents bin/herdr-notify bin/*.py
+      # shellcheck is preinstalled on ubuntu runners.
+      - name: shellcheck (POSIX sh)
+        run: >
+          shellcheck --shell=sh --severity=warning
+          install uninstall phone/tendril phone/agent phone/termux-url-opener
+      # The Termux setup helper is bash-shebang'd on purpose; lint it as bash
+      # (clean at warning level there; `-s sh` would false-positive on local/-p).
+      - name: shellcheck (bash, Termux docs helper)
+        run: shellcheck --shell=bash --severity=warning docs/scripts/tendril-phone-setup.sh

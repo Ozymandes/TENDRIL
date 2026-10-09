@@ -30,11 +30,30 @@ def load_cli():
 ra = load_cli()
 
 
+def tty_settings(fd):
+    """termios attributes minus PENDIN: macOS's kernel sets that status bit
+    itself when canonical mode returns with input pending; it is not a
+    setting anyone chose, so restore checks ignore it."""
+    attrs = termios.tcgetattr(fd)
+    attrs[3] &= ~getattr(termios, "PENDIN", 0)
+    return attrs
+
+
 class KeyReader(unittest.TestCase):
     def setUp(self):
         self.master, self.slave = pty.openpty()
+        # A real terminal always reads what the tty echoes. Without a
+        # reader, restoring with TCSADRAIN waits forever on macOS for that
+        # echo to drain (Linux returns at once for ptys).
+        # A separate process, not a thread: on Python 3.9 the blocked
+        # tcsetattr holds the GIL, so a reader thread could never run.
+        self._drain = subprocess.Popen(["cat"], stdin=self.master,
+                                       stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
 
     def tearDown(self):
+        self._drain.kill()
+        self._drain.wait(5)
         os.close(self.master)
         os.close(self.slave)
 
@@ -53,23 +72,23 @@ class KeyReader(unittest.TestCase):
         self.assertEqual(self.read(bytes([27])), "escape")
 
     def test_terminal_modes_restore_after_success_and_exception(self):
-        original = termios.tcgetattr(self.slave)
+        original = tty_settings(self.slave)
         with ra.raw_terminal(self.slave):
-            self.assertNotEqual(termios.tcgetattr(self.slave), original)
-        self.assertEqual(termios.tcgetattr(self.slave), original)
+            self.assertNotEqual(tty_settings(self.slave), original)
+        self.assertEqual(tty_settings(self.slave), original)
 
         with self.assertRaisesRegex(RuntimeError, "boom"):
             with ra.raw_terminal(self.slave):
                 raise RuntimeError("boom")
-        self.assertEqual(termios.tcgetattr(self.slave), original)
+        self.assertEqual(tty_settings(self.slave), original)
 
     def test_numeric_input_supports_multi_digit_and_backspace_and_restores_tty(self):
-        original = termios.tcgetattr(self.slave)
+        original = tty_settings(self.slave)
         output = io.StringIO()
         with mock.patch.object(ra.sys, "stdout", output):
             os.write(self.master, b"123" + bytes([127]) + b"4" + bytes([13]))
             self.assertEqual(ra.read_menu_action(True, self.slave), ("line", "124"))
-        self.assertEqual(termios.tcgetattr(self.slave), original)
+        self.assertEqual(tty_settings(self.slave), original)
 
     def test_enter_and_footer_keys_are_distinct_actions(self):
         with mock.patch.object(ra.sys, "stdout", io.StringIO()):
@@ -155,34 +174,57 @@ class Panels(unittest.TestCase):
                 self.assertIn("TENDRIL_DETACH_BRIDGE=0", output.getvalue())
 
     def test_info_returns_via_any_key_wait(self):
+        """Both host-fact paths, on any OS: /proc (Linux) and sysctl/vm_stat
+        (macOS). Only the listed commands may run."""
+        darwin_answers = {
+            ("sysctl", "-n", "kern.boottime"): "{ sec = 1700000000, usec = 0 } Tue Nov 14\n",
+            ("sysctl", "-n", "hw.memsize"): "17179869184\n",
+            ("vm_stat",): "Mach Virtual Memory Statistics: (page size of 16384 bytes)\n"
+                          "Pages free: 21894.\nPages inactive: 201301.\n"
+                          "Pages speculative: 51234.\n",
+            ("pmset", "-g", "batt"): "Now drawing from 'AC Power'\n",
+        }
+
         def fake_run(args, timeout=6):
             command = args[0]
-            if command == "tailscale":
+            if command == "tailscale" or command.endswith("/Tailscale"):
                 return 1, "", ""
             if command == "uptime":
                 return 0, "up 1 hour\n", ""
             if command == "df":
                 return 0, "Filesystem Size Used Avail Use% Mounted on\n/dev/root 100G 20G 80G 20% /\n", ""
-            if command == "systemctl":
+            if command in ("systemctl", "launchctl"):
                 return 1, "", ""
+            if tuple(args) in darwin_answers:
+                return 0, darwin_answers[tuple(args)], ""
             self.fail(f"unexpected command: {args}")
 
         def fake_open(path, *args, **kwargs):
             if path == "/proc/loadavg":
                 return io.StringIO("0.1 0.2 0.3 4/100 1\n")
+            if path == "/proc/uptime":
+                return io.StringIO("3600.5 100.0\n")
             if path == "/proc/meminfo":
                 return io.StringIO("MemAvailable: 1024 kB\nMemTotal: 4096 kB\n")
             raise OSError(path)
 
-        with contextlib.ExitStack() as stack:
-            wait = stack.enter_context(mock.patch.object(ra, "wait_for_key"))
-            stack.enter_context(mock.patch.object(ra, "run", side_effect=fake_run))
-            stack.enter_context(mock.patch.object(ra, "collect", return_value=[]))
-            stack.enter_context(mock.patch("builtins.open", side_effect=fake_open))
-            stack.enter_context(mock.patch("builtins.input", side_effect=AssertionError("line input used")))
-            with contextlib.redirect_stdout(io.StringIO()):
-                ra.info()
-        wait.assert_called_once_with()
+        real_exists = os.path.exists
+        for procfs in (True, False):
+            with self.subTest(procfs=procfs), contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(
+                    ra.tendril_host.os.path, "exists",
+                    lambda p, real=real_exists, on=procfs:
+                        on if p.startswith("/proc/") else real(p)))
+                wait = stack.enter_context(mock.patch.object(ra, "wait_for_key"))
+                stack.enter_context(mock.patch.object(ra, "run", side_effect=fake_run))
+                stack.enter_context(mock.patch.object(ra, "collect", return_value=[]))
+                stack.enter_context(mock.patch("builtins.open", side_effect=fake_open))
+                stack.enter_context(mock.patch("builtins.input", side_effect=AssertionError("line input used")))
+                out = io.StringIO()
+                with contextlib.redirect_stdout(out):
+                    ra.info()
+                wait.assert_called_once_with()
+                self.assertIn("free", out.getvalue())       # memory line rendered
 
 
 class Selection(unittest.TestCase):
@@ -553,7 +595,7 @@ class CtrlHomeBridge(unittest.TestCase):
                  "mod.attach({'id': 'w-test', 'label': 'test'})\n"
                  if through_attach else "mod._attach_session()\n"))
         master, slave = pty.openpty()
-        orig = termios.tcgetattr(slave)   # before the driver can go raw
+        orig = tty_settings(slave)   # before the driver can go raw
         env = dict(os.environ)
         for key in ("TERMUX_VERSION", "TENDRIL_DETACH_BRIDGE", "HERDR_ENV"):
             env.pop(key, None)
@@ -616,7 +658,7 @@ class CtrlHomeBridge(unittest.TestCase):
         self.assertIn(b"1b5b48", out)        # HOME forwarded verbatim
         self.assertIn(b"1b5b481b64", out)    # ...then ESC d (the detach)
         self.assertEqual(proc.wait(10), 0)   # session exit reaped cleanly
-        self.assertEqual(termios.tcgetattr(slave), orig)
+        self.assertEqual(tty_settings(slave), orig)
 
     def test_clean_host_attach_uses_real_bridge_and_translates_ctrl_home(self):
         stub = self.ECHO_STUB.replace("buf = b''\n",
@@ -630,7 +672,7 @@ class CtrlHomeBridge(unittest.TestCase):
         out = self._read_until(master, lambda data: b"1b64" in data)
         self.assertIn(b"1b64", out)
         self.assertEqual(proc.wait(10), 0)
-        self.assertEqual(termios.tcgetattr(slave), orig)
+        self.assertEqual(tty_settings(slave), orig)
 
     def test_held_partial_sequence_flushes_when_input_goes_idle(self):
         """A cancelled combo must not hold bytes until the next keystroke:
@@ -766,7 +808,7 @@ class DetachGate(unittest.TestCase):
         sys.stdin = test_stdin
         with mock.patch.object(
                 ra.subprocess, "run",
-                staticmethod(lambda args, check=False: attached.append(args))):
+                lambda args, check=False: attached.append(args)):
             try:
                 ra._attach_session()
             finally:

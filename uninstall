@@ -1,24 +1,61 @@
 #!/bin/sh
-# remote-agents uninstaller — removes ONLY files this package installed.
-# Herdr, Tailscale, SSH, Mosh, agents and unrelated ntfy config are untouched.
+# TENDRIL uninstaller — removes ONLY files this package installed (host and
+# client installs, Linux and macOS). Herdr, Tailscale, SSH, Mosh, agents,
+# unrelated LaunchAgents/units and unrelated ntfy config are untouched.
 
 set -u
+# --doctor and --dry-run are read-only: Python must not leave bytecode
+# caches either (Apple's python3 writes them under ~/Library/Caches).
+export PYTHONDONTWRITEBYTECODE=1
 
 BIN_DIR="$HOME/.local/bin"
 CONF_DIR="$HOME/.config/remote-agents"
+CLIENT_CONF_DIR="$HOME/.config/tendril"
 UNIT="$HOME/.config/systemd/user/herdr-notify.service"
+PLIST="$HOME/Library/LaunchAgents/com.tendril.herdr-notify.plist"
+PKG_DIR=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)
+HOST_HELPER="$PKG_DIR/bin/tendril_host.py"
+[ -f "$HOST_HELPER" ] || HOST_HELPER="$BIN_DIR/tendril_host.py"
 
 say() { printf '%s\n' "$*"; }
 confirm() { printf '%s [y/N] ' "$1"; read -r ans; [ "$ans" = "y" ] || [ "$ans" = "Y" ]; }
 
-say "remote-agents uninstaller"
+say "TENDRIL uninstaller"
 say ""
 
-if [ -f "$UNIT" ]; then
-    systemctl --user disable --now herdr-notify.service 2>/dev/null
-    rm -f "$UNIT"
-    systemctl --user daemon-reload 2>/dev/null
-    say "removed: $UNIT (watcher disabled)"
+# the watcher: launchd LaunchAgent (macOS) or systemd user unit (Linux)
+if [ -f "$UNIT" ] || [ -f "$PLIST" ]; then
+    if command -v python3 >/dev/null 2>&1 && [ -f "$HOST_HELPER" ] \
+       && python3 "$HOST_HELPER" service uninstall; then
+        :
+    else                                  # no python3/helper: do it by hand
+        if [ -f "$UNIT" ]; then
+            systemctl --user disable --now herdr-notify.service 2>/dev/null
+            rm -f "$UNIT"
+            systemctl --user daemon-reload 2>/dev/null
+            say "removed: $UNIT (watcher disabled)"
+        fi
+        if [ -f "$PLIST" ]; then
+            launchctl bootout "gui/$(id -u)/com.tendril.herdr-notify" 2>/dev/null \
+                || launchctl bootout "user/$(id -u)/com.tendril.herdr-notify" 2>/dev/null
+            rm -f "$PLIST"
+            say "removed: $PLIST (watcher unloaded)"
+        fi
+    fi
+fi
+
+# client launchers installed by ./install --client (recognised by their header)
+for f in tendril tendril-remote; do
+    if [ -f "$BIN_DIR/$f" ] && [ ! -L "$BIN_DIR/$f" ] \
+       && grep -q 'TENDRIL client launcher' "$BIN_DIR/$f" 2>/dev/null; then
+        rm -f "$BIN_DIR/$f"
+        say "removed: $BIN_DIR/$f (client launcher)"
+    fi
+done
+if [ -f "$CLIENT_CONF_DIR/alias" ]; then
+    rm -f "$CLIENT_CONF_DIR/alias"
+    rmdir "$CLIENT_CONF_DIR" 2>/dev/null
+    say "removed: $CLIENT_CONF_DIR/alias"
 fi
 
 # the `tendril` command is only a symlink to remote-agents; never touch a foreign file
@@ -27,7 +64,7 @@ if [ -L "$BIN_DIR/tendril" ] && [ "$(readlink "$BIN_DIR/tendril")" = "remote-age
     say "removed: $BIN_DIR/tendril"
 fi
 
-for f in remote-agents herdr-notify tendril_link.py; do
+for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py; do
     if [ -f "$BIN_DIR/$f" ]; then
         rm -f "$BIN_DIR/$f"
         say "removed: $BIN_DIR/$f"
@@ -48,13 +85,29 @@ if [ -d "$CONF_DIR" ]; then
     fi
 fi
 
+# the managed PATH block (# >>> tendril remote PATH) in shell startup files
+# (test each file on its own: grep exits 2 when any listed file is missing)
+HAS_BLOCK=""
+for f in "$HOME/.zshenv" "$HOME/.bashrc" "$HOME/.profile"; do
+    [ -f "$f" ] && grep -q '# >>> tendril remote PATH' "$f" && HAS_BLOCK=1
+done
+if [ -n "$HAS_BLOCK" ] && command -v python3 >/dev/null 2>&1 && [ -f "$HOST_HELPER" ]; then
+    say ""
+    if confirm "Remove the managed TENDRIL PATH block from your shell startup files?"; then
+        python3 "$HOST_HELPER" remote-path remove
+    else
+        say "kept: managed PATH block"
+    fi
+fi
+
 echo ""
 if ls "$HOME"/.config/herdr/config.toml.bak.* >/dev/null 2>&1 \
    && [ -f "$HOME/.config/herdr/config.toml" ]; then
     if confirm "Restore the newest Herdr config backup (removes the added detach bindings)?"; then
         LATEST=$(ls -t "$HOME"/.config/herdr/config.toml.bak.* | head -1)
         cp -p "$LATEST" "$HOME/.config/herdr/config.toml"
-        for H in "$HOME/.local/share/mise/installs/herdr/latest/herdr" "$(command -v herdr 2>/dev/null)"; do
+        for H in "$HOME/.local/share/mise/installs/herdr/latest/herdr" "$(command -v herdr 2>/dev/null)" \
+                 "$HOME/.local/bin/herdr" /opt/homebrew/bin/herdr /usr/local/bin/herdr; do
             if [ -n "$H" ] && [ -x "$H" ]; then
                 "$H" server reload-config >/dev/null 2>&1 && say "herdr config reloaded from: $LATEST"
                 break

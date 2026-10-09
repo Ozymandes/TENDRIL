@@ -4,6 +4,172 @@ All notable changes to TENDRIL are documented here.
 
 ## Unreleased
 
+- Android real-device certification (Samsung Galaxy S21 Ultra, F-Droid Termux
+  0.118, TENDRIL Link full integration): ntfy notification tap → TENDRIL Link →
+  Termux RUN_COMMAND → `tendril enter` lands in the exact emitting pane, across
+  workspaces and with alphanumeric pane ids (`w7:p2`, `w8:p1`, `wX:pC`);
+  several notifications each land in their own pane; workspace-only links keep
+  their old behaviour; Ctrl+Home / Alt+D detach returns to the TENDRIL
+  selector. Stale-pane handling (no attach, selector notice) is covered by
+  automated tests and was not part of the device run. TENDRIL Link is an
+  optional companion; TENDRIL works fully without it. macOS still lacks a
+  physical-Mac sign-off and iOS/Blink a real-iPhone sign-off.
+
+- Canonical host identity: one value,
+  `TENDRIL_HOST` in the host config, is what every deep link, notification and
+  pairing code calls this machine. Readers resolve it in one place
+  (`tendril_link.host_identity`): config `TENDRIL_HOST` → legacy
+  `TAILSCALE_HOST` (lowercased, so old `OMARCHY` backups read as `omarchy`) →
+  short hostname, HOST_RE-gated and sanitized, never rewritten on disk.
+  `remote-agents` (HOST_LABEL) and both `herdr-notify` sites use the resolver;
+  existing installs keep resolving to their configured name with zero config
+  churn.
+- `tendril --pair [--code]`: prints the phone pairing code for the TENDRIL
+  Link app — `TENDRIL1:` + unpadded base64url over compact JSON with the
+  sorted keys `{"h","s","u","v":1}`, byte-identical to the app's decoder
+  (pinned against its test fixture) — plus the identity summary, a QR of the
+  code when `qrencode` is on PATH (never a dependency), the ntfy subscribe
+  URL, and a paste-ready Termux setup block with every value filled in.
+  Flags-only like `--upgrade` (a bare word is a session-token position);
+  `--code` prints only the code. The payload carries nothing but host, ssh
+  target and user — no keys, tokens, topics, paths or commands — and invalid
+  values produce one clear error, never a code. SSH target resolution:
+  config `SSH_TARGET` → Tailscale MagicDNS FQDN → `SSH_ALIAS` → identity.
+- Installer (`./install`): discovery first, questions last. The installer now
+  detects Tailscale (`tailscale status --json`), resolves the canonical
+  identity, and shows one summary (identity, Tailscale name/FQDN, SSH/Mosh
+  availability, project roots) with a single `Use this host? [Y/n]` — a name
+  is asked only when Tailscale and the hostname disagree. `--yes` or a
+  non-tty run takes every discovered default without a question. Fresh
+  installs write `TENDRIL_HOST`/`SSH_TARGET` (and keep `TAILSCALE_HOST`/
+  `SSH_ALIAS` for compatibility); reinstalls keep configured values and ask
+  nothing about identity; the separate project-roots question is gone
+  (default: the standard roots that exist, editable in the config). Step 2's
+  interactive prompt count drops from 3 asks to 1 confirmation (2 only in the
+  genuinely ambiguous case). The `read` helpers now tolerate a vanished tty
+  (EIO) instead of dying under `set -u`.
+- `docs/scripts/tendril-phone-setup.sh` accepts all four answers as env
+  (`TENDRIL_HOST_ADDR`, `TENDRIL_HOST_USER`, `TENDRIL_ALIAS_NAME`,
+  `TENDRIL_REPO_DIR`) and skips its questions when all four are set.
+
+- `tendril --upgrade [--verbose]`, plus `tendril --version` and `--help`:
+  safe self-update for hosts. Every install now records provenance
+  (`~/.config/remote-agents/install.json`: source checkout, commit,
+  branch, version, sha256 of the installed phone launchers); the upgrade
+  re-reads it — fallback: the realpath of the running command, but only
+  inside a real checkout containing ./install, never a guessed path — and
+  refuses (one line, exit non-zero, nothing touched) on: non-git source,
+  uncommitted/untracked changes (`git status --porcelain`), a
+  merge/rebase/cherry-pick in progress, detached HEAD, missing upstream,
+  local or diverged commits, or a branch switch since install. Otherwise:
+  `git fetch --quiet` + `git merge --ff-only @{u}` (never reset/rebase/
+  force), then the new `./install --upgrade` non-interactive mode
+  (binaries incl. the new `tendril_upgrade.py`, entrypoint symlink, PATH
+  block only when missing, idempotent Herdr-binding merge, watcher unit
+  refresh) and a hard abort if `config` or `notify.env` changed by a byte
+  (the ntfy topic can never rotate here). The watcher restarts only when
+  its binary or unit actually changed (or it was not running); systemd
+  daemon-reload happens only when the unit content differs. Closes with
+  non-destructive health checks (python, herdr `api snapshot`, ssh/mosh,
+  service status, config parse, remote PATH) and a compact summary block;
+  when `phone/tendril` / `phone/termux-url-opener` changed upstream it
+  prints `android client update available` with the exact Termux refresh
+  commands. Version comes from the new repo `VERSION` file (`0.2.0-dev`
+  until the next tag; a tag on HEAD overrides, `git describe` covers older
+  checkouts without the file). Upgrade is flags-only by design — a bare
+  word is a session-token position and a workspace may be labeled
+  `upgrade`.
+
+- Exact targets and the notification entry lifecycle. Deep links gain an
+  additive `?pane=<pane-id>` query (contract stays v1; workspace-only
+  links are byte-identical, payload whitelist is now `{v,h,w,l,p}`).
+  herdr-notify aims every click URI at the EMITTING agent's own pane
+  (new `{pane_id}` and `{target}` placeholders; `{uri}` carries the
+  pane), never the workspace's currently focused tab — the wrong-tab root
+  cause. New `remote-agents enter <target>`: resolve, exact focus
+  (`workspace focus` + `tab focus` + `agent focus <pane_id>`, verified
+  against the snapshot's `focused_pane_id`), the same Ctrl+Home-bridged
+  attach the selector uses, then the selector loop in-process on detach —
+  no re-exec, no recursion, no orphaned mosh. A stale pane never attaches:
+  `enter` opens the selector with a one-line notice and the parent
+  workspace preselected; `resolve`/`attach`/`focus` take the existing
+  not-found path (exit 2) with `resolve` gaining `pane_id`/`tab_id`/
+  `agent` fields. `attach` stays one-shot. Phone side: `tendril enter`
+  (same validation/quoting/mosh-ssh fallback as attach) and the
+  termux-url-opener now routes recognized links to `tendril enter <id>`.
+  Closed pane/tab ids are not reused within a server lifetime (Herdr
+  documented; cross-restart ids are a new server's scope — hence the
+  verification + stale handling).
+
+- Reinstalling no longer rotates the ntfy topic. `./install` used to
+  mint a fresh random topic every time the notification question was
+  answered yes, silently invalidating every subscribed phone. An existing
+  configuration (non-empty `NTFY_TOPIC`) is now detected and preserved by
+  default — `git pull && ./install` leaves `notify.env` byte-for-byte
+  unchanged — and rotation is a separate, explicit, default-no question
+  that warns about resubscribing. Rotation restarts the watcher only when
+  it is actually running; a custom `NTFY_URL`/`NTFY_TOKEN` is carried over
+  instead of being reset. The canonical `tendril://host/<host>/workspace/<id>`
+  deep-link contract (host/id charset, normalization, malformed/stale
+  behavior, the two supported actions `attach` and `focus`, security
+  boundary) is now frozen in docs/DEEPLINK.md, with `{uri}` as the
+  click-template placeholder that puts that link on every notification.
+
+- Android real-device certification passed on an S21 Ultra / Termux
+  against this branch: launcher refresh, restored masthead and colour
+  hierarchy, selector, Alt+D / Ctrl+B d, direct attach and resolve on a
+  live workspace id, and the `termux-url-opener` deep link.
+
+- Fix (predates the cross-platform work): the installer's Herdr switching
+  merge looked conflicts up by action name in a map keyed by chord, so it
+  never noticed a `switch_tab` that already claims `prefix+1..9`/`alt+1..9`;
+  it proposed all three switching bindings, Herdr rejected the file, and the
+  valid one was rolled back too. `herdr-bindings.py switch` now decides each
+  proposal alone (exact chords after range and modifier expansion, then an
+  isolated `herdr config check` that ignores pre-existing warnings), appends
+  only conflict-free bindings, never edits existing lines, and the installer
+  and `?` help report what Ctrl+B/Alt/Ctrl + digit actually do.
+- Android fixes from a real S21 Ultra: the guided setup wrote the `agent`
+  wrapper through an old `agent -> tendril` symlink into `~/bin/tendril`,
+  where it exec'd itself forever; setup now stages and replaces files, and
+  the wrapper refuses a second hop. With the keyboard open and 7+
+  workspaces the masthead vanished entirely; paths now yield before the
+  brand does. A launcher with no alias lists `~/.ssh/config` hosts and exits.
+
+- macOS as a host and as a client. `./install` now runs unchanged on macOS
+  (Apple silicon and Intel, stock `/bin/sh`, Xcode Command Line Tools
+  Python 3.9+): no GNU `readlink -f`/`sed -i`/`\+` greps, package hints from
+  whichever manager is present (brew, pacman, apt, dnf), the Tailscale
+  app-bundle CLI is found automatically, and the default host name drops the
+  mDNS `.local` suffix. Herdr is found in `~/.local/bin` (install.sh) and
+  Homebrew prefixes even from SSH/launchd PATHs.
+- New `bin/tendril_host.py`: the few host facts and lifecycle verbs that
+  differ by OS, chosen by capability. The notification watcher runs as a
+  launchd LaunchAgent (`~/Library/LaunchAgents/com.tendril.herdr-notify.plist`,
+  log in `~/Library/Logs/tendril/`) where `launchctl` exists, and as the
+  existing systemd user unit otherwise. One command on both:
+  `tendril service status|start|stop|restart|logs`. launchd restarts a
+  crashed watcher; it has no watchdog, so hung-process recovery stays
+  Linux-only. The Info panel no longer reads `/proc` (it crashed on macOS).
+- Installer step 3b, "Remote session PATH": detects when SSH/Mosh commands
+  cannot find `remote-agents` or `mosh-server` (the macOS default: sshd's
+  `zsh -c` reads only `~/.zshenv`, Mosh's `sh -lc` only `~/.profile`) and
+  offers one small marked block, backed up first and removed by `./uninstall`.
+- `./install --client`: installs the launcher as `~/.local/bin/tendril` on a
+  Mac or Linux desktop (or `tendril-remote` when the machine is also a host)
+  with the default host in `~/.config/tendril/alias`. The launcher also gains
+  `resolve|focus|link <id>` over plain SSH and rejects aliases that start
+  with `-`.
+- iOS/Blink re-certified against current Blink source; `docs/IOS_BLINK.md`
+  now marks each feature as source-verified, automated-tested, real-device
+  required, or blocked by Blink. `docs/MACOS.md` covers both Mac roles.
+- Fixes: the Android setup block now `export`s `TENDRIL_ALIAS`; the guided
+  phone setup no longer uses GNU `sed -i` on the host, refreshes
+  `tendril_host.py`, and checks/restarts the watcher on launchd too; the
+  suite passes on Python 3.9.
+- CI: GitHub Actions runs the suite on Ubuntu and macOS (Python 3.9 and
+  current) plus shell syntax checks.
+
 - Guided phone-first setup (PR #1 by @bakrianoo): a one-shot Termux script
   (`docs/scripts/tendril-phone-setup.sh`) bootstraps both ends from the
   phone — SSH key and alias, host-side Herdr/TENDRIL install or atomic

@@ -2,7 +2,7 @@
 
 ```
 PHONE (thin control surface)              HOST (where the work lives)
-Android Termux                            Linux + systemd (user)
+Android Termux                            Linux (systemd user) / macOS (launchd)
   └─ tendril (sh, ~40 lines; alias agent) ├─ Tailscale / OpenSSH / mosh-server
       └─ Tailscale                        ├─ ~/.local/bin/remote-agents
           └─ Mosh / SSH ─────────────────>│    └─ herdr api snapshot (1 call)
@@ -95,6 +95,37 @@ Android Termux                            Linux + systemd (user)
   mobile apps do not render it reliably). Credentials only from
   `~/.config/remote-agents/notify.env` (chmod 600).
 
+### tendril_host (host facts + watcher lifecycle)
+
+- `bin/tendril_host.py` — installed as `~/.local/bin/tendril_host.py` —
+  holds the few host facts and lifecycle verbs that differ by OS, chosen by
+  capability, not OS name: launchd where `launchctl` exists, a systemd user
+  manager where `systemctl --user` answers; stdlib only, Python 3.9+.
+- Host facts for the `I` info panel and `./install --doctor`: Tailscale CLI
+  (PATH first, then the macOS app-bundle CLI), MagicDNS short name or the
+  nodename without its `.local` suffix, load, memory (`/proc/meminfo`, else
+  `sysctl` + `vm_stat`), battery (`/sys`, else `pmset`), uptime.
+- Watcher lifecycle (`tendril service status|start|stop|restart|logs`, plus
+  `service install|uninstall` for the installer):
+  - macOS: a per-user LaunchAgent `com.tendril.herdr-notify`
+    (`~/Library/LaunchAgents/com.tendril.herdr-notify.plist`, logs to
+    `~/Library/Logs/tendril/herdr-notify.log`) with `RunAtLoad` and
+    `KeepAlive` only on unsuccessful exit — crashes are restarted (5 s
+    throttle), hangs are not: launchd has no watchdog. The launchd domain
+    is `gui/<uid>` in a desktop login, `user/<uid>` over bare SSH, chosen
+    by probing `launchctl print`; `stop` bootouts the agent (a kill would
+    be undone by KeepAlive) until the next login.
+  - Linux: the `herdr-notify.service` user unit with `WatchdogSec=60` —
+    the poll loop pings every cycle, so a hung watcher is SIGABRT'd and
+    restarted within the window.
+  - Neither manager present: the verbs report it and suggest running
+    `herdr-notify` by hand.
+- The `remote-path check|plan|apply|remove` verbs manage the
+  `# >>> tendril remote PATH` block in `~/.zshenv`/`~/.bashrc` plus
+  `~/.profile`, so non-interactive SSH (`$SHELL -c`) and Mosh (`sh -lc`)
+  sessions find `remote-agents` and `mosh-server` despite sshd's bare
+  default PATH (`/usr/bin:/bin:/usr/sbin:/sbin` on macOS).
+
 ### install / uninstall
 
 - User-local only; never sudo; never installs packages; reports missing
@@ -109,6 +140,7 @@ Android Termux                            Linux + systemd (user)
 
 1. The phone is a thin control surface; the work lives on the host.
 2. Fewest moving parts: two stdlib Python scripts, one sh launcher, one
-   user systemd unit. No tmux, no web dashboard, no always-new services.
+   user service unit (systemd or launchd). No tmux, no web dashboard, no
+   always-new services.
 3. Every screen is generated from live state at invocation time.
 4. Nothing public: the only network exposure is your tailnet.
