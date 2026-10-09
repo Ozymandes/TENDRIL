@@ -24,6 +24,9 @@
 #   tendril [<alias>] resolve|focus|link <id>
 #                                print JSON / focus headless / print the deep
 #                                link, over plain SSH (no TTY, no Mosh)
+#   tendril snapshot              the LIVE MAP snapshot: ONE line of JSON
+#   tendril <alias> snapshot      (remote-agents snapshot) over plain SSH —
+#                                 no TTY, no Mosh; read by the TENDRIL Link app
 #   tendril --upgrade     refresh the launchers + TENDRIL Link from the host
 #   tendril --version     print the launcher build id (tendril-phone <sha12>)
 #
@@ -45,7 +48,7 @@ no_alias_help() {
     echo "  connect once:   tendril <alias>"
     echo "  set a default:  echo <alias> > ~/.config/tendril/alias"
     echo "                  (or: echo 'export TENDRIL_ALIAS=<alias>' >> ~/.bashrc)"
-    echo "usage: tendril [<alias>] [attach|enter|resolve|focus|link <session-id>] | tendril ssh <alias>"
+    echo "usage: tendril [<alias>] [attach|enter|resolve|focus|link <session-id>|snapshot] | tendril ssh <alias>"
     echo "first time: see docs/ANDROID.md or docs/MACOS.md — create a key, then: ssh-copy-id <alias>"
 }
 
@@ -104,17 +107,24 @@ else
     case "${1:-}" in
         attach | resolve | focus | link | enter)
             MODE="$1"; ALIAS="$DEFAULT_ALIAS"; ATTACH_ID="${2:-}" ;;
+        snapshot)
+            MODE="snapshot"; ALIAS="$DEFAULT_ALIAS" ;;
         *)
             case "${2:-}" in
                 attach | resolve | focus | link | enter)
                     MODE="$2"; ALIAS="$1"; ATTACH_ID="${3:-}" ;;
+                snapshot)
+                    MODE="snapshot"; ALIAS="$1" ;;
             esac ;;
     esac
 fi
 REMOTE_BIN="${REMOTE_AGENTS_BIN:-remote-agents}"   # resolved on the HOST (login shell)
 REMOTE_CMD="$REMOTE_BIN"
 
-if [ -n "$MODE" ]; then
+if [ "$MODE" = "snapshot" ]; then
+    # snapshot takes NO session id: a fixed one-word remote command.
+    REMOTE_CMD="$REMOTE_BIN snapshot"
+elif [ -n "$MODE" ]; then
     BAD=""
     case "$ATTACH_ID" in
         "" | *[!A-Za-z0-9._:-]*) BAD=1 ;;
@@ -137,9 +147,13 @@ if [ -z "$ALIAS" ]; then
     exit 1
 fi
 
-# resolve/focus/link print a result and exit: one plain SSH round trip
+# resolve/focus/link print a result and exit: one plain SSH round trip.
+# snapshot is the same shape, but strictly non-interactive: BatchMode (never
+# a password prompt mid-probe), a short connect timeout, no TTY, no Mosh —
+# the Link app's probe must end in a result, not a hanging session.
 case "$MODE" in
     resolve | focus | link) exec ssh "$ALIAS" "$REMOTE_CMD" ;;
+    snapshot) exec ssh -o BatchMode=yes -o ConnectTimeout=6 "$ALIAS" "$REMOTE_CMD" ;;
 esac
 
 if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$ALIAS" true 2>/dev/null; then

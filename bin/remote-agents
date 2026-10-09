@@ -331,8 +331,12 @@ def snapshot():
         return None
 
 
-def collect():
-    snap = snapshot()
+def collect(snap=None):
+    """Selector rows from one `herdr api snapshot` payload. snap=None fetches
+    one; callers that already hold the payload (snapshot --json) pass it in
+    so a single herdr call feeds both the rows and the raw document."""
+    if snap is None:
+        snap = snapshot()
     if snap is None:
         return None
     pane_cwd = {}
@@ -1411,6 +1415,68 @@ def resolve_token(rows, token):
     return None, ("unknown", [])
 
 
+_LIVE_STATUS = ("working", "blocked", "done", "idle")
+
+
+def _snapshot_agent(a):
+    """One LIVE MAP agent row: exactly the five contract fields (schema v1,
+    TENDRIL Link Topology.kt). Never cwd, terminal titles or agent_session —
+    they do not leave the host."""
+    st = a.get("agent_status")
+    tab = a.get("tab_id")
+    return {
+        "pane_id": a.get("pane_id") or "",
+        "tab_id": tab if tab else None,
+        "agent": a.get("agent") or "agent",
+        "status": st if st in _LIVE_STATUS else "unknown",
+        "focused": bool(a.get("focused")),
+    }
+
+
+def _snapshot_doc():
+    """(doc, 0) or (None, 1) — the LIVE MAP v1 document for TENDRIL Link's
+    phone map. ONE `herdr api snapshot` call feeds both the selector rows and
+    the raw document; workspaces in collect()'s order (selector order). The
+    gate is _reachable_rows' semantics, but diagnostics go to STDERR and
+    stdout stays empty on failure: consumers read one JSON line or nothing."""
+    if not HERDR:
+        print("no compatible herdr client found", file=sys.stderr)
+        return None, 1
+    snap = snapshot()
+    rows = collect(snap)
+    if snap is None or rows is None:
+        print("cannot reach the Herdr server. Is it running? Try: herdr status",
+              file=sys.stderr)
+        return None, 1
+    focused_pane = snap.get("focused_pane_id") or None
+    return {
+        "version": 1,
+        "host": HOST_LABEL,
+        "generated_at": int(time.time()),
+        "focused_workspace": next((r["id"] for r in rows if r["focused"]), None),
+        "focused_pane": focused_pane,
+        "workspaces": [{
+            "id": r["id"],
+            "label": r["label"],
+            "number": r["number"],
+            "focused": bool(r["focused"]),
+            "agents": [_snapshot_agent(a) for a in r["agents"]],
+        } for r in rows],
+    }, 0
+
+
+def _snapshot_cmd():
+    """`snapshot [--json]` — non-interactive LIVE MAP document for the phone
+    (phone/tendril snapshot dials this over plain SSH). --json is accepted
+    and a no-op: the output is one compact JSON line either way. Exit codes:
+    0 ok, 1 Herdr unreachable (stdout empty, reason on stderr), 2 usage."""
+    doc, code = _snapshot_doc()
+    if doc is None:
+        return code
+    print(json.dumps(doc, separators=(",", ":")))
+    return 0
+
+
 def _reachable_rows():
     """(rows, 0) or (None, 1) — the shared 'can we talk to Herdr?' gate."""
     if not HERDR:
@@ -1828,6 +1894,11 @@ persistent AI agents.
   tendril attach|enter|resolve|focus|link <token>
                               direct addressing: workspace id (w15), pane id
                               (w15:p1), workspace number, or exact label
+  tendril snapshot [--json]   one line of LIVE MAP JSON (schema v1): the
+                              read-only workspace/agent mirror TENDRIL Link's
+                              phone map renders. Non-interactive, safe over
+                              plain SSH; on failure stdout stays empty and
+                              the reason goes to stderr (exit 1)
   tendril service status|start|stop|restart|logs
                               the notification watcher, on launchd or systemd
   tendril --pair [--code | --manual]
@@ -1926,6 +1997,11 @@ def main():
         return _pair(args)
     if any(a in args for a in PHONE_FLAGS):
         return _phone(args)
+    if args[:1] == ["snapshot"]:
+        if len(args) > 2 or (len(args) == 2 and args[1] != "--json"):
+            print("usage: remote-agents snapshot [--json]", file=sys.stderr)
+            return 2
+        return _snapshot_cmd()
     if args[:1] == ["service"]:
         return _service(args[1:])
     if len(args) == 2 and args[0] in SUBCOMMANDS:
@@ -1940,6 +2016,8 @@ def main():
         print("       enter: exact focus + attach, then the selector (notification taps)",
               file=sys.stderr)
         print("       remote-agents service status|start|stop|restart|logs",
+              file=sys.stderr)
+        print("       remote-agents snapshot [--json] - LIVE MAP JSON for the Link app",
               file=sys.stderr)
         print("       remote-agents --pair [--code | --manual] | --upgrade [--verbose]",
               file=sys.stderr)
