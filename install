@@ -88,6 +88,22 @@ act() {
     fi
     say "  $desc"; "$@"
 }
+# install_atomic <mode> <src> <dest> - install to a sibling temp file, then
+# rename into place, so readers never see a half-written file.
+install_atomic() {
+    _ia_tmp="$3.tmp.$$"
+    install -m "$1" "$2" "$_ia_tmp" || { rm -f "$_ia_tmp"; return 1; }
+    mv -f "$_ia_tmp" "$3"
+}
+# phone_snapshot - mirror phone/{tendril,termux-url-opener,agent} into the
+# snapshot dir that `tendril --phone-asset` serves (mode 644; the phone
+# chmods its own copies to 700). Idempotent; respects --dry-run.
+phone_snapshot() {
+    act "create $PHONE_SNAP" mkdir -p "$PHONE_SNAP" || return 1
+    for f in tendril termux-url-opener agent; do
+        act "snapshot phone/$f" install_atomic 644 "$PKG_DIR/phone/$f" "$PHONE_SNAP/$f"
+    done
+}
 
 # ---------------- herdr config merge (shared: install and upgrade) -------
 # plan|apply the managed detach/switch set only; unrelated lines and
@@ -201,6 +217,7 @@ sshd_hint() {
 BIN_DIR="$HOME/.local/bin"
 CONF_DIR="$HOME/.config/remote-agents"
 CLIENT_CONF_DIR="$HOME/.config/tendril"
+PHONE_SNAP="$HOME/.local/share/tendril/phone"
 CONFIG="$CONF_DIR/config"
 
 # python3 must really run: on a fresh Mac /usr/bin/python3 is only a stub
@@ -307,7 +324,7 @@ upgrade_install() {
        && cmp -s "$BIN_DIR/herdr-notify" "$PKG_DIR/bin/herdr-notify"; then
         BIN_CHANGED=0
     fi
-    for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py tendril_upgrade.py; do
+    for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py tendril_upgrade.py tendril_phone.py; do
         [ -f "$BIN_DIR/$f" ] && backup "$BIN_DIR/$f"
         act "install $BIN_DIR/$f" install -m 755 "$PKG_DIR/bin/$f" "$BIN_DIR/$f"
     done
@@ -316,6 +333,7 @@ upgrade_install() {
     else
         act "link $BIN_DIR/tendril -> remote-agents" ln -sfn remote-agents "$BIN_DIR/tendril"
     fi
+    phone_snapshot
     say ""
 
     say "2) Remote session PATH (only when missing)"
@@ -557,7 +575,7 @@ else
     printf '%s\n' "$CONF_BODY" > "$CONFIG"
     chmod 600 "$CONFIG"
 fi
-for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py tendril_upgrade.py; do
+for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py tendril_upgrade.py tendril_phone.py; do
     [ -f "$BIN_DIR/$f" ] && backup "$BIN_DIR/$f"
     act "install $BIN_DIR/$f" install -m 755 "$PKG_DIR/bin/$f" "$BIN_DIR/$f"
 done
@@ -567,7 +585,20 @@ if [ -e "$BIN_DIR/tendril" ] && [ ! -L "$BIN_DIR/tendril" ]; then
 else
     act "link $BIN_DIR/tendril -> remote-agents" ln -sfn remote-agents "$BIN_DIR/tendril"
 fi
+phone_snapshot
 path_hint
+# provenance is recorded the moment the files are in place: everything
+# downstream (the version self-check below, tendril --upgrade later) reads
+# install.json. These lines stay free of backticks: inside double quotes
+# they would be live command substitutions and run tendril --upgrade here.
+say "Install provenance (what tendril --upgrade reads):"
+if [ "$DRY_RUN" = "1" ]; then
+    say "  [dry-run] record $CONF_DIR/install.json (source, commit, version, phone hashes)"
+elif "$PYTHON" "$PKG_DIR/bin/tendril_upgrade.py" record-provenance --pkg "$PKG_DIR/bin"; then
+    "$PYTHON" "$PKG_DIR/bin/tendril_upgrade.py" version | sed 's/^/  /'
+else
+    say "  note: provenance not recorded (non-fatal; it only enables tendril --upgrade)"
+fi
 say ""
 
 # ---------------- 3b. remote session PATH ----------------
@@ -795,54 +826,16 @@ PLAN=$(herdr_detach plan)
     done
 say ""
 
-# ---------------- 7. personalized Android setup ----------------
-hr; say "TENDRIL // ANDROID SETUP (for this host)"; hr
-say "Pair the TENDRIL Link app (code + QR + paste-ready setup):  tendril --pair"
-say "Or set Termux up by hand. Run inside Termux on the phone:"
-say ""
-say "  pkg update && pkg install openssh mosh"
-say "  ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N '' -C termux"
-say ""
-say "  cat > ~/.ssh/config <<'EOF'"
-say "  Host $NEW_ALIAS"
-say "      HostName $TARGET"
-say "      User $USER"
-say "      IdentityFile ~/.ssh/id_ed25519"
-say "      IdentitiesOnly yes"
-say "      ServerAliveInterval 30"
-say "      ServerAliveCountMax 3"
-say "  EOF"
-say ""
-say "  ssh-copy-id $NEW_ALIAS && ssh $NEW_ALIAS    # must log in without a password"
-say "  set -e"
-say "  mkdir -p ~/bin ~/tendril-launchers"
-say "  scp $(shq "$NEW_ALIAS:$PKG_DIR/phone/tendril") ~/tendril-launchers/tendril"
-say "  scp $(shq "$NEW_ALIAS:$PKG_DIR/phone/agent") ~/tendril-launchers/agent"
-say "  rm -f ~/bin/tendril ~/bin/agent"
-say "  mv ~/tendril-launchers/tendril ~/bin/tendril"
-say "  mv ~/tendril-launchers/agent ~/bin/agent"
-say "  chmod 700 ~/bin/tendril ~/bin/agent && rmdir ~/tendril-launchers"
-say "  echo 'export PATH=\$HOME/bin:\$PATH' >> ~/.bashrc"
-say "  echo 'export TENDRIL_ALIAS=$NEW_ALIAS' >> ~/.bashrc && source ~/.bashrc"
-say ""
-say "  hash -r && command -v tendril && command -v agent"
-say "  tendril              # TENDRIL console"
-say ""
-say "  (the phone generates its own key; private keys are never copied)"
+# ---------------- 7. pair a phone ----------------
+hr; say "TENDRIL // PHONE SETUP (for this host)"; hr
+say "Pair a phone:  tendril --pair"
+say "Manual Termux setup:  tendril --pair --manual"
 say ""
 say "iPhone (Blink Shell): docs/IOS_BLINK.md - same host alias, same commands."
 say "Mac / desktop client:  run ./install --client on that machine (docs/MACOS.md)."
-say ""
-say "Install provenance (what `tendril --upgrade` reads):"
-if [ "$DRY_RUN" = "1" ]; then
-    say "  [dry-run] record $CONF_DIR/install.json (source, commit, version, phone hashes)"
-elif "$PYTHON" "$PKG_DIR/bin/tendril_upgrade.py" record-provenance --pkg "$PKG_DIR/bin"; then
-    :
-else
-    say "  note: provenance not recorded (non-fatal; it only enables tendril --upgrade)"
-fi
+
 say ""
 hr
+say "TENDRIL // INSTALL COMPLETE"
 say "Done. Host console:  tendril (= $BIN_DIR/remote-agents)   |   doctor:  $0 --doctor"
 say "Daily use from the phone:  tendril          watcher:  tendril service status"
-hr

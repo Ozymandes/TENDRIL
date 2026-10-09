@@ -14,7 +14,6 @@ import json
 import os
 import re
 import select
-import shlex
 import shutil
 import subprocess
 import sys
@@ -71,6 +70,10 @@ try:
     import tendril_upgrade       # --version / --upgrade (thin dispatch below)
 except ImportError:
     tendril_upgrade = None
+try:
+    import tendril_phone         # --phone-* / --link-stage (thin dispatch below)
+except ImportError:
+    tendril_phone = None
 
 # Canonical host identity (binding contract): config TENDRIL_HOST -> legacy
 # TAILSCALE_HOST (lowercased) -> short hostname, HOST_RE-gated, sanitized —
@@ -1645,10 +1648,13 @@ def _pair_source_dir():
     return None
 
 
-def _notify_subscribe_url():
-    """ntfy server/topic from notify.env, joined for a subscribe URL —
-    printed so the phone can subscribe; never encoded into any payload."""
-    url = topic = ""
+def _notify_config():
+    """(url, topic, token) from notify.env; NTFY_SUBSCRIBE_TOKEN (a
+    read-only ntfy token — recommended) preferred over the legacy
+    NTFY_TOKEN. Missing file or keys: empty strings, never an error. The
+    values are only ever encoded into the pairing payload — never
+    printed."""
+    url = topic = subscribe = legacy = ""
     try:
         with open(NOTIFY_ENV, encoding="utf-8") as f:
             for ln in f:
@@ -1657,81 +1663,130 @@ def _notify_subscribe_url():
                     url = ln.split("=", 1)[1].strip().strip('"').strip("'")
                 elif ln.startswith("NTFY_TOPIC="):
                     topic = ln.split("=", 1)[1].strip().strip('"').strip("'")
+                elif ln.startswith("NTFY_SUBSCRIBE_TOKEN="):
+                    subscribe = ln.split("=", 1)[1].strip().strip('"').strip("'")
+                elif ln.startswith("NTFY_TOKEN="):
+                    legacy = ln.split("=", 1)[1].strip().strip('"').strip("'")
     except OSError:
         pass
-    return f"{url}/{topic}" if url and topic else ""
+    return url, topic, (subscribe or legacy)
 
 
-def _pair_print(code, host, target, user):
-    """The human block: identity summary, code, optional QR (only when
-    qrencode is on PATH; never a dependency), the ntfy subscribe URL, and
-    a paste-ready Termux setup with every value filled in."""
-    reach = f"{user}@{target}"
-    transport = "Tailscale + Mosh" if shutil.which("mosh") else "Tailscale + SSH"
-    print(f"{C_LIME}TENDRIL // PHONE PAIRING{C_RESET}")
-    print(f"{C_GRAY}  Host     {C_RESET}{host}")
-    print(f"{C_GRAY}  Reach    {C_RESET}{reach}  ({transport})")
-    print(f"{C_GRAY}  Pairing  {C_RESET}{code}")
-    qrencode = shutil.which("qrencode")
-    if qrencode:
+def _pair_reach(target):
+    """Display transport for REACH: over Tailscale (MagicDNS target, or
+    Tailscale answering at all) the phone dials mosh when it is on PATH,
+    else plain ssh; anything else is just SSH. Purely informational —
+    never blocks pairing."""
+    tailscale = target.endswith(".ts.net")
+    if not tailscale and tendril_host is not None:
         try:
-            qr = subprocess.run([qrencode, "-t", "ansiutf8", code],
-                                capture_output=True, text=True, timeout=15)
-            if qr.returncode == 0 and qr.stdout:
-                print(qr.stdout.rstrip("\n"))
-        except (OSError, subprocess.TimeoutExpired):
-            pass                            # QR is garnish, never load-bearing
-    subscribe = _notify_subscribe_url()
-    if subscribe:
-        print(f"{C_GRAY}  ntfy: subscribe to {C_RESET}{subscribe}")
-    else:
-        print(f"{C_GRAY}  ntfy: not configured ({NOTIFY_ENV}); "
-              f"push setup: re-run ./install{C_RESET}")
-    src = _pair_source_dir()
-    print("")
-    print("Termux setup (paste into Termux):")
-    lines = [
-        "pkg install -y openssh mosh",
-        "[ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519",
-        f"ssh-copy-id {reach}",
-        "mkdir -p ~/bin ~/.config/tendril",
-    ]
-    if src:
-        lines += [
-            f"scp {shlex.quote(f'{reach}:{src}/phone/tendril')} ~/bin/tendril",
-            f"scp {shlex.quote(f'{reach}:{src}/phone/termux-url-opener')} ~/bin/termux-url-opener",
-        ]
-    else:
-        lines += [
-            "# no recorded source checkout: copy phone/tendril and",
-            "# phone/termux-url-opener from your TENDRIL checkout to ~/bin/ first",
-        ]
-    lines += [
-        "chmod 700 ~/bin/tendril ~/bin/termux-url-opener",
-        f"printf '%s\\n' '{reach}' > ~/.config/tendril/alias",
-        "hash -r && tendril",
-    ]
+            tailscale = bool(tendril_host.tailscale_identity()[1])
+        except Exception:                       # garnish: never a crash
+            tailscale = False
+    if not tailscale:
+        return "SSH"
+    return "Tailscale + " + ("Mosh" if shutil.which("mosh") else "SSH")
+
+
+def _pair_bootstrap_command(reach):
+    """The ONE new-phone bootstrap command (binding contract, "New-phone
+    bootstrap"): Termux tools, a key if needed, the key copied to the
+    host once (ssh-copy-id), then the host's auditable phone setup
+    script."""
+    return ("pkg install -y openssh mosh && "
+            "{ [ -f ~/.ssh/id_ed25519 ] || ssh-keygen -t ed25519 -N '' "
+            "-f ~/.ssh/id_ed25519 -C termux; } && "
+            f"ssh-copy-id {reach} && "
+            f"ssh {reach} remote-agents --phone-script setup "
+            "> \"$PREFIX/tmp/tendril-setup.sh\" && sh \"$PREFIX/tmp/tendril-setup.sh\"")
+
+
+def _pair_qr(code, indent=2):
+    """Print the code as an ANSI QR when qrencode is on PATH and the block
+    fits the terminal (minus the indent); one plain hint line when it is
+    too narrow, nothing at all without qrencode. Garnish — never a
+    failure. Returns True when anything was printed."""
+    qrencode = shutil.which("qrencode")
+    if not qrencode:
+        return False
+    try:
+        qr = subprocess.run([qrencode, "-t", "ansiutf8", "-m", "1", code],
+                            capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if qr.returncode != 0 or not qr.stdout:
+        return False
+    lines = qr.stdout.rstrip("\n").splitlines()
+    width = max((len(ln) for ln in lines), default=0)
+    if width + indent > shutil.get_terminal_size(fallback=(80, 24)).columns:
+        print(" " * indent
+              + "(terminal too narrow for QR — widen it or use the code)")
+        return True
     for ln in lines:
-        print(f"  {ln}")
-    if subscribe:
+        print(" " * indent + ln)
+    return True
+
+
+def _pair_print(mode, code, host, target, user, notify_ready):
+    """`tendril --pair` output. --code: only the code line, nothing else
+    (for scripts). --manual: the header, the ONE new-phone bootstrap
+    command and a three-line explanation — no wall of steps. Default: the
+    identity summary, the optional QR, and the pairing code as one
+    unwrapped line (the ntfy token travels only inside it; there is no
+    subscribe-URL line — Link subscribes itself)."""
+    reach = f"{user}@{target}"
+    print(f"{C_LIME}TENDRIL // PAIR DEVICE{C_RESET}")
+    print("")
+    if mode == "manual":
+        print(f"{C_GRAY}  1.{C_RESET} Install Termux from F-Droid (not the Play Store build).")
+        print(f"{C_GRAY}  2.{C_RESET} Paste this one command into Termux:")
         print("")
-        print(f"Then subscribe the ntfy app to: {subscribe}")
+        print(f"     {_pair_bootstrap_command(reach)}")
+        print("")
+        print(f"{C_GRAY}  3.{C_RESET} It asks for your host password once (for ssh-copy-id), then sets up the phone.")
+        print("")
+        print(f"{C_GRAY}  Already set up?{C_RESET}  in Termux:  tendril --upgrade")
+        return 0
+    rows = [
+        ("HOST", host),
+        ("REACH", _pair_reach(target)),
+        ("LINK", "ready"),
+        ("NOTIFY", "ready" if notify_ready else "not configured — run ./install"),
+    ]
+    for label, value in rows:
+        print(f"{C_GRAY}  {label:<11}{C_RESET}{value}")
+    print("")
+    if _pair_qr(code):
+        print("")
+    print(f"{C_GRAY}  Scan with TENDRIL Link{C_RESET}")
+    print(f"{C_GRAY}  or paste the pairing code{C_RESET}")
+    print("")
+    print(f"{C_GRAY}  Pairing code{C_RESET}")
+    print(f"  {code}")
+    print("")
+    print(f"{C_GRAY}  New phone?{C_RESET}  tendril --pair --manual")
     return 0
 
 
 def _pair(args):
     """`tendril --pair`: the phone pairing code for the TENDRIL Link app,
-    plus the setup block. Deliberately flags-only like --upgrade — no bare
-    `pair` word: a single word is a session-token position and a workspace
-    may legitimately be labeled "pair". All payload values are validated;
-    on any invalid value: one clear error, no code."""
+    always contract v2 — with the ntfy keys n/t/k from notify.env when
+    they are usable, without them (NOTIFY shown "not configured") when
+    they are not: a bad ntfy value never blocks pairing. Modes: the
+    default pretty block, --code for scripts (only the code line),
+    --manual for the one-command new-phone bootstrap. Deliberately
+    flags-only like --upgrade — no bare `pair` word: a single word is a
+    session-token position and a workspace may legitimately be labeled
+    "pair". All payload values are validated; on any invalid value: one
+    clear error, no code."""
     rest = [a for a in args if a != "--pair"]
     code_only = "--code" in rest
-    rest = [a for a in rest if a != "--code"]
-    if rest or args.count("--pair") != 1:
-        print("usage: tendril --pair [--code]", file=sys.stderr)
+    manual = "--manual" in rest
+    rest = [a for a in rest if a not in ("--code", "--manual")]
+    if rest or args.count("--pair") != 1 or (code_only and manual):
+        print("usage: tendril --pair [--code | --manual]", file=sys.stderr)
         return 2
-    if tendril_link is None or not hasattr(tendril_link, "pairing_code"):
+    if tendril_link is None or not hasattr(tendril_link, "pairing_code_v2"):
         print("tendril_link.py is missing or stale next to remote-agents; "
               "re-run ./install", file=sys.stderr)
         return 1
@@ -1741,15 +1796,28 @@ def _pair(args):
         user = getpass.getuser() or ""
     except Exception:
         user = ""
+    url, topic, token = _notify_config()
+    notify_ready = False
     try:
-        code = tendril_link.pairing_code(host, target, user)
+        code = tendril_link.pairing_code_v2(host, target, user,
+                                            ntfy_url=url or None,
+                                            topic=topic or None,
+                                            token=token or None)
+        notify_ready = bool(url and topic)
     except tendril_link.LinkError as exc:
-        print(f"cannot pair: {exc}", file=sys.stderr)
-        return 1
+        if not (url or topic or token):
+            print(f"cannot pair: {exc}", file=sys.stderr)
+            return 1
+        try:                    # ntfy values out of grammar: pair anyway
+            code = tendril_link.pairing_code_v2(host, target, user)
+        except tendril_link.LinkError as exc2:
+            print(f"cannot pair: {exc2}", file=sys.stderr)
+            return 1
     if code_only:
         print(code)
         return 0
-    return _pair_print(code, host, target, user)
+    return _pair_print("manual" if manual else "pretty",
+                       code, host, target, user, notify_ready)
 
 
 HELP = """\
@@ -1762,16 +1830,24 @@ persistent AI agents.
                               (w15:p1), workspace number, or exact label
   tendril service status|start|stop|restart|logs
                               the notification watcher, on launchd or systemd
-  tendril --pair [--code]
+  tendril --pair [--code | --manual]
                               the phone pairing code for the TENDRIL Link
-                              app (scan or paste), the ntfy subscribe URL
-                              and a paste-ready Termux setup block; --code
-                              prints only the code (for scripting)
+                              app — scan or paste; ntfy config rides inside
+                              the code. --code prints only the code (for
+                              scripting), --manual prints the one-command
+                              Termux bootstrap for a new phone
   tendril --upgrade [--verbose]
                               self-update: fetch + fast-forward the recorded
                               source checkout, then ./install --upgrade
                               (binaries, symlink, PATH block, watcher unit;
                               config and notify.env stay byte-identical)
+  tendril --phone-manifest | --phone-asset <name> | --phone-script <setup|upgrade>
+                              phone channel: the sh-parsable manifest of phone
+                              assets, one asset's raw bytes (tendril,
+                              termux-url-opener, agent, link-apk), or a
+                              generated setup/upgrade script for Termux
+  tendril --link-stage <path> stage a built TENDRIL Link APK (tendril-link.apk
+                              + tendril-link.json) so phones can pick it up
   tendril --version           the installed version and commit
   tendril --help              this help
 
@@ -1796,7 +1872,35 @@ def _upgrade(args):
         print("tendril_upgrade.py is missing next to remote-agents; re-run ./install",
               file=sys.stderr)
         return 1
-    return tendril_upgrade.upgrade_main(verbose=verbose)
+    try:
+        return tendril_upgrade.upgrade_main(verbose=verbose)
+    except tendril_upgrade.Refused as exc:
+        # mirror tendril_upgrade.main: a refusal is guidance, never a traceback
+        print("tendril --upgrade: %s" % exc, file=sys.stderr)
+        return 1
+
+
+PHONE_FLAGS = ("--phone-manifest", "--phone-asset", "--phone-script",
+               "--link-stage")
+PHONE_USAGE = ("usage: tendril --phone-manifest\n"
+               "       tendril --phone-asset "
+               "<tendril|termux-url-opener|agent|link-apk>\n"
+               "       tendril --phone-script <setup|upgrade>\n"
+               "       tendril --link-stage <path>")
+
+
+def _phone(args):
+    """The phone channel (binding contract §2): flags-only like --pair and
+    --upgrade — a bare word is a session-token position. Exactly one phone
+    flag per call; tendril_phone.py validates the arguments strictly."""
+    if sum(1 for f in PHONE_FLAGS if f in args) != 1:
+        print(PHONE_USAGE, file=sys.stderr)
+        return 2
+    if tendril_phone is None:
+        print("tendril_phone.py is missing next to remote-agents; "
+              "re-run ./install", file=sys.stderr)
+        return 1
+    return tendril_phone.main(args)
 
 
 def main():
@@ -1820,6 +1924,8 @@ def main():
         return _upgrade(args)
     if "--pair" in args:
         return _pair(args)
+    if any(a in args for a in PHONE_FLAGS):
+        return _phone(args)
     if args[:1] == ["service"]:
         return _service(args[1:])
     if len(args) == 2 and args[0] in SUBCOMMANDS:
@@ -1835,8 +1941,12 @@ def main():
               file=sys.stderr)
         print("       remote-agents service status|start|stop|restart|logs",
               file=sys.stderr)
-        print("       remote-agents --pair [--code] | --upgrade [--verbose] "
-              "| --version | --help",
+        print("       remote-agents --pair [--code | --manual] | --upgrade [--verbose]",
+              file=sys.stderr)
+        print("       remote-agents --phone-manifest | --phone-asset <name> "
+              "| --phone-script <setup|upgrade> | --link-stage <path>",
+              file=sys.stderr)
+        print("       remote-agents --version | --help",
               file=sys.stderr)
         return 2
     rows, code = _reachable_rows()

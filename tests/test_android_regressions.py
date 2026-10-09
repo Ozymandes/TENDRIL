@@ -147,6 +147,83 @@ class AliasMissingFailsFast(unittest.TestCase):
         self.assertFalse(os.path.exists(log))           # never dialled
 
 
+class SelfUpgrade(unittest.TestCase):
+    """`tendril --upgrade` on the phone — the transition path for field
+    phones still running the OLD launcher, where `--upgrade` fell into
+    the "-*-) not an SSH alias" branch and exited 2. The current launcher
+    must upgrade from the config-file alias alone (TENDRIL_ALIAS unset),
+    download fully, then run; a failed or empty fetch must print one line
+    and change nothing."""
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="tendril self-upgrade ")
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.stubs = os.path.join(self.home, "stubs")
+        self.tmpdir = os.path.join(self.home, "tmp")
+        os.makedirs(self.stubs)
+        os.makedirs(self.tmpdir)
+        self.ssh_log = os.path.join(self.home, "ssh.log")
+        self.ran_log = os.path.join(self.home, "ran.log")
+
+    def stub_ssh(self, body):
+        path = os.path.join(self.stubs, "ssh")
+        with open(path, "w") as f:
+            f.write(body)
+        os.chmod(path, 0o755)
+
+    def write_alias(self, value):
+        d = os.path.join(self.home, ".config", "tendril")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, "alias"), "w") as f:
+            f.write(value + "\n")
+
+    def run_launcher(self):
+        env = {"HOME": self.home, "PATH": self.stubs + ":/usr/bin:/bin",
+               "TMPDIR": self.tmpdir, "PREFIX": self.home,
+               "TENDRIL_ALIAS": "", "TENDRIL_SSH_LOG": self.ssh_log,
+               "TENDRIL_UP_LOG": self.ran_log}
+        return subprocess.run(["sh", TENDRIL, "--upgrade"], env=env,
+                              capture_output=True, text=True, timeout=15)
+
+    def test_alias_file_user_at_host_dials_and_runs_the_script(self):
+        # TENDRIL_ALIAS is deliberately empty: ~/.config/tendril/alias is
+        # the only alias source, holding a full user@host value
+        self.write_alias("dad@omarchy")
+        self.stub_ssh('#!/bin/sh\n'
+                      'printf \'%s\\n\' "$*" >> "$TENDRIL_SSH_LOG"\n'
+                      'echo \'echo RAN >> "$TENDRIL_UP_LOG"\'\n')
+        p = self.run_launcher()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(self.ssh_log) as f:
+            calls = f.read()
+        self.assertIn("-o BatchMode=yes dad@omarchy", calls)
+        self.assertIn("remote-agents --phone-script upgrade", calls)
+        with open(self.ran_log) as f:               # the download executed
+            self.assertEqual(f.read().splitlines(), ["RAN"])
+
+    def test_ssh_failure_is_one_line_and_runs_nothing(self):
+        self.write_alias("dad@omarchy")
+        self.stub_ssh('#!/bin/sh\nexit 1\n')
+        p = self.run_launcher()
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(p.stdout.splitlines(),
+                         ["[tendril] could not fetch the upgrade script "
+                          "from 'dad@omarchy' - nothing was changed."])
+        self.assertFalse(os.path.exists(self.ran_log))
+        self.assertEqual(os.listdir(self.tmpdir), [])   # temp cleaned up
+
+    def test_empty_download_is_one_line_and_runs_nothing(self):
+        self.write_alias("dad@omarchy")
+        self.stub_ssh('#!/bin/sh\nexit 0\n')            # ssh ok, zero bytes
+        p = self.run_launcher()
+        self.assertEqual(p.returncode, 1)
+        self.assertEqual(p.stdout.splitlines(),
+                         ["[tendril] could not fetch the upgrade script "
+                          "from 'dad@omarchy' - nothing was changed."])
+        self.assertFalse(os.path.exists(self.ran_log))
+        self.assertEqual(os.listdir(self.tmpdir), [])
+
+
 class PhoneGeometry(unittest.TestCase):
     """S21 Ultra / Termux, portrait, keyboard + extra-keys row open:
     roughly 48-52 columns by 18-24 rows; 7 workspaces, each with a path."""
