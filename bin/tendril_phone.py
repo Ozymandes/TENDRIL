@@ -319,8 +319,10 @@ set -u
 
 MODE='@KIND@'
 REACH='@REACH@'                 # user@target; setup writes it to the alias file when missing
-HOST_ID='@HOST@'                # shellcheck disable=SC2034  (audit trail)
-TENDRIL_VERSION='@VERSION@'     # shellcheck disable=SC2034  (audit trail)
+# shellcheck disable=SC2034  # audit trail only
+HOST_ID='@HOST@'
+# shellcheck disable=SC2034  # audit trail only
+TENDRIL_VERSION='@VERSION@'
 SHA_TENDRIL='@SHA_TENDRIL@'
 SHA_TERMUX_URL_OPENER='@SHA_TERMUX_URL_OPENER@'
 SHA_AGENT='@SHA_AGENT@'
@@ -439,6 +441,7 @@ ensure_external_apps() {
 # ensure_rc_path - append the ~/bin PATH line to ~/.bashrc only when absent.
 ensure_rc_path() {
     _ep_rc="$HOME/.bashrc"
+    # shellcheck disable=SC2016  # the literal line written to ~/.bashrc
     _ep_line='export PATH="$HOME/bin:$PATH"'
     if [ -f "$_ep_rc" ] && grep -qF "$_ep_line" "$_ep_rc"; then
         return 1
@@ -543,14 +546,9 @@ if [ "$MODE" = setup ]; then
     else
         ROW_PATH="PATH already in ~/.bashrc"
     fi
-    if [ -n "$APK_SHA" ]; then
-        ROW_LINK="staged - run: tendril --upgrade"
-    else
-        ROW_LINK="not staged"
-    fi
 fi
 
-if [ "$MODE" = upgrade ] && [ -n "$APK_SHA" ]; then
+if [ -n "$APK_SHA" ]; then
     _rec=""
     [ -r "$HOME/.config/tendril/link-apk.sha256" ] \
         && IFS= read -r _rec < "$HOME/.config/tendril/link-apk.sha256"

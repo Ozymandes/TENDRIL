@@ -848,6 +848,27 @@ class SetupScriptRun(PhoneEnv):
         self.assertEqual(body.count('export PATH="$HOME/bin:$PATH"'), 1)
         self.assertIn("PHONE // SETUP", p.stdout)
         self.assertIn("LINK READY", p.stdout)
+
+    def test_setup_installs_staged_link_apk(self):
+        # a brand-new phone gets TENDRIL Link from the same verified path
+        self.host_ready()
+        self.stage()
+        p = self.run_generated("setup", stdin="\n", TENDRIL_FAKE_VC="")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("  TENDRIL Link   update ready", p.stdout)
+        opens = self.log_lines(self.open_log)
+        self.assertEqual(len(opens), 1)
+        self.assertIn("<application/vnd.android.package-archive>", opens[0])
+        self.assertIn("LINK READY", p.stdout)
+        self.assertNotIn("staged - run", out)
+
+    def test_setup_without_staged_apk_says_not_staged(self):
+        self.host_ready()
+        p = self.run_generated("setup", stdin="")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("  TENDRIL Link   not staged", p.stdout)
+        self.assertEqual(self.log_lines(self.open_log), [])
         self.assertIn("open the TENDRIL Link app", p.stdout)
         self.assertEqual(len(self.asset_calls()), 3)
 
