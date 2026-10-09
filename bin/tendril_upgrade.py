@@ -36,7 +36,7 @@ import time
 
 DEFAULT_VERSION = "0.2.0-dev"
 INSTALLER = "install"
-PHONE_FILES = ("tendril", "termux-url-opener")
+PHONE_FILES = ("tendril", "termux-url-opener", "agent")
 USAGE = ("usage: tendril_upgrade.py [--verbose]\n"
          "       tendril_upgrade.py record-provenance --pkg DIR\n"
          "       tendril_upgrade.py version")
@@ -327,6 +327,26 @@ def version_line(repo=None):
 
 
 # ---------------------------------------------------------------- record
+def staged_link_info():
+    """The staged TENDRIL Link APK summary (from the link snapshot dir,
+    XDG_DATA_HOME honoured), or None. Recorded under "link_apk" so the
+    next upgrade can notice a freshly staged APK."""
+    data = os.environ.get("XDG_DATA_HOME") \
+        or os.path.join(os.path.expanduser("~"), ".local", "share")
+    path = os.path.join(data, "tendril", "link", "tendril-link.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(doc, dict) or not isinstance(doc.get("sha256"), str) \
+            or not doc.get("sha256"):
+        return None
+    return {"sha256": doc["sha256"],
+            "versionCode": doc.get("versionCode"),
+            "versionName": doc.get("versionName")}
+
+
 def record_provenance(pkg_dir):
     """Called by ./install at the end of BOTH install modes. Read-only git
     facts about the checkout; writes ~/.config/remote-agents/install.json."""
@@ -343,6 +363,7 @@ def record_provenance(pkg_dir):
         "installed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "phone": {name: sha256(os.path.join(repo, "phone", name))
                   for name in PHONE_FILES},
+        "link_apk": staged_link_info(),
     }
     os.makedirs(config_dir(), exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=".install-json-", dir=config_dir())
@@ -471,13 +492,33 @@ def phone_changes(recorded_phone, repo):
     return changed
 
 
-def android_notice(alias, repo):
-    src = os.path.join(repo, "phone")
-    return ("android client update available - on the phone (Termux):\n"
-            "  scp '%s:%s/tendril' ~/bin/tendril\n"
-            "  scp '%s:%s/termux-url-opener' ~/bin/termux-url-opener\n"
-            "  chmod 700 ~/bin/tendril ~/bin/termux-url-opener"
-            % (alias, src, alias, src))
+SAFE_ALIAS_RE = re.compile(r"^[A-Za-z0-9._@][A-Za-z0-9._@-]{0,252}$")
+
+
+def notice_alias():
+    """The host the phone-side hint dials: config SSH_TARGET -> SSH_ALIAS
+    (the same resolution the setup script writes into a fresh phone's
+    alias file). Returned only when it is a single shell-safe token, so
+    the printed command stays safe to paste into Termux; empty otherwise."""
+    cfg = parse_env_file(config_path())
+    for key in ("SSH_TARGET", "SSH_ALIAS"):
+        value = (cfg.get(key) or "").strip()
+        if SAFE_ALIAS_RE.match(value):
+            return value
+    return ""
+
+
+def android_notice():
+    """Exactly two compact lines, aligned with the print_summary rows:
+    the phone pulls everything itself over its existing SSH key auth
+    (replaces the old scp block), and the second line is the ONE-command
+    transition for phones still running the old launcher (whose
+    `tendril --upgrade` predates the flag and would only error)."""
+    alias = notice_alias() or "<alias>"
+    return ("  phone       run  tendril --upgrade  in Termux\n"
+            "              first time on an older phone:  ssh %s "
+            "remote-agents --phone-script upgrade > $PREFIX/tmp/tu.sh "
+            "&& sh $PREFIX/tmp/tu.sh" % alias)
 
 
 def print_summary(ver, old_short, new_short, host, watcher, herdr, android):
@@ -567,10 +608,14 @@ def upgrade_main(verbose=False):
     android = "client current"
     if host == "updated":
         changed = phone_changes((prov or {}).get("phone"), repo)
-        if changed:
+        staged = staged_link_info()
+        prev_link = (prov or {}).get("link_apk")
+        link_new = bool(staged) and (
+            not isinstance(prev_link, dict)
+            or prev_link.get("sha256") != staged["sha256"])
+        if changed or link_new:
             android = "client refresh recommended"
-            alias = parse_env_file(config_path()).get("SSH_ALIAS") or "SSH_ALIAS"
-            say(android_notice(alias, repo))
+            say(android_notice())
     print_summary(ver, old_short, head[:12], host,
                   watcher_row(marker, checks.get("watcher")),
                   checks["herdr"], android)

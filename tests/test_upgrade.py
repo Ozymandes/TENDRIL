@@ -29,6 +29,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 TESTS = os.path.dirname(os.path.abspath(__file__))
 if TESTS not in sys.path:  # importable however the suite is invoked
@@ -46,7 +47,8 @@ REMOTE_AGENTS = os.path.join(REPO, "bin", "remote-agents")
 UNIT_SRC = os.path.join(REPO, "systemd", th.UNIT)
 
 BIN_FILES = ("remote-agents", "herdr-notify", "tendril_link.py",
-             "tendril_host.py", "herdr-bindings.py", "tendril_upgrade.py")
+             "tendril_host.py", "herdr-bindings.py", "tendril_upgrade.py",
+             "tendril_phone.py")
 PHONE_FILES = ("tendril", "termux-url-opener", "agent")
 
 CUSTOM_NOTIFY = (b"NTFY_URL=https://ntfy.example\n"
@@ -525,10 +527,16 @@ class FullUpgradeLaunchd(UpgradeEnv):
         self.assertEqual(counts.get("bootout"), 1)
         self.assertEqual(counts.get("bootstrap"), 1)
         self.assertIn("  watcher     restarted", out)
-        # android client refresh recommended, with exact Termux commands
-        self.assertIn("android client update available", out)
-        self.assertIn("scp 'tendril-test:", out)
-        self.assertIn("chmod 700", out)
+        # android client refresh recommended: the phone pulls everything
+        # itself now — one command, never scp; the second notice line is
+        # the transition hint for phones still running the old launcher
+        # (alias resolved from CUSTOM_CONFIG: SSH_ALIAS=tendril-test)
+        self.assertIn("  phone       run  tendril --upgrade  in Termux", out)
+        self.assertIn(
+            "              first time on an older phone:  "
+            "ssh tendril-test remote-agents --phone-script upgrade "
+            "> $PREFIX/tmp/tu.sh && sh $PREFIX/tmp/tu.sh", out)
+        self.assertNotIn("scp", out)
         # config + notify.env byte-identical, PATH block exactly once
         conf = os.path.join(self.home, ".config", "remote-agents")
         self.assertEqual(read_file(os.path.join(conf, "notify.env"), "rb"),
@@ -586,6 +594,64 @@ class FullUpgradeLaunchd(UpgradeEnv):
         self.assertEqual(self.install_json()["commit"], new_head)
         self.assert_block(p.stdout, host="updated", watcher="restarted")
 
+    def test_newly_staged_link_apk_triggers_the_phone_line(self):
+        # an APK staged after the last install: the summary recommends the
+        # phone refresh even when no phone asset changed, and provenance
+        # records the staged APK under "link_apk"
+        data = os.path.join(self.tmp, "data")
+        link = os.path.join(data, "tendril", "link")
+        os.makedirs(link)
+        apk = b"staged-link-apk"
+        with open(os.path.join(link, "tendril-link.apk"), "wb") as f:
+            f.write(apk)
+        with open(os.path.join(link, "tendril-link.json"), "w") as f:
+            json.dump({"schema": 1, "package": "app.tendril.link",
+                       "versionCode": 7, "versionName": "0.2.0",
+                       "build": "abc1234",
+                       "sha256": sha(os.path.join(link,
+                                                  "tendril-link.apk")),
+                       "size": len(apk), "signer_sha256": "d" * 64}, f)
+        advance_upstream(self.tmp, self.bare,
+                         {"bin/remote-agents": "# not-a-phone-file\n"})
+        p = self.run_module(XDG_DATA_HOME=data)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        out = p.stdout
+        self.assertIn("run  tendril --upgrade  in Termux", out)
+        self.assertNotIn("scp", out)
+        self.assert_block(out, host="updated", watcher="restarted",
+                          android="client refresh recommended")
+        doc = self.install_json()
+        self.assertEqual(doc["link_apk"]["sha256"],
+                         sha(os.path.join(link, "tendril-link.apk")))
+        self.assertEqual(doc["link_apk"]["versionCode"], 7)
+
+    def test_unchanged_link_apk_stays_quiet(self):
+        # the staged APK was already recorded: no phone line when the phone
+        # assets did not change either
+        first = self.run_installer_directly()      # unit + PATH block in place
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        data = os.path.join(self.tmp, "data")
+        link = os.path.join(data, "tendril", "link")
+        os.makedirs(link)
+        apk = b"staged-link-apk"
+        sha_hex = hashlib.sha256(apk).hexdigest()
+        with open(os.path.join(link, "tendril-link.apk"), "wb") as f:
+            f.write(apk)
+        with open(os.path.join(link, "tendril-link.json"), "w") as f:
+            json.dump({"schema": 1, "package": "app.tendril.link",
+                       "versionCode": 7, "versionName": "0.2.0",
+                       "build": "abc1234", "sha256": sha_hex,
+                       "size": len(apk), "signer_sha256": "d" * 64}, f)
+        p = sh([sys.executable, MODULE, "record-provenance", "--pkg",
+                os.path.join(self.work, "bin")],
+               env={**self.env(), "XDG_DATA_HOME": data})
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        p = self.run_module(XDG_DATA_HOME=data)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.install_json()["link_apk"]["sha256"], sha_hex)
+        self.assert_block(p.stdout, host="already current")
+        self.assertNotIn("run  tendril --upgrade  in Termux", p.stdout)
+
 
 class FullUpgradeSystemd(UpgradeEnv):
     """Same pipeline with a systemd user manager instead of launchd.
@@ -628,6 +694,50 @@ class FullUpgradeSystemd(UpgradeEnv):
         return [ln for ln in lines
                 if ln.split()[:1] and ln.split()[0]
                 in ("daemon-reload", "restart", "start", "stop", "enable")]
+
+
+class AndroidNotice(unittest.TestCase):
+    """The two-line android block, pinned: print_summary row style, the
+    configured host dials the same target setup writes to the phone, and
+    an unusable alias never reaches a paste-able command."""
+
+    FIRST = "  phone       run  tendril --upgrade  in Termux"
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="tendril notice ")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = os.path.join(self.tmp, "home")
+        os.makedirs(os.path.join(self.home, ".config", "remote-agents"))
+
+    def notice(self, config):
+        with open(os.path.join(self.home, ".config", "remote-agents",
+                               "config"), "w") as f:
+            f.write(config)
+        with mock.patch.dict(os.environ, {"HOME": self.home}):
+            return tu.android_notice()
+
+    def test_ssh_target_used_and_both_lines_exact(self):
+        lines = self.notice(
+            "SSH_TARGET=omarchy.tail1234.ts.net\n").splitlines()
+        self.assertEqual(lines, [
+            self.FIRST,
+            "              first time on an older phone:  "
+            "ssh omarchy.tail1234.ts.net remote-agents --phone-script "
+            "upgrade > $PREFIX/tmp/tu.sh && sh $PREFIX/tmp/tu.sh"])
+
+    def test_ssh_alias_is_the_fallback_and_target_wins(self):
+        second = self.notice("SSH_ALIAS=tendril-test\n").splitlines()[1]
+        self.assertIn("ssh tendril-test remote-agents", second)
+        both = self.notice("SSH_TARGET=real.host\n"
+                           "SSH_ALIAS=tendril-test\n")
+        self.assertIn("ssh real.host remote-agents", both)
+
+    def test_unsafe_or_missing_alias_stays_a_template(self):
+        for config in ("", "SSH_TARGET=bad host\n",
+                       "SSH_TARGET='x;rm -rf'\n", "SSH_TARGET=-evil\n"):
+            with self.subTest(config=config):
+                self.assertIn("ssh <alias> remote-agents",
+                              self.notice(config))
 
 
 class UpgradeRefusals(UpgradeEnv):

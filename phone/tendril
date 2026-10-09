@@ -24,6 +24,8 @@
 #   tendril [<alias>] resolve|focus|link <id>
 #                                print JSON / focus headless / print the deep
 #                                link, over plain SSH (no TTY, no Mosh)
+#   tendril --upgrade     refresh the launchers + TENDRIL Link from the host
+#   tendril --version     print the launcher build id (tendril-phone <sha12>)
 #
 # <id> is anything `remote-agents attach`/`enter` resolves on the host: the canonical
 # workspace id (w15), a pane id (w15:p1), the workspace number or an exact
@@ -33,6 +35,64 @@
 CONF_ALIAS=""
 [ -r "$HOME/.config/tendril/alias" ] && IFS= read -r CONF_ALIAS < "$HOME/.config/tendril/alias"
 DEFAULT_ALIAS="${TENDRIL_ALIAS:-${AGENT_ALIAS:-$CONF_ALIAS}}"
+
+# no_alias_help - the shared fail-fast guidance when no SSH alias resolves.
+no_alias_help() {
+    echo "[tendril] no host alias: TENDRIL_ALIAS is empty and ~/.config/tendril/alias is missing."
+    HOSTS=$(awk 'tolower($1)=="host" { for (i = 2; i <= NF; i++) if ($i !~ /[*?!]/) printf "%s ", $i }' \
+        "$HOME/.ssh/config" 2>/dev/null)
+    [ -n "$HOSTS" ] && echo "  hosts in ~/.ssh/config: $HOSTS"
+    echo "  connect once:   tendril <alias>"
+    echo "  set a default:  echo <alias> > ~/.config/tendril/alias"
+    echo "                  (or: echo 'export TENDRIL_ALIAS=<alias>' >> ~/.bashrc)"
+    echo "usage: tendril [<alias>] [attach|enter|resolve|focus|link <session-id>] | tendril ssh <alias>"
+    echo "first time: see docs/ANDROID.md or docs/MACOS.md — create a key, then: ssh-copy-id <alias>"
+}
+
+# --version / --upgrade are flags, never aliases: they are handled before
+# $1 becomes an alias, so `tendril --upgrade` can never dial a host whose
+# alias is literally "--upgrade".
+case "${1:-}" in
+    --version)
+        if command -v sha256sum >/dev/null 2>&1; then
+            printf 'tendril-phone %s\n' \
+                "$(sha256sum "$0" 2>/dev/null | cut -d ' ' -f1 | cut -c1-12)"
+        elif command -v shasum >/dev/null 2>&1; then
+            printf 'tendril-phone %s\n' \
+                "$(shasum -a 256 "$0" 2>/dev/null | cut -d ' ' -f1 | cut -c1-12)"
+        else
+            echo "tendril-phone unknown"
+        fi
+        exit 0 ;;
+    --upgrade)
+        ALIAS="${TENDRIL_ALIAS:-${AGENT_ALIAS:-$CONF_ALIAS}}"
+        if [ -z "$ALIAS" ]; then
+            no_alias_help
+            exit 1
+        fi
+        case $ALIAS in
+            -*) echo "[tendril] '$ALIAS' is not an SSH alias (leading '-')"; exit 2 ;;
+        esac
+        _td="$PREFIX/tmp"
+        [ -d "$_td" ] || _td="${TMPDIR:-/tmp}"
+        UP_TMP=$(mktemp "$_td/tendril-upgrade.XXXXXX" 2>/dev/null) || UP_TMP=""
+        if [ -z "$UP_TMP" ]; then
+            echo "[tendril] no writable temp dir ($_td) - upgrade aborted."
+            exit 1
+        fi
+        trap 'rm -f "$UP_TMP"' EXIT HUP INT TERM
+        # download fully, THEN run: never pipe a partial stream into sh
+        if ssh -o BatchMode=yes "$ALIAS" "remote-agents --phone-script upgrade" > "$UP_TMP" \
+           && [ -s "$UP_TMP" ]; then
+            sh "$UP_TMP"
+            rc=$?
+        else
+            echo "[tendril] could not fetch the upgrade script from '$ALIAS' - nothing was changed."
+            rc=1
+        fi
+        exit $rc ;;
+esac
+
 ALIAS="${1:-$DEFAULT_ALIAS}"
 MODE=""
 ATTACH_ID=""
@@ -73,15 +133,7 @@ case "$ALIAS" in
     -*) echo "[tendril] '$ALIAS' is not an SSH alias (leading '-')"; exit 2 ;;
 esac
 if [ -z "$ALIAS" ]; then
-    echo "[tendril] no host alias: TENDRIL_ALIAS is empty and ~/.config/tendril/alias is missing."
-    HOSTS=$(awk 'tolower($1)=="host" { for (i = 2; i <= NF; i++) if ($i !~ /[*?!]/) printf "%s ", $i }' \
-        "$HOME/.ssh/config" 2>/dev/null)
-    [ -n "$HOSTS" ] && echo "  hosts in ~/.ssh/config: $HOSTS"
-    echo "  connect once:   tendril <alias>"
-    echo "  set a default:  echo <alias> > ~/.config/tendril/alias"
-    echo "                  (or: echo 'export TENDRIL_ALIAS=<alias>' >> ~/.bashrc)"
-    echo "usage: tendril [<alias>] [attach|enter|resolve|focus|link <session-id>] | tendril ssh <alias>"
-    echo "first time: see docs/ANDROID.md or docs/MACOS.md — create a key, then: ssh-copy-id <alias>"
+    no_alias_help
     exit 1
 fi
 
