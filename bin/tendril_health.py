@@ -75,6 +75,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import tempfile
 import time
@@ -165,10 +166,22 @@ def _atomic_write(path, body, mode=0o600):
 def _locked(lock_path):
     d = os.path.dirname(lock_path)
     os.makedirs(d, exist_ok=True)
+    # Same symlink refusal as tendril_schedule._locked: a symlinked state
+    # dir or lock must not aim the 0700 tightening and the lock write at
+    # an attacker-chosen target. O_NOFOLLOW backstops the lstat→open race
+    # (swap → ELOOP); O_NONBLOCK is cleared right after so LOCK_EX keeps
+    # its normal blocking semantics.
+    if stat.S_ISLNK(os.lstat(d).st_mode):
+        raise OSError("refusing symlinked health state dir: %s" % d)
+    if os.path.lexists(lock_path) \
+            and stat.S_ISLNK(os.lstat(lock_path).st_mode):
+        raise OSError("refusing symlinked health lock: %s" % lock_path)
     with contextlib.suppress(OSError):
         os.chmod(d, 0o700)
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+                 | os.O_NONBLOCK, 0o600)
     try:
+        os.set_blocking(fd, True)
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             yield
@@ -545,6 +558,12 @@ def herdr_verb(verb, host=None, herdr=None, run=None, home=None,
             if alive:
                 return {"ok": False, "error": E_RUNNING}
         with _locked(p["lock"]):
+            # a concurrent `herdr stop` can land between the up-front
+            # check and this lock — re-check under the same flock the
+            # stop writes under, so an intentional stop is never
+            # resurrected (§6.1 guard semantics)
+            if os.path.isfile(p["guard"]):
+                return {"ok": False, "error": E_GUARD}
             try:
                 with open(p["stamp"]) as f:
                     last = float(f.read().strip() or 0)
@@ -556,6 +575,8 @@ def herdr_verb(verb, host=None, herdr=None, run=None, home=None,
                         "error": E_SLOW % int(RATE_LIMIT_S
                                               - (now - last))}
             _atomic_write(p["stamp"], b"%d" % int(now))
+        if os.path.isfile(p["guard"]):     # stop landed while we verified
+            return {"ok": False, "error": E_GUARD}
         ok, phrase = starter()
         if not ok:
             return {"ok": False, "error": phrase or E_NOUP}
@@ -584,8 +605,10 @@ def herdr_verb(verb, host=None, herdr=None, run=None, home=None,
     if verb == "stop":
         # the guard is written BEFORE the stop: a crash in between must
         # still record the user's intent (§6.1 "writes the stop guard,
-        # then stops Herdr")
-        _atomic_write(p["guard"], b"intentional stop\n")
+        # then stops Herdr"). Under the restart flock, so a concurrent
+        # restart's guarded re-check sees it before starting anything.
+        with _locked(p["lock"]):
+            _atomic_write(p["guard"], b"intentional stop\n")
         if stopper():
             return {"ok": True, "herdr": {"state": "stopped"}}
         return {"ok": False, "error": E_STOP}

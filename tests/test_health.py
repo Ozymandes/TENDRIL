@@ -449,6 +449,28 @@ class TickTests(Base):
         self.assertEqual(before["last_healthy_at"], after["last_healthy_at"])
         self.assertEqual(calls, [])
 
+    def test_symlinked_lock_and_state_dir_are_refused(self):
+        # U13b: same hardening as tendril_schedule._locked — a planted
+        # symlink must never aim the lock write / 0700 tightening at an
+        # attacker-chosen target.
+        victim = os.path.join(self.home, "victim")
+        open(victim, "w").write("do not touch\n")
+        os.makedirs(os.path.dirname(self.p["lock"]), exist_ok=True)
+        os.symlink(victim, self.p["lock"])
+        with self.assertRaises(OSError):
+            self.tick(["down"])
+        self.assertEqual(open(victim).read(), "do not touch\n")
+
+        # a symlinked state dir is refused outright
+        real_dir = os.path.join(self.home, "elsewhere")
+        os.makedirs(real_dir)
+        state_dir = os.path.dirname(self.p["lock"])
+        os.unlink(self.p["lock"])
+        os.rmdir(state_dir)
+        os.symlink(real_dir, state_dir)
+        with self.assertRaises(OSError):
+            self.tick(["down"])
+
     def test_malformed_state_file_recovered(self):
         notify, calls = rec_notifier()
         os.makedirs(os.path.dirname(self.p["state"]), exist_ok=True)
@@ -486,7 +508,8 @@ class RestartTests(Base):
         self.clock = FakeClock()
         self.api_true = lambda: True
 
-    def verb(self, verb, states, starter=None, stopper=None, api=None):
+    def verb(self, verb, states, starter=None, stopper=None, api=None,
+             probe=None):
         started, stop_calls = [], []
 
         def default_starter():
@@ -505,7 +528,8 @@ class RestartTests(Base):
         return th.herdr_verb(verb, host="omarchy", herdr="/fake/herdr",
                              run=lambda a, t: (0, '{"running":false}', ""),
                              home=self.home,
-                             probe=scripted_probe(states),
+                             probe=probe if probe is not None
+                             else scripted_probe(states),
                              api=api,
                              starter=starter, stopper=stopper,
                              epoch=self.clock.epoch, mono=self.clock.mono,
@@ -550,6 +574,26 @@ class RestartTests(Base):
                                     api=[False, True])
         self.assertEqual(doc["ok"], True)
         self.assertEqual(len(started), 1)
+
+    def test_stop_landing_mid_restart_is_never_resurrected(self):
+        # U13b regression: the guard used to be checked only BEFORE the
+        # rate-limit lock, so `herdr stop` landing between that check and
+        # starter() still resurrected the server. The guard is now
+        # re-checked under the restart flock (stop writes under it) and
+        # once more immediately before starter().
+        probes = {"n": 0}
+
+        def stop_lands_in_window():
+            probes["n"] += 1
+            if probes["n"] == 1:
+                with th._locked(self.p["lock"]):
+                    th._atomic_write(self.p["guard"], b"intentional stop\n")
+            return "down", None
+        doc, started, _ = self.verb("restart", ["down"],
+                                    probe=stop_lands_in_window)
+        self.assertEqual(doc["ok"], False)
+        self.assertEqual(doc["error"], th.E_GUARD)
+        self.assertEqual(started, [])
 
     def test_rate_limit_one_attempt_per_30s(self):
         doc, _, _ = self.verb("restart", ["down"])       # fails verify,
