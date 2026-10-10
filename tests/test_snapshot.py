@@ -1,12 +1,14 @@
 """LIVE MAP snapshot: `remote-agents snapshot` + phone launcher plumbing.
 
-The document is the read-only mirror TENDRIL Link's map renders (schema v2,
+The document is the read-only mirror TENDRIL Link's map renders (schema v3,
 documented in the app's Topology.kt). Contract points under test here:
 - the v1 fields unchanged (never cwd/terminal titles/sessions), plus the
-  v2 `harness` tag and optional per-agent telemetry;
+  v2 `harness` tag, and the v3 top-level `capabilities` marker;
 - status vocabulary collapses to working/blocked/done/idle else "unknown";
 - stdout carries the ONE JSON line or NOTHING (reason on stderr, exit 1);
-- phone/tendril snapshot dials plain BatchMode SSH, never Mosh, no TTY.
+- phone/tendril snapshot dials plain BatchMode SSH, never Mosh, no TTY;
+- the whole wire document stays ≤ 64 KB (contract §0) and the optional
+  capacity/schedule sections follow the hook tuple contract.
 """
 import importlib.util
 import io
@@ -16,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from importlib.machinery import SourceFileLoader
 from unittest import mock
@@ -67,7 +70,7 @@ SNAPSHOT = {"result": {"snapshot": {
 }}}
 
 DOC_KEYS = {"version", "host", "generated_at", "focused_workspace",
-            "focused_pane", "workspaces"}
+            "focused_pane", "workspaces", "capabilities"}
 WS_KEYS = {"id", "label", "number", "focused", "agents"}
 AGENT_KEYS = {"pane_id", "tab_id", "agent", "status", "focused",
               "harness"}
@@ -105,7 +108,13 @@ class SnapshotCommand(unittest.TestCase):
             ctx.append(mock.patch.object(ra.tendril_telemetry, "CACHE_FILE",
                                          os.path.join(tempfile.mkdtemp(
                                              prefix="tendril-snap-cache-"),
-                                             "telemetry-v1.json")))
+                                             "telemetry-v2.json")))
+        # the sibling capacity/schedule hooks are other modules' territory:
+        # pin them ABSENT (None makes `import` raise) so these tests assert
+        # the exact base document regardless of what is installed.
+        ctx.append(mock.patch.dict(sys.modules,
+                                   {"tendril_capacity": None,
+                                    "tendril_schedule": None}))
         for c in ctx:
             c.start()
         try:
@@ -120,11 +129,13 @@ class SnapshotCommand(unittest.TestCase):
         self.assertEqual(len(lines), 1, "exactly ONE line of output")
         return json.loads(lines[0])
 
-    def test_schema_v2_exact_shape(self):
+    def test_schema_v3_exact_shape(self):
         self.assertEqual(self.main(["snapshot"]), 0)
         doc = self.doc()
         self.assertEqual(set(doc), DOC_KEYS)
-        self.assertEqual(doc["version"], 2)
+        self.assertEqual(doc["version"], 3)
+        self.assertIsInstance(doc["capabilities"], list)
+        self.assertIn("subagents", doc["capabilities"])
         self.assertEqual(doc["host"], "testhost")
         self.assertEqual(doc["generated_at"], 1760000000)
         self.assertIsInstance(doc["generated_at"], int)
@@ -189,7 +200,7 @@ class SnapshotCommand(unittest.TestCase):
         # opens the selector, and the herdr snapshot call is what feeds it.
         self.assertEqual(self.main(["snapshot"]), 0)
         self.assertIn(["herdr", "api", "snapshot"], self.run_calls)
-        self.assertEqual(self.doc()["version"], 2)
+        self.assertEqual(self.doc()["version"], 3)
 
 
 class SnapshotLauncher(unittest.TestCase):
@@ -265,6 +276,165 @@ class SnapshotLauncher(unittest.TestCase):
         self.assertEqual(p.returncode, 2)
         self.assertEqual(self.calls(), [])
         self.assertIn("not an SSH alias", p.stdout + p.stderr)
+
+
+class DocCap(unittest.TestCase):
+    """Contract §0: the whole wire document stays ≤ 64 KB, and shrinking it
+    never touches the v1 agent/workspace fields."""
+
+    V1 = ("pane_id", "tab_id", "agent", "status", "focused", "harness")
+
+    def build(self, n):
+        ws = {"id": "w1", "label": "lab", "number": 1, "focused": True,
+              "agents": []}
+        for i in range(n):
+            ws["agents"].append({
+                "pane_id": "w1:p%d" % i, "tab_id": "w1:t%d" % i,
+                "agent": "pi", "status": "working", "focused": i == 0,
+                "harness": "pi",
+                "model": "m" * 40, "provider": "p" * 40, "effort": "high",
+                "started_at": 1, "context_tokens": 1, "output_tokens": 1,
+                "cost_usd": 0.0, "tool": "bash", "tool_started_at": 2,
+                "activity": "a" * 3000, "trail": "PRTPRTPRTPRT",
+                "phase": "thinking",
+                "last_event": {"kind": "reply", "at": 3},
+                "events": [{"kind": "reply", "at": t} for t in range(12)],
+                "children": [{"id": "%08x" % j, "kind": "subagent",
+                              "harness": "pi", "status": "done",
+                              "name": "worker"} for j in range(8)],
+            })
+        return {"version": 3, "host": "h", "generated_at": 1,
+                "focused_workspace": "w1", "focused_pane": "w1:p0",
+                "workspaces": [ws], "capabilities": ["subagents"]}
+
+    def test_oversized_document_is_capped_and_keeps_v1_fields(self):
+        doc = self.build(40)
+        self.assertGreater(ra._doc_bytes(doc), ra._SNAPSHOT_MAX_BYTES)
+        ra._enforce_doc_cap(doc)
+        self.assertLessEqual(ra._doc_bytes(doc), ra._SNAPSHOT_MAX_BYTES)
+        for key in ("version", "host", "generated_at", "focused_workspace",
+                    "focused_pane", "workspaces", "capabilities"):
+            self.assertIn(key, doc)
+        for ws in doc["workspaces"]:
+            self.assertTrue(WS_KEYS <= set(ws))
+            for a in ws["agents"]:
+                for k in self.V1:
+                    self.assertIn(k, a)
+
+    def test_document_under_the_cap_is_untouched(self):
+        doc = self.build(2)
+        before = json.dumps(doc, sort_keys=True)
+        ra._enforce_doc_cap(doc)
+        self.assertEqual(json.dumps(doc, sort_keys=True), before)
+
+
+def _fake_module(name, fn):
+    m = types.ModuleType(name)
+    m.snapshot_section = fn
+    return m
+
+
+class OptionalSections(unittest.TestCase):
+    """Contract §1 hook signature: tendril_capacity.snapshot_section(
+    budget_s) and tendril_schedule.snapshot_section() return
+    (section_dict | None, capability_string). Absence, failure or an empty
+    section omits BOTH the section and the capability."""
+
+    def call(self, cap="absent", sched="absent"):
+        # NOTE: sibling modules may be importable depending on ambient
+        # sys.path (other test files insert REPO/bin), so every case pins
+        # BOTH module slots explicitly: None makes `import` raise.
+        mods = {}
+        for key, val in (("tendril_capacity", cap), ("tendril_schedule",
+                                                     sched)):
+            if val == "absent" or val is None:
+                mods[key] = None            # `import` raises ImportError
+            else:
+                mods[key] = _fake_module(key, val)
+        with mock.patch.dict(sys.modules, mods):
+            return ra._optional_sections()
+
+    def test_absent_hooks_omit_sections_and_capabilities(self):
+        self.assertEqual(self.call(), ({}, []))
+        self.assertEqual(self.call(sched=None), ({}, []))
+        self.assertEqual(self.call(cap=None), ({}, []))
+
+    def test_tuple_contract_registers_section_and_capability(self):
+        sec = {"generated_at": 1, "providers": []}
+        extra, caps = self.call(cap=lambda budget_s=1.0: (sec, "capacity"))
+        self.assertEqual(extra, {"capacity": sec})
+        self.assertEqual(caps, ["capacity"])
+
+    def test_none_section_registers_nothing(self):
+        self.assertEqual(self.call(cap=lambda budget_s=1.0: (None,
+                                                             "capacity")),
+                         ({}, []))
+
+    def test_empty_section_registers_no_capability(self):
+        self.assertEqual(self.call(cap=lambda budget_s=1.0: ({}, "capacity")),
+                         ({}, []))
+
+    def test_bare_dict_section_is_tolerated(self):
+        sec = {"generated_at": 2, "providers": [{"id": "claude"}]}
+        extra, caps = self.call(cap=lambda budget_s=1.0: sec)
+        self.assertEqual(extra, {"capacity": sec})
+        self.assertEqual(caps, ["capacity"])
+
+    def test_hook_exception_is_swallown_and_does_not_block_the_sibling(self):
+        def boom(budget_s=1.0):
+            raise RuntimeError("boom")
+        sec = {"available": True, "tasks": []}
+        extra, caps = self.call(cap=boom,
+                                sched=lambda: (sec, "schedule"))
+        self.assertEqual(extra, {"schedule": sec})
+        self.assertEqual(caps, ["schedule"])
+
+    def test_snapshot_doc_embeds_hook_sections_and_capabilities(self):
+        cap = ({"generated_at": 7, "providers": [{"id": "claude"}]},
+               "capacity")
+        sched = ({"available": True, "tasks": []}, "schedule")
+
+        def fake_run(args, timeout=6):
+            if args[1:] == ["api", "snapshot"]:
+                return 0, json.dumps(SNAPSHOT), ""
+            return 0, "status: running\n", ""
+
+        with mock.patch.dict(sys.modules, {
+                "tendril_capacity": _fake_module("tendril_capacity",
+                                                 lambda budget_s=1.0: cap),
+                "tendril_schedule": _fake_module("tendril_schedule",
+                                                 lambda: sched)}), \
+             mock.patch.object(ra, "HERDR", "herdr"), \
+             mock.patch.object(ra, "HOST_LABEL", "testhost"), \
+             mock.patch.object(ra, "run", fake_run):
+            doc, code = ra._snapshot_doc()
+        self.assertEqual(code, 0)
+        self.assertEqual(doc["capacity"]["generated_at"], 7)
+        self.assertEqual(doc["schedule"], {"available": True, "tasks": []})
+        self.assertEqual(doc["capabilities"],
+                         ["subagents", "capacity", "schedule"])
+        self.assertLessEqual(ra._doc_bytes(doc), ra._SNAPSHOT_MAX_BYTES)
+
+    def test_hook_failure_omits_the_section_from_the_doc(self):
+        def boom(budget_s=1.0):
+            raise RuntimeError("boom")
+
+        def fake_run(args, timeout=6):
+            if args[1:] == ["api", "snapshot"]:
+                return 0, json.dumps(SNAPSHOT), ""
+            return 0, "status: running\n", ""
+
+        with mock.patch.dict(sys.modules, {
+                "tendril_capacity": _fake_module("tendril_capacity", boom),
+                "tendril_schedule": None}), \
+             mock.patch.object(ra, "HERDR", "herdr"), \
+             mock.patch.object(ra, "HOST_LABEL", "testhost"), \
+             mock.patch.object(ra, "run", fake_run):
+            doc, code = ra._snapshot_doc()
+        self.assertEqual(code, 0)
+        self.assertNotIn("capacity", doc)
+        self.assertNotIn("schedule", doc)
+        self.assertEqual(doc["capabilities"], ["subagents"])
 
 
 if __name__ == "__main__":

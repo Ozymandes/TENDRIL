@@ -1,0 +1,1 @@
+{"timestamp":"@TNOW@","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":4000,"cached_input_tokens":3900,"output_tokens":200,"total_tokens":4200}},"rate_limits":{"primary":{"used_percent":55.0,"resets_at":"@RESET_ISO@","window_minutes":300},"secondary":null,"plan_type":"pro"}}}

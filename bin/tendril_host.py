@@ -31,6 +31,8 @@ import time
 
 LABEL = "com.tendril.herdr-notify"
 UNIT = "herdr-notify.service"
+SCHEDULE_UNIT = "tendril-schedule.service"
+SCHEDULE_TIMER = "tendril-schedule.timer"
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 # Where macOS package managers put binaries. Neither is on the PATH that
 # sshd hands a non-interactive session (`/usr/bin:/bin:/usr/sbin:/sbin`).
@@ -550,6 +552,76 @@ class Systemd(_Backend):
         return "journalctl --user -u herdr-notify -f"
 
 
+def refresh_schedule(pkg_dir, run=_run, dry_run=False, out=None,
+                     home_dir=None, which=shutil.which):
+    """Install/refresh the scheduler units (tendril-schedule.service and
+    tendril-schedule.timer, LINK-CONTRACT-0.2 §3) beside the watcher unit,
+    mirroring the watcher refresh: write each unit only when its content
+    differs, daemon-reload only when something was written, and
+    `enable --now` the timer only then (or when it is not active). A
+    launchd host or a machine without a user systemd is the documented
+    no-op (macOS ticks by hand; docs/MACOS.md). Never raises; 0 ok."""
+    out = out or sys.stdout
+    if which("launchctl"):
+        # launchd host (backend()'s precedence): macOS runs the tick by hand
+        print("  scheduler: launchd host - no systemd timer (docs/MACOS.md);"
+              " run `remote-agents schedule tick` by hand", file=out)
+        return 0
+    if not which("systemctl"):
+        print("  scheduler: no systemctl - enable tendril-schedule.timer by hand",
+              file=out)
+        return 0
+    unit_dir = os.path.join(home_dir or home(), ".config", "systemd", "user")
+    changed = []
+    for name in (SCHEDULE_UNIT, SCHEDULE_TIMER):
+        src = os.path.join(pkg_dir, "systemd", name)
+        dst = os.path.join(unit_dir, name)
+        try:
+            with open(src, "rb") as f:
+                body = f.read()
+        except OSError as exc:
+            print("  scheduler: cannot read %s: %s" % (src, exc), file=out)
+            return 1
+        try:
+            with open(dst, "rb") as f:
+                current = f.read()
+        except OSError:
+            current = None
+        if current == body:
+            print("  scheduler: %s unchanged" % name, file=out)
+            continue
+        changed.append(name)
+        if dry_run:
+            print("  [dry-run] scheduler: install %s" % dst, file=out)
+            continue
+        os.makedirs(unit_dir, exist_ok=True)
+        _atomic_write(dst, body, 0o600)
+        print("  scheduler: installed %s" % name, file=out)
+    if dry_run:
+        print("  [dry-run] scheduler: daemon-reload + enable --now %s"
+              % SCHEDULE_TIMER, file=out)
+        return 0
+    if changed:
+        run(["systemctl", "--user", "daemon-reload"], 8)
+        rc, _, _ = run(["systemctl", "--user", "enable", "--now",
+                        SCHEDULE_TIMER], 8)
+        print("  scheduler: timer %s" % ("enabled" if rc == 0
+                                          else "enable FAILED"), file=out)
+        return 0 if rc == 0 else 1
+    dst = os.path.join(unit_dir, SCHEDULE_TIMER)
+    if not os.path.isfile(dst):
+        print("  scheduler: timer not installed - skipped", file=out)
+        return 0
+    _, state, _ = run(["systemctl", "--user", "is-active", SCHEDULE_TIMER], 5)
+    if state.strip() == "active":
+        print("  scheduler: timer active", file=out)
+        return 0
+    rc, _, _ = run(["systemctl", "--user", "enable", "--now", SCHEDULE_TIMER], 8)
+    print("  scheduler: timer was inactive - %s"
+          % ("enabled" if rc == 0 else "enable FAILED"), file=out)
+    return 0 if rc == 0 else 1
+
+
 def backend(run=_run, which=shutil.which, env=None, dry_run=False, out=None):
     """launchd where launchctl exists; a *live* systemd user manager next;
     otherwise None (the watcher can still be run by hand)."""
@@ -725,6 +797,11 @@ def main(argv=None):
         return 0
     if words[:1] == ["ssh-server"]:
         return 0 if ssh_server_listening() else 1
+    if words[:1] == ["schedule-unit"] and len(words) == 2 \
+            and words[1] in ("install", "refresh"):
+        pkg = _opt(argv, "--pkg", os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        return refresh_schedule(pkg, dry_run=dry)
     if words[:1] == ["service"] and len(words) == 2:
         verb = words[1]
         b = backend(dry_run=dry)

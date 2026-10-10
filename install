@@ -324,7 +324,7 @@ upgrade_install() {
        && cmp -s "$BIN_DIR/herdr-notify" "$PKG_DIR/bin/herdr-notify"; then
         BIN_CHANGED=0
     fi
-    for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py tendril_upgrade.py tendril_phone.py tendril_telemetry.py; do
+    for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py tendril_upgrade.py tendril_phone.py tendril_telemetry.py tendril_schedule.py; do
         [ -f "$BIN_DIR/$f" ] && backup "$BIN_DIR/$f"
         act "install $BIN_DIR/$f" install -m 755 "$PKG_DIR/bin/$f" "$BIN_DIR/$f"
     done
@@ -357,6 +357,13 @@ upgrade_install() {
         python3 "$HOST_HELPER" service refresh --pkg "$PKG_DIR" --python "$PYTHON" --bin-changed
     else
         python3 "$HOST_HELPER" service refresh --pkg "$PKG_DIR" --python "$PYTHON"
+    fi
+    # scheduler timer units: content-diffed install, enable --now only on
+    # change; a launchd host is the documented no-op (tendril_host.py)
+    if [ "$DRY_RUN" = "1" ]; then
+        python3 "$HOST_HELPER" schedule-unit refresh --pkg "$PKG_DIR" --dry-run
+    else
+        python3 "$HOST_HELPER" schedule-unit refresh --pkg "$PKG_DIR"
     fi
     say ""
 
@@ -575,7 +582,7 @@ else
     printf '%s\n' "$CONF_BODY" > "$CONFIG"
     chmod 600 "$CONFIG"
 fi
-for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py tendril_upgrade.py tendril_phone.py tendril_telemetry.py; do
+for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py tendril_upgrade.py tendril_phone.py tendril_telemetry.py tendril_schedule.py; do
     [ -f "$BIN_DIR/$f" ] && backup "$BIN_DIR/$f"
     act "install $BIN_DIR/$f" install -m 755 "$PKG_DIR/bin/$f" "$BIN_DIR/$f"
 done
@@ -713,6 +720,13 @@ else
     else
         say "  skipped - enable later by re-running ./install (step 5)"
     fi
+fi
+# scheduler timer units: content-diffed install, enable --now only on
+# change; a launchd host is the documented no-op (tendril_host.py)
+if [ "$DRY_RUN" = "1" ]; then
+    python3 "$HOST_HELPER" schedule-unit refresh --pkg "$PKG_DIR" --dry-run
+else
+    python3 "$HOST_HELPER" schedule-unit refresh --pkg "$PKG_DIR"
 fi
 say ""
 

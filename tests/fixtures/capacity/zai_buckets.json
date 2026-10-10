@@ -1,0 +1,1 @@
+{"success":true,"data":{"limits":[{"type":"TIME_LIMIT","utilization":0.91,"resets_at":@RESET@,"windowMinutes":300},{"type":"WEEK_LIMIT","utilization":55,"resets_at":@RESET2@,"windowMinutes":10080},{"type":"DAILY_LIMIT","used":30,"remaining":70,"resets_at":@RESET@},{"type":"UNKNOWN_BUCKET","utilization":0.9}]}}

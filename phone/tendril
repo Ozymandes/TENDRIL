@@ -27,6 +27,15 @@
 #   tendril snapshot              the LIVE MAP snapshot: ONE line of JSON
 #   tendril <alias> snapshot      (remote-agents snapshot) over plain SSH —
 #                                 no TTY, no Mosh; read by the TENDRIL Link app
+#   tendril [<alias>] schedule show|cancel <id>
+#   tendril [<alias>] schedule add <payload>
+#                                 the host scheduler over plain SSH (no TTY,
+#                                 no Mosh): id is t-YYYYMMDD-8hex, payload is
+#                                 1..16384 base64url chars (A-Z a-z 0-9 _ -)
+#   tendril [<alias>] capacity   host capacity report (JSON) over plain SSH
+#   tendril link                 open the TENDRIL Link app on THIS device
+#                                (Termux: am start; LOCAL ONLY — no ssh, no
+#                                alias, no args, never a URI from input)
 #   tendril --upgrade     refresh the launchers + TENDRIL Link from the host
 #   tendril --version     print the launcher build id (tendril-phone <sha12>)
 #
@@ -34,6 +43,42 @@
 # workspace id (w15), a pane id (w15:p1), the workspace number or an exact
 # label. Only A-Z a-z 0-9 . _ : - are accepted (max 128 chars), so the id can
 # be embedded single-quoted in the mosh/ssh remote command injection-proof.
+# The fixed verbs (snapshot, schedule, capacity) validate their arguments
+# against their own contract regexes before anything is quoted or dialed.
+
+# The selector's L key ends the remote session with this status: the phone
+# launcher launched ssh and turns it into a local
+# `am start -n app.tendril.link/.MainActivity`. 75 = EX_TEMPFAIL; ssh
+# propagates it, mosh does not — over mosh the host selector prints its
+# own one-line hint instead (LINK-CONTRACT-0.2 §4).
+LINK_OPEN_STATUS=75
+
+# open_link_app - launch TENDRIL Link on THIS device. Fixed component from
+# the contract; no input ever reaches the intent (LINK-CONTRACT-0.2 §4).
+open_link_app() {
+    _am=""
+    if command -v am >/dev/null 2>&1; then
+        _am="am"
+    elif command -v termux-am >/dev/null 2>&1; then
+        _am="termux-am"
+    fi
+    if [ -z "$_am" ]; then
+        echo "[tendril] 'am' not found - open TENDRIL Link from the home screen (or: pkg install termux-tools)."
+        return 1
+    fi
+    "$_am" start -n app.tendril.link/.MainActivity
+}
+
+# finish_interactive <rc> - end an interactive session: the selector's Link
+# key (LINK_OPEN_STATUS) opens the app here on the phone; every other
+# status passes through untouched.
+finish_interactive() {
+    if [ "$1" -eq "$LINK_OPEN_STATUS" ]; then
+        open_link_app
+        exit 0
+    fi
+    exit "$1"
+}
 
 CONF_ALIAS=""
 [ -r "$HOME/.config/tendril/alias" ] && IFS= read -r CONF_ALIAS < "$HOME/.config/tendril/alias"
@@ -49,6 +94,7 @@ no_alias_help() {
     echo "  set a default:  echo <alias> > ~/.config/tendril/alias"
     echo "                  (or: echo 'export TENDRIL_ALIAS=<alias>' >> ~/.bashrc)"
     echo "usage: tendril [<alias>] [attach|enter|resolve|focus|link <session-id>|snapshot] | tendril ssh <alias>"
+    echo "       tendril [<alias>] [schedule show|cancel <id> | schedule add <payload> | capacity] | tendril link"
     echo "first time: see docs/ANDROID.md or docs/MACOS.md — create a key, then: ssh-copy-id <alias>"
 }
 
@@ -67,6 +113,22 @@ case "${1:-}" in
             echo "tendril-phone unknown"
         fi
         exit 0 ;;
+    link)
+        # LINK-CONTRACT-0.2 §4: NO args = LOCAL ONLY - fixed component,
+        # never a URI built from input, no ssh, no alias. `tendril link
+        # <id>` keeps its existing host meaning (the plain-ssh deep-link
+        # verb) and is parsed as a normal verb below. Strict: two or more
+        # arguments are refused, never reinterpreted as anything else.
+        if [ "$#" -eq 1 ]; then
+            open_link_app
+            exit $?
+        fi
+        if [ "$#" -gt 2 ]; then
+            echo "usage: tendril link [<session-id>]"
+            echo "  no argument:  open the TENDRIL Link app on THIS device"
+            echo "  <session-id>: print the deep link from the host (A-Z a-z 0-9 . _ : - only, max 128)"
+            exit 2
+        fi ;;
     --upgrade)
         ALIAS="${TENDRIL_ALIAS:-${AGENT_ALIAS:-$CONF_ALIAS}}"
         if [ -z "$ALIAS" ]; then
@@ -109,12 +171,24 @@ else
             MODE="$1"; ALIAS="$DEFAULT_ALIAS"; ATTACH_ID="${2:-}" ;;
         snapshot)
             MODE="snapshot"; ALIAS="$DEFAULT_ALIAS" ;;
+        capacity)
+            [ "$#" -eq 1 ] || { echo "usage: tendril [<alias>] capacity"; exit 2; }
+            MODE="capacity"; ALIAS="$DEFAULT_ALIAS" ;;
+        schedule)
+            { [ "$#" -eq 2 ] || [ "$#" -eq 3 ]; } || { echo "usage: tendril [<alias>] schedule show|add|cancel <arg>"; exit 2; }
+            MODE="schedule"; ALIAS="$DEFAULT_ALIAS"; SCHED_SUB="${2:-}"; SCHED_ARG="${3:-}" ;;
         *)
             case "${2:-}" in
                 attach | resolve | focus | link | enter)
                     MODE="$2"; ALIAS="$1"; ATTACH_ID="${3:-}" ;;
                 snapshot)
                     MODE="snapshot"; ALIAS="$1" ;;
+                capacity)
+                    [ "$#" -eq 2 ] || { echo "usage: tendril [<alias>] capacity"; exit 2; }
+                    MODE="capacity"; ALIAS="$1" ;;
+                schedule)
+                    { [ "$#" -eq 3 ] || [ "$#" -eq 4 ]; } || { echo "usage: tendril [<alias>] schedule show|add|cancel <arg>"; exit 2; }
+                    MODE="schedule"; ALIAS="$1"; SCHED_SUB="${3:-}"; SCHED_ARG="${4:-}" ;;
             esac ;;
     esac
 fi
@@ -124,6 +198,36 @@ REMOTE_CMD="$REMOTE_BIN"
 if [ "$MODE" = "snapshot" ]; then
     # snapshot takes NO session id: a fixed one-word remote command.
     REMOTE_CMD="$REMOTE_BIN snapshot"
+elif [ "$MODE" = "capacity" ]; then
+    # capacity is read-only and takes NO arguments: a fixed remote command.
+    REMOTE_CMD="$REMOTE_BIN capacity --json"
+elif [ "$MODE" = "schedule" ]; then
+    # LINK-CONTRACT-0.2 §4: the sub and its argument are validated against
+    # the contract regexes HERE, then single-quoted into the remote command.
+    case "$SCHED_SUB" in
+        show | cancel)
+            case "$SCHED_ARG" in
+                t-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+                *)
+                    echo "usage: tendril [<alias>] schedule $SCHED_SUB <id>   (id: t-YYYYMMDD-8 lowercase hex)"
+                    exit 2 ;;
+            esac
+            REMOTE_CMD="$REMOTE_BIN schedule $SCHED_SUB '$SCHED_ARG'" ;;
+        add)
+            case "$SCHED_ARG" in
+                "" | *[!A-Za-z0-9_-]*)
+                    echo "usage: tendril [<alias>] schedule add <payload>   (1..16384 base64url chars: A-Z a-z 0-9 _ -)"
+                    exit 2 ;;
+            esac
+            if [ "${#SCHED_ARG}" -gt 16384 ]; then
+                echo "usage: tendril [<alias>] schedule add <payload>   (1..16384 base64url chars: A-Z a-z 0-9 _ -)"
+                exit 2
+            fi
+            REMOTE_CMD="$REMOTE_BIN schedule add '$SCHED_ARG'" ;;
+        *)
+            echo "usage: tendril [<alias>] schedule show|add|cancel <arg>"
+            exit 2 ;;
+    esac
 elif [ -n "$MODE" ]; then
     BAD=""
     case "$ATTACH_ID" in
@@ -148,12 +252,14 @@ if [ -z "$ALIAS" ]; then
 fi
 
 # resolve/focus/link print a result and exit: one plain SSH round trip.
-# snapshot is the same shape, but strictly non-interactive: BatchMode (never
-# a password prompt mid-probe), a short connect timeout, no TTY, no Mosh —
-# the Link app's probe must end in a result, not a hanging session.
+# snapshot/schedule/capacity are the same shape, but strictly non-interactive:
+# BatchMode (never a password prompt mid-probe), a short connect timeout,
+# no TTY, no Mosh — the Link app's probe must end in a result, not a
+# hanging session.
 case "$MODE" in
     resolve | focus | link) exec ssh "$ALIAS" "$REMOTE_CMD" ;;
-    snapshot) exec ssh -o BatchMode=yes -o ConnectTimeout=6 "$ALIAS" "$REMOTE_CMD" ;;
+    snapshot | schedule | capacity)
+        exec ssh -o BatchMode=yes -o ConnectTimeout=6 "$ALIAS" "$REMOTE_CMD" ;;
 esac
 
 if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$ALIAS" true 2>/dev/null; then
@@ -162,11 +268,21 @@ if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$ALIAS" true 2>/dev/null; then
     echo "  - first time? run: ssh $ALIAS   (accept host key, password once)"
     echo "  - then: ssh-copy-id $ALIAS"
     echo "[tendril] attempting interactive SSH anyway..."
+    # degraded path (no key auth yet): exec straight into ssh so its rc
+    # propagates; the selector's L key just ends the session here (the
+    # host selector's one-line hint still tells the user what L does).
     exec ssh -t "$ALIAS" "$REMOTE_CMD"
 fi
 
 if [ -z "$FORCE_SSH" ] && command -v mosh >/dev/null 2>&1; then
+    # mosh-client does NOT propagate the remote exit status (verified on
+    # mosh 1.4.0: `mosh <host> -- sh -c 'exit 42'` still exits 0), so the
+    # selector's L key (LINK_OPEN_STATUS) cannot reach finish_interactive
+    # over mosh — the host selector prints its own one-line hint in-band
+    # instead. A non-zero status HERE is mosh's own failure (client or
+    # connection refused), which falls back to ssh below.
     mosh "$ALIAS" -- sh -lc "exec $REMOTE_CMD" && exit 0
     echo "[tendril] mosh failed - falling back to ssh"
 fi
-exec ssh -t "$ALIAS" "$REMOTE_CMD"
+ssh -t "$ALIAS" "$REMOTE_CMD"
+finish_interactive $?

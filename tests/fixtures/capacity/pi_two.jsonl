@@ -1,0 +1,4 @@
+{"type":"message","message":{"role":"assistant","provider":"zai","model":"glm-4.7","timestamp":@MS1@,"usage":{"input":200,"output":60,"cacheRead":40000,"cacheWrite":30,"reasoning":10,"totalTokens":40300,"cost":{"total":0.10,"currency":"USD"}}}}
+{"type":"message","message":{"role":"assistant","provider":"zai","model":"glm-4.7","timestamp":@MS0@,"usage":{"input":100,"output":50,"cacheRead":50000,"cacheWrite":20,"reasoning":10,"totalTokens":50180,"cost":{"total":0.25,"currency":"USD"}}}}
+{"type":"message","message":{"role":"assistant","provider":"google","model":"gemini-3-flash","timestamp":@MS0@,"usage":{"input":500,"output":100,"cacheRead":0,"cacheWrite":0,"reasoning":0,"totalTokens":600}}}
+{"type":"message","message":{"role":"user","content":"decoy user text — must never leave the transcript"}}

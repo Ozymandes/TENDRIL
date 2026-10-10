@@ -1,0 +1,1 @@
+{"five_hour":{"utilization":0.91,"resets_at":"@RESET_ISO@"},"seven_day":{"utilization":0.42,"resets_at":"@RESET2_ISO@","window_minutes":10080},"extra_unknown_key":{"nested":[1,2,3]}}

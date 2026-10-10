@@ -13,15 +13,28 @@ Privacy contract (enforced structurally, not by filtering output):
   surface, and only inside `activity`;
 - only regular files are read; pi paths must realpath under $HOME and end in
   .jsonl; Claude ids must match ^[0-9a-f-]{36}$ before globbing;
-- nothing here prints or logs transcript content, ever.
+- nothing here prints or logs transcript content, ever;
+- subagent meta files are whitelist-projected (runId, agent, exitCode, model
+  and usage numbers only): their `task`/`acceptance` prompt text is never
+  copied into the cache or onto the wire;
+- a bash command is classified on the host into at most one phase word
+  ("testing"); the command string itself is never stored or emitted.
+
+Children (contract 0.2): pi sessions whose first-line header names this file
+as `parentSession`, pi-subagents run dirs/forks under the parent's stem
+directory and Claude Code `<sessionId>/subagents/agent-*.jsonl` sidechains
+are scanned with the same per-line parsers into per-child accumulators
+stored inside the parent's cache entry. Header verdicts (path -> parent or
+not) are cached so each child header line is read once.
 
 NEVER fabricate: a field that cannot be derived reliably is omitted (the key
 is absent). Sessions of other harnesses (codex, ...) get no telemetry.
 
 Performance: transcripts can be hundreds of MB with base64 image lines. Reads
-are incremental — a small cache (~/.cache/tendril/telemetry-v1.json keyed by
+are incremental — a small cache (~/.cache/tendril/telemetry-v2.json keyed by
 realpath) stores accumulators and a byte offset, so each call only reads bytes
-appended since last time. Lines are pre-filtered with byte-substring markers
+appended since last time (children too). Lines are pre-filtered with
+byte-substring markers
 BEFORE any json.loads; over-long lines are mined with bounded head/tail regex
 windows instead of being parsed. A wall-clock budget covers all agents per
 call; agents past it get no telemetry this round (their cache advances next
@@ -33,6 +46,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import stat
 import time
 from datetime import datetime, timezone
@@ -40,8 +54,16 @@ from datetime import datetime, timezone
 # ---------- tunables (module-level so tests can patch) ----------
 HOME = os.path.realpath(os.path.expanduser("~"))
 CACHE_DIR = os.path.expanduser("~/.cache/tendril")
-CACHE_FILE = os.path.join(CACHE_DIR, "telemetry-v1.json")
+CACHE_FILE = os.path.join(CACHE_DIR, "telemetry-v2.json")
 BUDGET_S = 1.5              # wall-clock budget for ALL agents per call
+CHILD_BUDGET_FRAC = 0.25    # children may use at most this share of it
+CHILD_QUIET_S = 20          # quiet this long + terminal stop (or meta 0) = done
+CHILD_ACTIVE_S = 120        # changed within this window = working/tool/thinking
+CHILD_CAP = 8               # children per agent on the wire, newest first
+CHILD_SCAN_CAP = 200        # candidate child files inspected per parent
+HEADER_BYTES = 4096         # pi child header: first line, bounded read
+META_MAX_BYTES = 16 * 1024  # subagent meta files are tiny; refuse bigger
+SCAN_MASK = 0x7FF           # parent deadline check every N lines
 CATCHUP_GRACE_S = 8.5       # extra allowance for one cold full backfill
 OPEN_TOOL_TTL_S = 30 * 60   # an open tool older than this is stale
 HUGE_LINE = 256 * 1024      # above this: regex windows instead of json.loads
@@ -172,7 +194,28 @@ def _fresh_entry(size, mtime):
             "cost_sum": None,            # pi: sum of usage.cost.total
             "cost_last": None,           # claude: latest cost-state.totalCostUSD
             "last_event": None, "trail": "", "last_seen_at": None,
-            "open_calls": {}}
+            "open_calls": {},
+            # v3 additions (content-free, see _event/_open_call)
+            "events": [],                # wire events, <= TRAIL_MAX, newest last
+            "stop_reason": None,         # last assistant stopReason (children)
+            "last_prompt_at": None, "last_assistant_at": None,
+            "last_error_ts": None}
+
+
+def _fresh_child(size, mtime):
+    """Child accumulator: same parser state plus child-only facts. No nested
+    children: grandchildren are out of scope (and off the wire)."""
+    e = _fresh_entry(size, mtime)
+    e.update({"name": None, "async": False, "meta": None,
+              "session_id": None, "run_id": None})
+    return e
+
+
+def _fresh_parent(size, mtime):
+    e = _fresh_entry(size, mtime)
+    e.update({"children": {},            # child path -> child accumulator
+              "child_headers": {}})      # child path -> header verdict (once)
+    return e
 
 
 def _touch(entry, ts):
@@ -185,9 +228,27 @@ def _touch(entry, ts):
         entry["last_seen_at"] = ts
 
 
+def _wire_event(entry, kind, tool, ts):
+    """Append one v3 wire event ({kind, tool?, at}); cap newest-last. Only
+    kinds, tool NAMES and epoch times ever enter this list."""
+    at = ts if ts is not None else entry.get("last_seen_at")
+    if at is None:
+        return
+    ev = {"kind": kind}
+    if tool:
+        ev["tool"] = tool
+    ev["at"] = int(at)
+    events = entry.get("events")
+    if not isinstance(events, list):
+        events = entry["events"] = []
+    events.append(ev)
+    if len(events) > TRAIL_MAX:
+        del events[:-TRAIL_MAX]
+
+
 def _event(entry, kind, tool, error, ts):
-    """last_event + one trail char (P prompt, R reply, T tool ok, E error).
-    Never any content — only kind, tool NAME and time."""
+    """last_event + one trail char (P prompt, R reply, T tool ok, E error)
+    + one v3 wire event. Never any content — only kind, tool NAME and time."""
     ev = {"kind": kind}
     if tool:
         ev["tool"] = tool
@@ -203,6 +264,18 @@ def _event(entry, kind, tool, error, ts):
          {"prompt": "P", "reply": "R", "tool_result": "T"}.get(kind)
     if ch:
         entry["trail"] = (entry["trail"] + ch)[-TRAIL_MAX:]
+    at_ts = ts if ts is not None else entry.get("last_seen_at")
+    if kind == "prompt":
+        entry["last_prompt_at"] = at_ts
+    elif kind == "reply":
+        entry["last_assistant_at"] = at_ts
+    elif kind == "tool_result" and error:
+        entry["last_error_ts"] = at_ts
+    wire = {"prompt": "prompt", "reply": "reply"}.get(kind)
+    if wire is None and kind == "tool_result":
+        wire = "error" if error else "tool"
+    if wire:
+        _wire_event(entry, wire, tool if isinstance(tool, str) else None, at_ts)
 
 
 def _sanitize_base(name):
@@ -224,14 +297,55 @@ def _arg_base(args):
     return None
 
 
+# ---------- host-only bash phase classification (contract 0.2 §1) ----------
+_TEST_ARGV0 = {"pytest", "gradle", "gradlew", "unittest", "run_suite.py"}
+_TEST_RUNNERS = {"npm", "pnpm", "yarn", "cargo", "go", "make"}
+
+
+def _bash_phase_word(tool, args):
+    """`testing` when an open bash call's argv[0] basename is a known test
+    runner (npm/pnpm/yarn/cargo/go/make additionally need a `test` argument).
+    HOST-ONLY: the command string is read here and immediately discarded —
+    only the returned word may ever be stored in the cache or emitted."""
+    if tool not in ("bash", "Bash") or not isinstance(args, dict):
+        return None
+    cmd = args.get("command")
+    if not isinstance(cmd, str) or not cmd or len(cmd) > 4096:
+        return None
+    head = cmd[:512]
+    try:
+        toks = shlex.split(head, posix=True)[:6]
+    except ValueError:
+        toks = head.split()[:6]
+    if not toks:
+        return None
+    argv0 = os.path.basename(toks[0].strip())
+    if argv0 in _TEST_ARGV0:
+        return "testing"
+    if argv0 in _TEST_RUNNERS and any(
+            os.path.basename(t) == "test" for t in toks[1:4]):
+        return "testing"
+    return None
+
+
+def _is_delegate(name):
+    return isinstance(name, str) and (
+        name in _DELEGATE_TOOLS or name.startswith("subagent"))
+
+
 def _open_call(entry, cid, name, ts, args):
     if not isinstance(cid, str) or not cid:
         return
+    nm = name if isinstance(name, str) else ""
     oc = entry["open_calls"]
     if len(oc) >= MAX_OPEN_CALLS and cid not in oc:
         oc.pop(next(iter(oc)))               # drop the oldest unmatched
-    oc[cid] = [name if isinstance(name, str) else "",
-               ts, _arg_base(args)]
+    # slot 3 holds ONLY the derived phase word — never the command text.
+    oc[cid] = [nm, ts, _arg_base(args), _bash_phase_word(nm, args)]
+    if _is_delegate(nm):
+        _wire_event(entry, "subagent", nm, ts)
+    elif nm:
+        _wire_event(entry, "tool", nm, ts)
 
 
 def _close_call(entry, cid):
@@ -280,6 +394,8 @@ def _pi_obj(d, entry):
             entry["provider"] = m["provider"]
         if isinstance(m.get("thinkingLevel"), str):
             entry["effort"] = m["thinkingLevel"]
+        if isinstance(m.get("stopReason"), str):
+            entry["stop_reason"] = m["stopReason"]
         u = m.get("usage")
         if isinstance(u, dict):
             c = u.get("cost")
@@ -379,6 +495,9 @@ def _cl_obj(d, entry):
             entry["model"] = m["model"]
         if isinstance(d.get("effort"), str):     # recorded by the harness
             entry["effort"] = d["effort"]
+        sr = m.get("stop_reason")
+        if isinstance(sr, str):
+            entry["stop_reason"] = sr
         u = m.get("usage")
         if isinstance(u, dict):
             _cl_usage(entry, _num(u.get("output_tokens")),
@@ -461,11 +580,13 @@ def _cl_line(raw, entry):
 _HANDLERS = {"pi": _pi_line, "claude": _cl_line}
 
 
-def _scan(path, entry, harness, deadline, hard_deadline):
+def _scan(path, entry, harness, deadline, hard_deadline, mask=SCAN_MASK):
     """Read only bytes past entry["offset"]; update accumulators in place.
-    Truncation/rotation (file shrank) resets the entry. A partial final line
+    Truncation/rotation (file shrank) resets the entry — child header
+    verdicts survive (paths do not change meaning). A partial final line
     is left for the next call. Progress is persisted even when the time
-    budget ends mid-file, so a huge backfill advances across calls."""
+    budget ends mid-file, so a huge backfill advances across calls. The
+    deadline check runs every `mask+1` lines (children use a tighter mask)."""
     try:
         st = os.stat(path)
     except OSError:
@@ -474,8 +595,11 @@ def _scan(path, entry, harness, deadline, hard_deadline):
         return
     size, mtime = st.st_size, st.st_mtime
     if size < entry.get("size", 0) or entry["offset"] > size:
+        keep = {k: entry[k] for k in ("child_headers",)
+                if isinstance(entry.get(k), dict)}
         entry.clear()                        # truncated or replaced: reset
         entry.update(_fresh_entry(size, mtime))
+        entry.update(keep)
     offset = entry["offset"]
     if offset == size:
         entry["size"], entry["mtime"] = size, mtime
@@ -503,7 +627,7 @@ def _scan(path, entry, harness, deadline, hard_deadline):
                     if ts:
                         _touch(entry, _iso_to_epoch(
                             ts.decode("utf-8", "replace")))
-                if (seen & 0x7FF) == 0 and _mono() > limit:
+                if (seen & mask) == 0 and _mono() > limit:
                     break                    # budget out; offset keeps progress
     except OSError:
         return
@@ -551,6 +675,21 @@ def _activity(status, tool_name, tool_base):
     return None                              # unknown status: omit, don't guess
 
 
+def _wire_phase(status, tool_name, bash_phase):
+    """Contract 0.2 §1 phase: one word, host-classified, never a command."""
+    if tool_name:
+        if bash_phase:
+            return bash_phase
+        if tool_name in _EDIT_TOOLS:
+            return "editing"
+        if tool_name in _READ_TOOLS or tool_name in _SEARCH_TOOLS:
+            return "reviewing"
+        return "tool"
+    if status == "working":
+        return "thinking"
+    return None                              # absent otherwise
+
+
 # ---------- wire emit ----------
 def _emit(harness, entry, status, now):
     out = {"harness": harness}
@@ -570,9 +709,11 @@ def _emit(harness, entry, status, now):
     seen = entry.get("last_seen_at")
     oc = entry.get("open_calls") or {}
     tool_base = None
+    rec_phase = None
     if oc and seen is not None and (now - seen) <= OPEN_TOOL_TTL_S:
         _cid, rec = max(oc.items(), key=lambda kv: kv[1][1] or 0)
-        name, ts, tool_base = rec
+        name, ts, tool_base = rec[0], rec[1], rec[2]
+        rec_phase = rec[3] if len(rec) > 3 else None
         if name:
             out["tool"] = name
             if ts:
@@ -582,11 +723,25 @@ def _emit(harness, entry, status, now):
     phrase = _activity(status, out.get("tool"), tool_base)
     if phrase:
         out["activity"] = phrase
+    ph = _wire_phase(status, out.get("tool"), rec_phase)
+    if ph:
+        out["phase"] = ph
     ev = entry.get("last_event")
     if isinstance(ev, dict) and "at" in ev:
         out["last_event"] = dict(ev)
     if entry.get("trail"):
         out["trail"] = entry["trail"]
+    events = entry.get("events")
+    if isinstance(events, list) and events:
+        out["events"] = [dict(e) for e in events[-TRAIL_MAX:]
+                         if isinstance(e, dict)]
+    kids = entry.get("children")
+    if isinstance(kids, dict) and kids:
+        rows = sorted((ce for ce in kids.values() if isinstance(ce, dict)),
+                      key=_child_last, reverse=True)
+        children = [_child_emit(harness, ce, now) for ce in rows[:CHILD_CAP]]
+        if children:
+            out["children"] = children
     return out
 
 
@@ -615,17 +770,396 @@ def _save_cache(path, cache):
         pass
 
 
+# ---------- subagent children (pi / claude) ----------
+def _sanitize_name(v, cap=24):
+    """Agent TYPE name for the wire: [A-Za-z0-9._-], <= 24 chars."""
+    if not isinstance(v, str) or not v:
+        return None
+    out = re.sub(r"[^A-Za-z0-9._-]", "_", v)[:cap]
+    return out if out.strip("._-") else None
+
+
+def _short_id(*cands):
+    """First 8 hex chars of the first usable uuid / runId candidate."""
+    for c in cands:
+        if isinstance(c, str) and c:
+            s = re.sub(r"[^0-9a-fA-F]", "", c)
+            if s:
+                return s[:8].lower()
+    return None
+
+
+def _pi_header(path):
+    """Whitelist projection of a pi session header (first line, <= 4 KB):
+    id / parentSession / name / timestamp ONLY — never cwd. {} when the file
+    exists but has no parseable session header; None when unreadable."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(HEADER_BYTES)
+    except OSError:
+        return None
+    line = head.split(b"\n", 1)[0][:HEADER_BYTES]
+    try:
+        d = json.loads(line)
+    except Exception:
+        return {}
+    if not isinstance(d, dict) or d.get("type") != "session":
+        return {}
+    out = {}
+    for k in ("id", "parentSession", "name"):
+        v = d.get(k)
+        if isinstance(v, str) and v:
+            out[k] = v
+    ts = _iso_to_epoch(d.get("timestamp"))
+    if ts is not None:
+        out["ts"] = ts
+    return out
+
+
+def _jsonl_candidates(*dirs):
+    """Bounded newest-first [(path, mtime)] of regular *.jsonl files."""
+    out = []
+    for d in dirs:
+        if not d:
+            continue
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            if not n.endswith(".jsonl"):
+                continue
+            p = os.path.join(d, n)
+            mt = _safe_mtime(p)
+            if mt is not None and _is_regular(p):
+                out.append((p, mt))
+    out.sort(key=lambda x: x[1], reverse=True)
+    return out[:CHILD_SCAN_CAP]
+
+
+def _safe_mtime(path):
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return None
+
+
+def _child_ok(path, home):
+    """Same safety gate as parent transcripts: realpath under $HOME, regular
+    file, .jsonl. Symlinks escaping home never reach a parser."""
+    if not isinstance(path, str) or not path.endswith(".jsonl"):
+        return False
+    rp = os.path.realpath(path)
+    return _under_home(rp, home) and _is_regular(rp)
+
+
+def _pi_child_candidates(parent_path, entry, home):
+    """Bounded pi child candidates for one parent: same-dir sessions whose
+    header names this file as parentSession (tintinweb Agent children), plus
+    the pi-subagents layout <stem>/<runId>/run-*/session.jsonl and
+    <stem>/forks/*.jsonl. Candidates are gated through _child_ok BEFORE any
+    byte is read (a symlink escaping $HOME is never opened). Header verdicts
+    are cached per parent entry so each child's first line is read at most
+    once. Same-dir candidates must also be at least as new as parent
+    start - 60s."""
+    d = os.path.dirname(parent_path)
+    stem = os.path.basename(parent_path)[:-len(".jsonl")]
+    stem_dir = os.path.join(d, stem)
+    headers = entry.setdefault("child_headers", {})
+    if len(headers) > 512:                   # bounded verdict memory
+        for k in list(headers)[:len(headers) - 512]:
+            del headers[k]
+    floor = entry.get("started_at")
+    floor = (floor - 60.0) if isinstance(floor, (int, float)) else None
+    out = []                                 # (path, mtime, run_id, async, cid, name, ts)
+    for p, mt in _jsonl_candidates(d):
+        if os.path.realpath(p) == parent_path:
+            continue
+        if floor is not None and mt < floor:
+            continue
+        v = headers.get(p)
+        if not isinstance(v, dict):
+            # gate BEFORE the first (and only) header read; _scan_children
+            # re-verifies every candidate per call, so already-verdicted
+            # paths skip the realpath/stat work entirely on warm calls.
+            if not _child_ok(p, home):
+                headers[p] = {"parent": False}
+                continue
+            h = _pi_header(p) or {}
+            ps = h.get("parentSession")
+            v = {"parent": bool(ps and os.path.realpath(ps) == parent_path),
+                 "id": h.get("id"), "name": h.get("name"), "ts": h.get("ts")}
+            headers[p] = v
+        if v.get("parent"):
+            out.append((p, mt, None, False, v.get("id"), v.get("name"),
+                        v.get("ts")))
+    # pi-subagents run dirs: <stem>/<runId>/run-*/session.jsonl (+ forks/)
+    run_rows = []
+    try:
+        top = sorted(os.listdir(stem_dir))[:64]
+    except OSError:
+        top = []
+    for rid in top:
+        rdir = os.path.join(stem_dir, rid)
+        if rid == "forks" or not os.path.isdir(rdir):
+            continue
+        try:
+            subs = os.listdir(rdir)[:32]
+        except OSError:
+            continue
+        for sub in subs:
+            if not sub.startswith("run-"):
+                continue
+            sp = os.path.join(rdir, sub, "session.jsonl")
+            mt = _safe_mtime(sp)
+            if mt is not None and _is_regular(sp) and _child_ok(sp, home):
+                run_rows.append((sp, mt, rid))
+    run_rows.sort(key=lambda x: x[1], reverse=True)
+    for sp, mt, rid in run_rows[:CHILD_SCAN_CAP]:
+        out.append((sp, mt, rid, True, None, None, None))
+    for fp, mt in _jsonl_candidates(os.path.join(stem_dir, "forks")):
+        if _child_ok(fp, home):
+            out.append((fp, mt, None, True, None, None, None))
+    return out
+
+
+def _cl_child_candidates(parent_path, home):
+    """Claude Code sidechains: <munged>/<sessionId>/subagents/agent-*.jsonl.
+    The directory's existence is the parentage proof; no header read. Files
+    not matching the agent-*.jsonl shape, or escaping $HOME (symlink), are
+    skipped before any byte is read."""
+    d = os.path.dirname(parent_path)
+    stem = os.path.basename(parent_path)[:-len(".jsonl")]
+    sub = os.path.join(d, stem, "subagents")
+    out = []
+    for p, mt in _jsonl_candidates(sub):
+        m = re.search(r"agent-([0-9a-fA-F][0-9a-zA-Z_-]{0,64})\.jsonl$",
+                      os.path.basename(p))
+        if m is None or not _child_ok(p, home):
+            continue
+        out.append((p, mt, None, False, m.group(1), None, None))
+    return out
+
+
+_META_KEYS = ("runId", "agent", "exitCode", "model")
+_META_USAGE_KEYS = ("input", "output", "cacheRead", "cacheWrite",
+                    "cost", "turns")
+
+
+def _meta_project(d):
+    """Whitelist projection of a subagent meta file. `task`/`acceptance`
+    (prompt text!) are structurally unreachable: only the keys below are
+    ever copied, so they can never reach the cache or the wire."""
+    if not isinstance(d, dict):
+        return None
+    out = {}
+    for k in _META_KEYS:
+        v = d.get(k)
+        if k == "exitCode":
+            if type(v) is int:
+                out[k] = v
+        elif isinstance(v, str) and v:
+            out[k] = v
+    u = d.get("usage")
+    if isinstance(u, dict):
+        uu = {}
+        for k in _META_USAGE_KEYS:
+            v = u.get(k)
+            if type(v) in (int, float):
+                uu[k] = v
+        if uu:
+            out["usage"] = uu
+    return out or None
+
+
+def _child_meta(child_path, run_id):
+    """Whitelisted meta projection for a pi-subagents run child, read from
+    <stem>/<runId>/subagent-artifacts/<runId>_*_meta.json. A meta file is
+    never guessed across children: the run id must prefix the file name.
+    (projection, mtime) — projection None when nothing usable was found."""
+    if not run_id:
+        return None, None
+    run_dir = os.path.dirname(os.path.dirname(child_path))
+    art = os.path.join(run_dir, "subagent-artifacts")
+    try:
+        names = sorted(os.listdir(art))[:16]
+    except OSError:
+        return None, None
+    prefix = run_id + "_"
+    for n in names:
+        if n.startswith(prefix) and n.endswith("_meta.json"):
+            path = os.path.join(art, n)
+            try:
+                with open(path, "rb") as f:
+                    raw = f.read(META_MAX_BYTES + 1)
+            except OSError:
+                continue
+            if len(raw) > META_MAX_BYTES:
+                continue                     # oversized: not a meta file
+            try:
+                proj = _meta_project(json.loads(raw))
+            except Exception:
+                proj = None
+            if proj is not None:
+                return proj, _safe_mtime(path)
+    return None, None
+
+
+def _terminal_stop(sr):
+    return isinstance(sr, str) and bool(sr) and sr not in (
+        "toolUse", "tool_use", "tool")
+
+
+def _child_last(ce):
+    vals = [v for v in (ce.get("last_seen_at"), ce.get("mtime"))
+            if isinstance(v, (int, float))]
+    return max(vals) if vals else None
+
+
+def _child_status(ce, now):
+    """done | failed | working | tool | thinking | unknown per contract 0.2.
+    Meta exitCode wins; then timing rules; nothing is ever guessed."""
+    code = (ce.get("meta") or {}).get("exitCode")
+    if isinstance(code, int):
+        return "done" if code == 0 else "failed"
+    last = _child_last(ce)
+    if last is None:
+        return "unknown"
+    quiet = now - last
+    if ce.get("last_error_ts") is not None and quiet >= CHILD_QUIET_S:
+        return "failed"
+    if _terminal_stop(ce.get("stop_reason")) and quiet >= CHILD_QUIET_S:
+        return "done"
+    if quiet <= CHILD_ACTIVE_S:
+        if ce.get("open_calls"):
+            return "tool"
+        ap = ce.get("last_assistant_at")
+        rp = ce.get("last_prompt_at")
+        if isinstance(rp, (int, float)) and (not isinstance(ap, (int, float))
+                                             or rp >= ap):
+            return "working"
+        return "thinking"
+    return "unknown"
+
+
+def _child_emit(harness, ce, now):
+    """One wire child dict; unknown facts are omitted, never fabricated."""
+    status = _child_status(ce, now)
+    out = {"kind": "subagent", "harness": harness, "status": status}
+    sid = _short_id(ce.get("run_id"), ce.get("session_id"))
+    if sid:
+        out["id"] = sid
+    name = _sanitize_name(ce.get("name")
+                          or (ce.get("meta") or {}).get("agent"))
+    if name:
+        out["name"] = name
+    for k in ("model", "effort"):
+        v = ce.get(k)
+        if isinstance(v, str) and v:
+            out[k] = v
+    if ce.get("started_at"):
+        out["started_at"] = int(ce["started_at"])
+    meta = ce.get("meta")
+    mu = meta.get("usage") if isinstance(meta, dict) and \
+        isinstance(meta.get("usage"), dict) else {}
+    ctx = ce.get("context_tokens")
+    if not ctx and mu:
+        total = (mu.get("input") or 0) + (mu.get("cacheRead") or 0) \
+                + (mu.get("cacheWrite") or 0)
+        ctx = int(total) if total else None
+    if ctx:
+        out["context_tokens"] = int(ctx)
+    outp = ce.get("output_tokens")
+    if not outp and mu.get("output") is not None:
+        outp = mu["output"]
+    if outp:
+        out["output_tokens"] = int(outp)
+    cost = ce.get("cost_sum") if harness == "pi" else None
+    if cost is None and isinstance(mu.get("cost"), (int, float)):
+        cost = mu["cost"]
+    if cost is not None:
+        out["cost_usd"] = round(float(cost), 4)
+    seen = _child_last(ce)
+    oc = ce.get("open_calls") or {}
+    tool_base = None
+    if oc and seen is not None and (now - seen) <= OPEN_TOOL_TTL_S:
+        _cid, rec = max(oc.items(), key=lambda kv: kv[1][1] or 0)
+        nm = rec[0]
+        tool_base = rec[2] if len(rec) > 2 else None
+        if nm:
+            out["tool"] = nm
+            if rec[1]:
+                out["tool_started_at"] = int(rec[1])
+        else:
+            tool_base = None
+    phrase = _activity(status, out.get("tool"), tool_base)
+    if phrase:
+        out["activity"] = phrase
+    if status in ("done", "failed", "cancelled") and ce.get("last_seen_at"):
+        out["ended_at"] = int(ce["last_seen_at"])
+    if ce.get("async"):
+        out["async"] = True
+    return out
+
+
+def _scan_children(harness, parent_path, entry, home, deadline, cands):
+    """Scan candidate children incrementally into the parent's cache entry.
+    At most CHILD_CAP newest-by-mtime children are kept; a child past the
+    deadline is skipped whole (its offset persists — it resumes next call)."""
+    kids = entry.setdefault("children", {})
+    rows = []
+    for p, mt, run_id, is_async, cid, cname, cts in cands:
+        if not _child_ok(p, home):
+            continue
+        rp = os.path.realpath(p)
+        if rp == parent_path:
+            continue
+        rows.append((rp, mt, run_id, is_async, cid, cname, cts))
+    rows.sort(key=lambda r: r[1], reverse=True)
+    rows = rows[:CHILD_CAP]
+    keep = set()
+    for rp, mt, run_id, is_async, cid, cname, cts in rows:
+        keep.add(rp)
+        ce = kids.get(rp)
+        if not isinstance(ce, dict) or not isinstance(ce.get("open_calls"),
+                                                      dict):
+            ce = kids[rp] = _fresh_child(0, mt)
+        if is_async:
+            ce["async"] = True
+        if run_id and not ce.get("run_id"):
+            ce["run_id"] = run_id
+        if cid and not ce.get("session_id"):
+            ce["session_id"] = cid
+        if cname and not ce.get("name"):
+            ce["name"] = cname
+        if cts and ce.get("started_at") is None:
+            ce["started_at"] = cts
+        if _mono() <= deadline:
+            _scan(rp, ce, harness, deadline, deadline, mask=0xFF)
+        meta = ce.get("meta")
+        if not isinstance(meta, dict) or meta.get("exitCode") is None:
+            proj, _mt = _child_meta(rp, run_id)
+            if proj is not None:
+                ce["meta"] = proj
+    # bound the per-parent child map to the children we kept
+    for stale in [p for p in kids if p not in keep]:
+        del kids[stale]
+
+
 # ---------- entry point ----------
 def for_agents(agents, budget=BUDGET_S, cache_path=None, home=None, now=None):
     """Telemetry wire dicts aligned with `agents` (raw herdr agent dicts);
-    None where nothing could be derived. Never raises."""
+    None where nothing could be derived. Never raises. Children (subagents)
+    get at most CHILD_BUDGET_FRAC of the budget and resume across calls."""
     if not agents:
         return []
     home = home or HOME
     cache_path = cache_path or CACHE_FILE
     now = _time() if now is None else now
-    deadline = _mono() + budget
+    start = _mono()
+    deadline = start + budget
     hard = deadline + CATCHUP_GRACE_S
+    kids_deadline = start + budget * CHILD_BUDGET_FRAC
     cache = _load_cache(cache_path) if os.path.exists(cache_path) else {}
     out, by_path, touched, keep = [], {}, False, set()
     for a in agents:
@@ -649,8 +1183,22 @@ def for_agents(agents, budget=BUDGET_S, cache_path=None, home=None, now=None):
                                 or not isinstance(entry.get("offset"), int) \
                                 or not isinstance(entry.get("open_calls"), dict) \
                                 or not isinstance(entry.get("trail"), str):
-                            entry = _fresh_entry(st.st_size, st.st_mtime)
+                            entry = _fresh_parent(st.st_size, st.st_mtime)
+                        entry.setdefault("children", {})
+                        entry.setdefault("child_headers", {})
                         _scan(path, entry, harness, deadline, hard)
+                        if harness in ("pi", "claude"):
+                            try:
+                                if harness == "pi":
+                                    cands = _pi_child_candidates(path, entry,
+                                                                 home)
+                                else:
+                                    cands = _cl_child_candidates(path, home)
+                                _scan_children(harness, path, entry, home,
+                                               min(kids_deadline, deadline),
+                                               cands)
+                            except Exception:
+                                pass            # children never fail the parent
                         res = _emit(harness, entry,
                                     str(a.get("agent_status") or ""), now)
                         by_path[path] = res

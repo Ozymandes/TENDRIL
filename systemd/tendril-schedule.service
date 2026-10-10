@@ -1,0 +1,7 @@
+[Unit]
+Description=TENDRIL scheduler tick (contract §3, user-level oneshot)
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/.local/bin/remote-agents schedule tick

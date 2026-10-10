@@ -1,4 +1,4 @@
-"""Schema v2 telemetry: tendril_telemetry + its wiring into the snapshot.
+"""Schema v3 telemetry: tendril_telemetry + its wiring into the snapshot.
 
 Contract points under test (TENDRIL Link Topology.kt, AgentTelemetry):
 - per-agent facts derived READ-ONLY from pi / claude transcripts; codex and
@@ -12,7 +12,12 @@ Contract points under test (TENDRIL Link Topology.kt, AgentTelemetry):
 - safety gate: pi paths must realpath under $HOME and end .jsonl, claude
   ids must match the uuid shape before globbing;
 - privacy: prompt text, command lines and directories never reach the wire
-  — only tool names and sanitized file basenames inside `activity`.
+  — only tool names and sanitized file basenames inside `activity`;
+- v3 subagent children (pi same-dir/parentSession + pi-subagents run dirs
+  + claude sidechains), with meta files whitelist-projected so prompt text
+  (the `task` decoy) can never reach the cache or the wire;
+- v3 phase classification: an open bash call yields at most the phase word
+  ("testing"), never the command; events are ≤ 12, newest last.
 """
 import importlib.util
 import io
@@ -20,6 +25,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -639,12 +645,13 @@ class Privacy(Base):
 
 
 # ---------- snapshot wiring ----------
-class SnapshotV2Wiring(unittest.TestCase):
-    """End-to-end: `remote-agents snapshot` emits version 2 with telemetry."""
+class SnapshotV3Wiring(unittest.TestCase):
+    """End-to-end: `remote-agents snapshot` emits version 3 with telemetry
+    (v2 keys unchanged, plus phase/events; codex gets none of them)."""
 
     def setUp(self):
         self.home = tempfile.mkdtemp(prefix="tendril-tel-e2e-")
-        self.cache = os.path.join(self.home, ".cache", "telemetry-v1.json")
+        self.cache = os.path.join(self.home, ".cache", "telemetry-v2.json")
         self.addCleanup(shutil.rmtree, self.home, True)
         self.pi_path = os.path.join(self.home, ".pi", "agent", "sessions",
                                     "proj", "e2e.jsonl")
@@ -684,7 +691,7 @@ class SnapshotV2Wiring(unittest.TestCase):
             "focused_tab_id": "w2:t1",
         }}}
 
-    def test_snapshot_embeds_v2_telemetry(self):
+    def test_snapshot_embeds_v3_telemetry(self):
         def fake_run(args, timeout=6):
             if args[1:] == ["api", "snapshot"]:
                 return 0, json.dumps(self.envelope()), ""
@@ -696,7 +703,10 @@ class SnapshotV2Wiring(unittest.TestCase):
                mock.patch.object(ra.sys, "argv",
                                  ["remote-agents", "snapshot"]),
                mock.patch.object(ra.sys, "stdout", self.out),
-               mock.patch.object(ra.sys, "stderr", self.err)]
+               mock.patch.object(ra.sys, "stderr", self.err),
+               # sibling hooks are other workers' modules: pin them absent
+               mock.patch.dict(sys.modules, {"tendril_capacity": None,
+                                             "tendril_schedule": None})]
         if ra.tendril_telemetry is not None:
             ctx += [mock.patch.object(ra.tendril_telemetry, "HOME", self.home),
                     mock.patch.object(ra.tendril_telemetry, "CACHE_FILE",
@@ -711,7 +721,9 @@ class SnapshotV2Wiring(unittest.TestCase):
                 c.stop()
         self.assertEqual(code, 0)
         doc = json.loads(self.out.getvalue().strip())
-        self.assertEqual(doc["version"], 2)
+        self.assertEqual(doc["version"], 3)
+        self.assertIsInstance(doc["capabilities"], list)
+        self.assertIn("subagents", doc["capabilities"])
         agents = doc["workspaces"][0]["agents"]
         self.assertEqual(len(agents), 2)
         pi, codex = agents
@@ -733,11 +745,18 @@ class SnapshotV2Wiring(unittest.TestCase):
         self.assertEqual(pi["last_event"], {"kind": "reply", "at": NOW - 60})
         self.assertEqual(pi["trail"], "PR")
         self.assertEqual(pi["activity"], "Thinking")
+        # v3: phase + events (no child sessions exist in this fixture)
+        self.assertEqual(pi["phase"], "thinking")
+        self.assertEqual(pi["events"],
+                         [{"kind": "prompt", "at": NOW - 120},
+                          {"kind": "reply", "at": NOW - 60}])
+        self.assertNotIn("children", pi)
         # codex: harness only
         self.assertEqual(codex["harness"], "codex")
         for k in ("model", "provider", "effort", "started_at",
                   "context_tokens", "output_tokens", "cost_usd", "tool",
-                  "tool_started_at", "activity", "last_event", "trail"):
+                  "tool_started_at", "activity", "last_event", "trail",
+                  "phase", "events", "children"):
             self.assertNotIn(k, codex)
         # privacy across the whole wire line
         for needle in ("SECRET", "/home/u", "cwd", "terminal_title",
@@ -757,6 +776,8 @@ class SnapshotV2Wiring(unittest.TestCase):
                                  ["remote-agents", "snapshot"]),
                mock.patch.object(ra.sys, "stdout", self.out),
                mock.patch.object(ra.sys, "stderr", self.err),
+               mock.patch.dict(sys.modules, {"tendril_capacity": None,
+                                             "tendril_schedule": None}),
                mock.patch.object(ra.tendril_telemetry, "for_agents",
                                  side_effect=RuntimeError("boom"))]
         for c in ctx:
@@ -768,7 +789,7 @@ class SnapshotV2Wiring(unittest.TestCase):
                 c.stop()
         self.assertEqual(code, 0)
         doc = json.loads(self.out.getvalue().strip())
-        self.assertEqual(doc["version"], 2)
+        self.assertEqual(doc["version"], 3)
         for a in doc["workspaces"][0]["agents"]:
             self.assertNotIn("model", a)
             self.assertEqual(a["harness"], a["agent"])
@@ -787,3 +808,571 @@ class SyntheticModelTest(unittest.TestCase):
         self.assertFalse(tt._real_model("<synthetic>"))
         self.assertFalse(tt._real_model(""))
         self.assertFalse(tt._real_model(None))
+
+
+# ---------- v3 subagent children (shared fixtures) ----------
+def pi_session_header(ts, **kw):
+    d = {"type": "session", "version": 9, "id": "s-child",
+         "timestamp": iso(ts), "cwd": "/home/u/SECRET_CHILD_CWD"}
+    d.update(kw)
+    return d
+
+
+def pi_assistant_stop(ts, usage, stop="end_turn"):
+    d = pi_assistant(ts, usage, [{"type": "text", "text": "x"}])
+    d["message"]["stopReason"] = stop
+    return d
+
+
+class ChildBase(Base):
+    """Fixtures for the three child layouts: same-dir parentSession,
+    pi-subagents <stem>/<runId>/run-N/session.jsonl (+ meta artifacts) and
+    claude <sessionId>/subagents/agent-*.jsonl."""
+
+    RUN_ID = "9f1e0d0c-1111-4222-8333-444455556666"
+
+    def setUp(self):
+        super().setUp()
+        self.proj = os.path.join(self.home, ".pi", "agent", "sessions",
+                                 "proj")
+
+    def parent(self, name, lines):
+        return self.write_jsonl(os.path.join(self.proj, name), lines)
+
+    def run_child(self, parent_path, run_id, lines, mtime=None):
+        d = os.path.join(os.path.dirname(parent_path),
+                         os.path.basename(parent_path)[:-len(".jsonl")],
+                         run_id, "run-0")
+        p = self.write_jsonl(os.path.join(d, "session.jsonl"), lines)
+        # default: an OLD mtime so _child_last's mtime fallback never masks
+        # the transcript's own timestamps in status timing assertions
+        os.utime(p, (mtime if mtime is not None else NOW - 100000,) * 2)
+        return p
+
+    def meta(self, child_path, run_id, obj):
+        d = os.path.join(os.path.dirname(os.path.dirname(child_path)),
+                         "subagent-artifacts")
+        os.makedirs(d, exist_ok=True)
+        p = os.path.join(d, "%s_w_meta.json" % run_id)
+        with open(p, "w") as f:
+            f.write(dumps(obj))
+        return p
+
+    def pi_agent(self, path, status="working"):
+        return {"agent": "pi", "agent_status": status,
+                "agent_session": {"agent": "pi", "kind": "path",
+                                  "source": "herdr:pi", "value": path}}
+
+    def cache_bytes(self):
+        with open(self.cache, "rb") as f:
+            return f.read()
+
+
+class PiSameDirChildren(ChildBase):
+    def test_header_naming_this_file_attaches_the_child(self):
+        parent = self.parent("p1.jsonl", [
+            pi_session_line(NOW - 100),
+            pi_user(NOW - 100, "SECRET-PROMPT go")])
+        self.parent("c1.jsonl", [
+            pi_session_header(NOW - 90,
+                              parentSession=os.path.realpath(parent),
+                              name="worker",
+                              id="feedface-1111-4222-8333-444455556666"),
+            pi_assistant(NOW - 80, pi_usage(10, 2, 0, 0, 0.0),
+                         [{"type": "text", "text": "SECRET-CHILD-REPLY"}]),
+            pi_user(NOW - 10, "SECRET-CHILD-PROMPT"),
+        ])
+        res = self.run_tele([self.pi_agent(parent)])[0]
+        kids = res["children"]
+        self.assertEqual(len(kids), 1)
+        k = kids[0]
+        self.assertEqual(k["kind"], "subagent")
+        self.assertEqual(k["harness"], "pi")
+        self.assertEqual(k["name"], "worker")
+        self.assertEqual(k["id"], "feedface")
+        self.assertEqual(k["status"], "working")
+        self.assertEqual(k["started_at"], NOW - 90)
+        self.assertEqual(k["context_tokens"], 10)
+        self.assertEqual(k["output_tokens"], 2)
+        self.assertNotIn("async", k)             # sync child: key absent
+        text = json.dumps(res)
+        for needle in ("SECRET-CHILD", "SECRET_CHILD_CWD", "/home/u"):
+            self.assertNotIn(needle, text)
+
+    def test_unrelated_sibling_session_is_not_a_child(self):
+        parent = self.parent("p1b.jsonl", [
+            pi_session_line(NOW - 100), pi_user(NOW - 100, "go")])
+        self.parent("c2.jsonl", [
+            pi_session_header(NOW - 50,
+                              parentSession="/home/u/other-session.jsonl")])
+        self.parent("c3.jsonl", [                 # no parentSession at all
+            pi_session_header(NOW - 40)])
+        res = self.run_tele([self.pi_agent(parent)])[0]
+        self.assertNotIn("children", res)
+
+
+class PiRunChildren(ChildBase):
+    def test_run_dir_child_with_meta_artifacts(self):
+        parent = self.parent("p2.jsonl", [
+            pi_session_line(NOW - 200),
+            pi_user(NOW - 200, "SECRET-PROMPT go")])
+        child = self.run_child(parent, self.RUN_ID, [
+            pi_session_header(NOW - 150, id="run-child"),
+            pi_assistant(NOW - 100, pi_usage(1000, 50, 900, 100, 0.05),
+                         [{"type": "text", "text": "SECRET-CHILD-REPLY"}]),
+        ])
+        self.meta(child, self.RUN_ID, {
+            "runId": self.RUN_ID, "agent": "worker", "exitCode": 0,
+            "model": "meta-model", "label": "w19",
+            "task": "SUPER-SECRET-TASK-DECOY",
+            "acceptance": "SUPER-SECRET-ACCEPTANCE-DECOY",
+            "prompt": "ALSO-SECRET-PROMPT-DECOY",
+            "usage": {"input": 1200, "output": 60, "cacheRead": 5,
+                      "cost": 0.02, "turns": 3}})
+        res = self.run_tele([self.pi_agent(parent)])[0]
+        k = res["children"][0]
+        self.assertEqual(k["id"], "9f1e0d0c")
+        self.assertEqual(k["name"], "worker")
+        self.assertEqual(k["status"], "done")
+        self.assertEqual(k["async"], True)
+        self.assertEqual(k["started_at"], NOW - 150)
+        self.assertEqual(k["ended_at"], NOW - 100)
+        # transcript facts win; meta only fills gaps
+        self.assertEqual(k["context_tokens"], 2000)
+        self.assertEqual(k["output_tokens"], 50)
+        self.assertEqual(k["cost_usd"], 0.05)
+        wire = json.dumps(res)
+        cache = self.cache_bytes().decode("utf-8", "replace")
+        for where in (wire, cache):
+            for needle in ("SUPER-SECRET-TASK-DECOY",
+                           "SUPER-SECRET-ACCEPTANCE-DECOY",
+                           "ALSO-SECRET-PROMPT-DECOY", "SECRET-CHILD"):
+                self.assertNotIn(needle, where)
+        self.assertNotIn("meta-model", wire)     # meta model is not emitted
+
+    def test_meta_fills_gaps_when_transcript_has_no_usage(self):
+        parent = self.parent("p2b.jsonl", [
+            pi_session_line(NOW - 200), pi_user(NOW - 200, "go")])
+        child = self.run_child(parent, self.RUN_ID, [
+            pi_session_header(NOW - 150, id="run-child")])
+        self.meta(child, self.RUN_ID, {
+            "runId": self.RUN_ID, "agent": "Explore", "exitCode": 0,
+            "usage": {"input": 500, "cacheRead": 50, "output": 40,
+                      "cost": 0.01}})
+        k = self.run_tele([self.pi_agent(parent)])[0]["children"][0]
+        self.assertEqual(k["name"], "Explore")
+        self.assertEqual(k["context_tokens"], 550)
+        self.assertEqual(k["output_tokens"], 40)
+        self.assertEqual(k["cost_usd"], 0.01)
+
+
+class ClaudeChildren(ChildBase):
+    def test_sidechain_children_under_the_session_dir(self):
+        _d, path = cl_session_dir(self.home, UUID_OK)
+        self.write_jsonl(path, [cl_user_prompt(NOW - 200)])
+        sub = os.path.join(os.path.dirname(path), UUID_OK, "subagents")
+        self.write_jsonl(os.path.join(sub, "agent-cafe1234bb.jsonl"), [
+            cl_user_prompt(NOW - 100),
+            cl_tool_use(NOW - 90, "toolu_c1", "Bash",
+                        {"command": "echo SECRET-CHILD-COMMAND"}),
+        ])
+        self.write_jsonl(os.path.join(sub, "notes.jsonl"),
+                         [cl_user_prompt(NOW - 50)])   # NOT agent-*: skipped
+        res = self.run_tele([self.agent("claude", self.agent_sess())])[0]
+        kids = res["children"]
+        self.assertEqual(len(kids), 1)
+        k = kids[0]
+        self.assertEqual(k["id"], "cafe1234")
+        self.assertEqual(k["harness"], "claude")
+        self.assertEqual(k["status"], "tool")
+        self.assertEqual(k["tool"], "Bash")
+        self.assertNotIn("SECRET", json.dumps(res))
+
+
+class CodexNoChildren(ChildBase):
+    def test_codex_yields_no_telemetry_and_no_children(self):
+        # even with a pi-shaped child tree under the value, codex sessions
+        # are never parsed: no telemetry row, hence no children anywhere.
+        self.run_child(os.path.join(self.proj, "cx.jsonl"), self.RUN_ID, [
+            pi_session_header(NOW - 10)])
+        res = self.run_tele([self.agent("codex", {
+            "agent": "codex", "kind": "id", "source": "herdr:codex",
+            "value": "roll-1"})])[0]
+        self.assertIsNone(res)
+
+
+class ChildStatusMapping(ChildBase):
+    """done | failed | working | tool | thinking | unknown — meta exitCode
+    wins, then timing rules; nothing is ever guessed."""
+
+    SEQ = [0]
+
+    def scenario(self, lines, meta=None):
+        ChildStatusMapping.SEQ[0] += 1
+        n = ChildStatusMapping.SEQ[0]
+        parent = self.parent("ps%d.jsonl" % n, [
+            pi_session_line(NOW - 1000), pi_user(NOW - 1000, "go")])
+        rid = "d000000%d-1111-4222-8333-444455556666" % (n % 10)
+        child = self.run_child(parent, rid, lines)
+        if meta is not None:
+            self.meta(child, rid, meta)
+        res = self.run_tele([self.pi_agent(parent)])[0]
+        self.assertEqual(len(res["children"]), 1)
+        return res["children"][0]
+
+    def test_meta_exit_code_decides_done_and_failed(self):
+        head = lambda: [pi_session_header(NOW - 100, id="x"),
+                        pi_user(NOW - 90, "child prompt")]
+        done = self.scenario(head(), meta={"runId": "x", "exitCode": 0})
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(done["ended_at"], NOW - 90)
+        failed = self.scenario(head(), meta={"runId": "x", "exitCode": 1})
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("ended_at", failed)
+
+    def test_open_tool_is_tool(self):
+        k = self.scenario([
+            pi_session_header(NOW - 100, id="x"),
+            pi_user(NOW - 40, "child prompt"),
+            pi_assistant(NOW - 30, pi_usage(1, 1, 0, 0, 0.0),
+                         [pi_tool_call("t1", "bash", NOW - 30)])])
+        self.assertEqual(k["status"], "tool")
+        self.assertEqual(k["tool"], "bash")
+        self.assertEqual(k["activity"], "Running a command")
+
+    def test_fresh_prompt_is_working_fresh_reply_is_thinking(self):
+        working = self.scenario([
+            pi_session_header(NOW - 100, id="x"),
+            pi_assistant(NOW - 90, pi_usage(1, 1, 0, 0, 0.0),
+                         [{"type": "text", "text": "x"}]),
+            pi_user(NOW - 10, "child prompt")])
+        self.assertEqual(working["status"], "working")
+        thinking = self.scenario([
+            pi_session_header(NOW - 100, id="x"),
+            pi_user(NOW - 90, "child prompt"),
+            pi_assistant(NOW - 10, pi_usage(1, 1, 0, 0, 0.0),
+                         [{"type": "text", "text": "x"}])])
+        self.assertEqual(thinking["status"], "thinking")
+
+    def test_quiet_without_terminal_stop_is_unknown(self):
+        k = self.scenario([
+            pi_session_header(NOW - 1000, id="x"),
+            pi_user(NOW - 1000, "child prompt")])
+        self.assertEqual(k["status"], "unknown")
+        self.assertNotIn("ended_at", k)
+
+    def test_terminal_stop_then_quiet_is_done(self):
+        k = self.scenario([
+            pi_session_header(NOW - 200, id="x"),
+            pi_assistant_stop(NOW - 100, pi_usage(1, 1, 0, 0, 0.0))])
+        self.assertEqual(k["status"], "done")
+        self.assertEqual(k["ended_at"], NOW - 100)
+
+    def test_error_then_quiet_is_failed(self):
+        k = self.scenario([
+            pi_session_header(NOW - 200, id="x"),
+            pi_user(NOW - 150, "child prompt"),
+            pi_assistant(NOW - 120, pi_usage(1, 1, 0, 0, 0.0),
+                         [pi_tool_call("t1", "edit", NOW - 120)]),
+            pi_tool_result(NOW - 100, "t1", "edit", error=True)])
+        self.assertEqual(k["status"], "failed")
+        self.assertEqual(k["ended_at"], NOW - 100)
+
+
+class ChildCap(ChildBase):
+    def test_at_most_eight_children_newest_first(self):
+        parent = self.parent("cap.jsonl", [
+            pi_session_line(NOW - 500), pi_user(NOW - 500, "go")])
+        stem = os.path.join(os.path.dirname(parent),
+                            os.path.basename(parent)[:-len(".jsonl")])
+        for i in range(1, 11):                     # run-1 .. run-10
+            rid = "b00000%02d-1111-4222-8333-444455556666" % i
+            p = self.write_jsonl(os.path.join(stem, rid, "run-0",
+                                              "session.jsonl"),
+                                 [pi_session_header(NOW - 400 + i)])
+            os.utime(p, (NOW - 100 + i, NOW - 100 + i))
+        res = self.run_tele([self.pi_agent(parent)])[0]
+        kids = res["children"]
+        self.assertEqual(len(kids), 8)             # newest 8 of 10
+        self.assertEqual([k["id"] for k in kids],
+                         ["b00000%02d" % i for i in range(10, 2, -1)])
+        self.assertEqual([k["status"] for k in kids], ["thinking"] * 8)
+
+
+class ChildIncremental(ChildBase):
+    def test_partial_final_child_line_waits_for_the_rest(self):
+        parent = self.parent("inc.jsonl", [
+            pi_session_line(NOW - 200), pi_user(NOW - 200, "go")])
+        rest = dumps(pi_assistant(NOW - 50, pi_usage(7, 9, 0, 0, 0.0),
+                                  [{"type": "text", "text": "x"}]))
+        child = self.run_child(parent, self.RUN_ID, [
+            pi_session_header(NOW - 150, id="x"),
+            pi_assistant(NOW - 100, pi_usage(7, 3, 0, 0, 0.0),
+                         [{"type": "text", "text": "x"}])])
+        with open(child, "a") as f:
+            f.write(rest[:20])                     # writer mid-line
+        agent = [self.pi_agent(parent)]
+        k = self.run_tele(agent)[0]["children"][0]
+        self.assertEqual(k["output_tokens"], 3)    # complete lines only
+        ce = self.cache_entry(parent)["children"]
+        (entry,) = ce.values()
+        self.assertEqual(entry["offset"], os.path.getsize(child) - 20)
+        with open(child, "a") as f:
+            f.write(rest[20:] + "\n")
+        k = self.run_tele(agent)[0]["children"][0]
+        self.assertEqual(k["output_tokens"], 3 + 9)
+        (entry,) = self.cache_entry(parent)["children"].values()
+        self.assertEqual(entry["offset"], os.path.getsize(child))
+
+    def test_huge_child_line_is_mined_not_parsed(self):
+        blob = {"type": "text", "text": "SECRET-BASE64 " + "A" * (2 << 20)}
+        parent = self.parent("huge.jsonl", [
+            pi_session_line(NOW - 200), pi_user(NOW - 200, "go")])
+        child = self.run_child(parent, self.RUN_ID, [
+            pi_session_header(NOW - 150, id="x"),
+            pi_user(NOW - 60, "child prompt"),
+            pi_assistant(NOW - 50, pi_usage(1, 1, 0, 0, 0.0),
+                         [pi_tool_call("t1", "read", NOW - 50,
+                                       {"path": "/home/u/SECRET_DIR/p.png"})]),
+            {"type": "message", "id": "r", "parentId": "a",
+             "timestamp": iso(NOW - 40),
+             "message": {"role": "toolResult", "toolCallId": "t1",
+                         "toolName": "read", "isError": True,
+                         "timestamp": NOW * 1000 - 40000,
+                         "content": [blob]}},
+        ])
+        self.assertGreater(os.path.getsize(child), tt.HUGE_LINE)
+        t0 = time.monotonic()
+        k = self.run_tele([self.pi_agent(parent)])[0]["children"][0]
+        self.assertLess(time.monotonic() - t0, 5.0)
+        self.assertEqual(k["status"], "failed")    # error result, no meta
+        wire = json.dumps(k)
+        for needle in ("SECRET-BASE64", "AAAA", "SECRET_DIR"):
+            self.assertNotIn(needle, wire)
+        self.assertNotIn("SECRET-BASE64",
+                         self.cache_bytes().decode("utf-8", "replace"))
+
+    def test_budget_exhaustion_skips_and_resumes_next_call(self):
+        parent = self.parent("budget.jsonl", [
+            pi_session_line(NOW - 3000), pi_user(NOW - 3000, "go")])
+        header = pi_session_header(NOW - 2500, id="x")
+        line = dumps(pi_assistant(NOW - 2000, pi_usage(0, 1, 0, 0, 0.0),
+                                  [{"type": "text", "text": "x"}]))
+        H, L = len(dumps(header)) + 1, len(line) + 1   # + newline byte
+        n = 1200
+        body = "".join(
+            dumps(pi_assistant(NOW - 2000 - i, pi_usage(0, 1, 0, 0, 0.0),
+                               [{"type": "text", "text": "x"}])) + "\n"
+            for i in range(n))
+        child = self.run_child(parent, self.RUN_ID, [header])
+        with open(child, "a") as f:
+            f.write(body)
+        os.utime(child, (NOW - 100000,) * 2)   # the append bumped mtime
+        size = os.path.getsize(child)
+        ticks = iter([0.1 * (i + 1) for i in range(200)])   # 0.1s per call
+
+        def fake_mono():
+            return next(ticks, 9e9)
+
+        agent = [self.pi_agent(parent)]
+        kw = dict(budget=1.5, home=self.home, cache_path=self.cache, now=NOW)
+        with mock.patch.object(tt, "_mono", fake_mono):
+            res1 = tt.for_agents(agent, **kw)[0]
+        (entry,) = self.cache_entry(parent)["children"].values()
+        self.assertGreater(entry["offset"], 0, "child scan started")
+        self.assertLess(entry["offset"], size, "budget stopped it mid-file")
+        offset = entry["offset"]
+        self.assertEqual((offset - H) % L, 0, "no torn line was consumed")
+        k1 = res1["children"][0]
+        self.assertEqual(k1["output_tokens"], (offset - H) // L)
+        # next call: budget restored — the rest is parsed, nothing re-parsed
+        with mock.patch.object(tt, "_mono", lambda: 0.0):
+            res2 = tt.for_agents(agent, **kw)[0]
+        (entry,) = self.cache_entry(parent)["children"].values()
+        self.assertEqual(entry["offset"], size)
+        self.assertEqual(res2["children"][0]["output_tokens"], n)
+        self.assertEqual(res2["children"][0]["status"], "unknown")
+
+
+class ChildSafety(ChildBase):
+    def test_symlink_child_escaping_home_is_never_even_read(self):
+        outside = tempfile.mkdtemp(prefix="tendril-child-out-")
+        self.addCleanup(shutil.rmtree, outside, True)
+        parent = self.parent("p3.jsonl", [
+            pi_session_line(NOW - 100), pi_user(NOW - 100, "go")])
+        victim = os.path.join(outside, "victim.jsonl")
+        with open(victim, "w") as f:
+            f.write(dumps(pi_session_header(
+                NOW - 90, parentSession=os.path.realpath(parent),
+                name="worker")) + "\n")
+        os.symlink(victim, os.path.join(self.proj, "esc.jsonl"))
+        reads = {"n": 0}
+        real_header = tt._pi_header
+
+        def counting(p):
+            reads["n"] += 1
+            return real_header(p)
+
+        with mock.patch.object(tt, "_pi_header", counting):
+            res = self.run_tele([self.pi_agent(parent)])[0]
+        self.assertNotIn("children", res)
+        self.assertEqual(reads["n"], 0, "outside-home child is never opened")
+
+    def test_parent_session_traversal_that_escapes_is_not_a_child(self):
+        parent = self.parent("p4.jsonl", [
+            pi_session_line(NOW - 100), pi_user(NOW - 100, "go")])
+        self.parent("c4.jsonl", [
+            pi_session_header(
+                NOW - 90, parentSession=os.path.join(
+                    self.home, "elsewhere", "..", "elsewhere.jsonl"))])
+        res = self.run_tele([self.pi_agent(parent)])[0]
+        self.assertNotIn("children", res)
+
+    def test_claude_bad_uuid_yields_no_children_and_no_error(self):
+        _d, path = cl_session_dir(self.home, UUID_OK)
+        os.makedirs(os.path.join(os.path.dirname(path), UUID_OK,
+                                 "subagents"), exist_ok=True)
+        self.write_jsonl(os.path.join(os.path.dirname(path), UUID_OK,
+                                      "subagents", "agent-ff01aa.jsonl"),
+                         [cl_user_prompt(NOW - 30)])
+        for bad in ("../etc/passwd", "xyz", "GGGG-GGGG-GGGG", ""):
+            res = self.run_tele([self.agent("claude", {
+                "agent": "claude", "kind": "id", "source": "herdr:claude",
+                "value": bad})])[0]
+            self.assertIsNone(res)
+
+
+# ---------- v3 phase + events ----------
+class PhaseAndEvents(Base):
+    def pi(self, path):
+        return {"agent": "pi", "agent_status": "working",
+                "agent_session": {"agent": "pi", "kind": "path",
+                                  "source": "herdr:pi", "value": path}}
+
+    def cache_bytes(self):
+        with open(self.cache, "rb") as f:
+            return f.read()
+
+    def test_bash_testing_phase_and_the_secret_never_leaks(self):
+        path = self.write_jsonl(os.path.join(
+            self.home, ".pi", "agent", "sessions", "proj", "ph1.jsonl"), [
+            pi_session_line(NOW - 60),
+            pi_user(NOW - 60, "SECRET-PROMPT run the tests"),
+            pi_assistant(NOW - 50, pi_usage(1, 1, 0, 0, 0.0),
+                         [pi_tool_call("t1", "bash", NOW - 50,
+                                       {"command": "pytest -k "
+                                        "SECRET_TOKEN_abc123 tests/"})]),
+        ])
+        res = self.run_tele([self.pi(path)])[0]
+        self.assertEqual(res["tool"], "bash")
+        self.assertEqual(res["phase"], "testing")   # only the word survives
+        self.assertEqual(res["activity"], "Running a command")
+        wire = json.dumps(res)
+        cache = self.cache_bytes().decode("utf-8", "replace")
+        for where in (wire, cache):
+            for needle in ("SECRET_TOKEN_abc123", "pytest", "SECRET-PROMPT"):
+                self.assertNotIn(needle, where)
+
+    def test_plain_bash_command_is_tool_phase(self):
+        path = self.write_jsonl(os.path.join(
+            self.home, ".pi", "agent", "sessions", "proj", "ph2.jsonl"), [
+            pi_session_line(NOW - 60),
+            pi_user(NOW - 60, "go"),
+            pi_assistant(NOW - 50, pi_usage(1, 1, 0, 0, 0.0),
+                         [pi_tool_call("t1", "bash", NOW - 50,
+                                       {"command": "curl "
+                                        "http://x/SECRET_TOKEN_abc123"})]),
+        ])
+        res = self.run_tele([self.pi(path)])[0]
+        self.assertEqual(res["phase"], "tool")
+        self.assertNotIn("SECRET_TOKEN_abc123", json.dumps(res))
+        self.assertNotIn("SECRET_TOKEN_abc123",
+                         self.cache_bytes().decode("utf-8", "replace"))
+
+    def test_phase_table(self):
+        base = os.path.join(self.home, ".pi", "agent", "sessions", "proj")
+        cases = [
+            ("edit", {"path": "/home/u/SECRET_DIR/x.kt"}, "working",
+             "editing"),
+            ("read", {"file_path": "/home/u/SECRET_DIR/x.kt"}, "working",
+             "reviewing"),
+            ("bash", {"command": "ls -la"}, "working", "tool"),
+        ]
+        for i, (tool, args, status, want) in enumerate(cases):
+            path = self.write_jsonl(os.path.join(base, "pt%d.jsonl" % i), [
+                pi_session_line(NOW - 60),
+                pi_user(NOW - 60, "go"),
+                pi_assistant(NOW - 50, pi_usage(1, 1, 0, 0, 0.0),
+                             [pi_tool_call("t1", tool, NOW - 50, args)]),
+            ])
+            res = self.run_tele([self.pi(path)])[0]
+            self.assertEqual(res["phase"], want, tool)
+        # no open tool: thinking while working, absent otherwise
+        path = self.write_jsonl(os.path.join(base, "pt9.jsonl"), [
+            pi_session_line(NOW - 60), pi_user(NOW - 60, "go")])
+        res = self.run_tele([self.pi(path)])[0]
+        self.assertEqual(res["phase"], "thinking")
+        blocked = dict(self.pi(path))
+        blocked["agent_status"] = "blocked"
+        res = self.run_tele([blocked])[0]
+        self.assertNotIn("phase", res)
+
+    def test_bash_phase_word_unit_table(self):
+        f = tt._bash_phase_word
+        bash = lambda cmd: f("bash", {"command": cmd})
+        self.assertEqual(bash("pytest -k x"), "testing")
+        self.assertEqual(bash("/usr/bin/pytest -q"), "testing")
+        self.assertEqual(bash("gradlew check"), "testing")
+        self.assertEqual(bash("unittest discover"), "testing")
+        self.assertEqual(bash("run_suite.py"), "testing")
+        self.assertEqual(bash("npm test"), "testing")
+        self.assertEqual(bash("pnpm test --run"), "testing")
+        self.assertEqual(bash("yarn test"), "testing")
+        self.assertEqual(bash("cargo test --lib"), "testing")
+        self.assertEqual(bash("go test ./..."), "testing")
+        self.assertEqual(bash("make test"), "testing")
+        self.assertEqual(bash("npm run build"), None)
+        self.assertEqual(bash("python3 -m pytest"), None)  # argv0 basename
+        self.assertEqual(bash("ls -la"), None)
+        self.assertEqual(bash("pytest -k 'unbalanced"), "testing")  # shlex
+        self.assertEqual(f("bash", {"command": "x" * 5000}), None)
+        self.assertEqual(f("bash", {"command": ""}), None)
+        self.assertEqual(f("bash", None), None)
+        self.assertEqual(f("edit", {"command": "pytest"}), None)
+
+    def test_events_are_capped_at_twelve_newest_last_with_valid_kinds(self):
+        lines = [pi_session_line(NOW - 800)]
+        ts = NOW - 700
+        for _ in range(20):                    # 40 events: P then R pairs
+            lines.append(pi_user(ts, "SECRET-PROMPT"))
+            lines.append(pi_assistant(ts + 1, pi_usage(1, 1, 0, 0, 0.0),
+                                      [{"type": "text", "text": "x"}]))
+            ts += 2
+        lines.append(pi_assistant(NOW - 60, pi_usage(1, 1, 0, 0, 0.0),
+                                  [pi_tool_call("d1", "subagent_worker",
+                                                NOW - 60)]))
+        lines.append(pi_assistant(NOW - 50, pi_usage(1, 1, 0, 0, 0.0),
+                                  [pi_tool_call("t1", "bash", NOW - 50,
+                                                {"command": "SECRET-CMD"})]))
+        lines.append(pi_tool_result(NOW - 40, "t1", "bash", error=True))
+        lines.append(pi_assistant(NOW - 30, pi_usage(1, 1, 0, 0, 0.0),
+                                  [{"type": "text", "text": "x"}]))
+        path = self.write_jsonl(os.path.join(
+            self.home, ".pi", "agent", "sessions", "proj", "ev.jsonl"),
+            lines)
+        res = self.run_tele([self.pi(path)])[0]
+        events = res["events"]
+        self.assertEqual(len(events), 12)
+        valid = {"prompt", "reply", "tool", "error", "subagent"}
+        for e in events:
+            self.assertTrue(set(e) <= {"kind", "tool", "at"})
+            self.assertIn(e["kind"], valid)
+            self.assertIsInstance(e["at"], int)
+        ats = [e["at"] for e in events]
+        self.assertEqual(ats, sorted(ats))             # newest LAST
+        self.assertEqual(events[-1], {"kind": "reply", "at": NOW - 30})
+        kinds = {e["kind"] for e in events}
+        self.assertTrue({"prompt", "reply", "tool", "error",
+                         "subagent"} <= kinds)
+        self.assertNotIn("SECRET-CMD", json.dumps(res))
+

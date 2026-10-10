@@ -44,6 +44,17 @@ if [ -f "$UNIT" ] || [ -f "$PLIST" ]; then
     fi
 fi
 
+# the scheduler timer units (contract §3): stop the 30 s tick before the
+# binaries it calls go away
+SCHED_UNIT="$HOME/.config/systemd/user/tendril-schedule.service"
+SCHED_TIMER="$HOME/.config/systemd/user/tendril-schedule.timer"
+if [ -f "$SCHED_TIMER" ] || [ -f "$SCHED_UNIT" ]; then
+    systemctl --user disable --now tendril-schedule.timer 2>/dev/null
+    rm -f "$SCHED_TIMER" "$SCHED_UNIT"
+    systemctl --user daemon-reload 2>/dev/null
+    say "removed: tendril-schedule.timer + .service (scheduler disabled)"
+fi
+
 # client launchers installed by ./install --client (recognised by their header)
 for f in tendril tendril-remote; do
     if [ -f "$BIN_DIR/$f" ] && [ ! -L "$BIN_DIR/$f" ] \

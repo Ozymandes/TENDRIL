@@ -1,0 +1,879 @@
+"""Contract §1/§2 capacity: tendril_capacity + the remote-agents verb.
+
+Under test (docs/LINK-CONTRACT-0.2.md, all fixtures synthetic):
+- token accounting EXCLUDES cache reads on every provider — claude:
+  input+output+cache_creation; codex: input−cached+output; pi:
+  input+output+cacheWrite — and the definition lives in the module
+  docstring (the 67M-tokens-a-day smoke bug);
+- state thresholds ready<70 / pressure 70–89 / critical 90–97 / exhausted
+  ≥98 or an active 429 with future resets_at; unknown outside the
+  staleness bound (local 6 h, network 30 min);
+- providers appear only with 7-day activity or a trusted window;
+  tokens_by_day always carries all 7 days, oldest first, host local dates;
+- network adapters are opt-in (config file), Bearer-only, 10 s timeout,
+  schema-projected, 300 s min interval, doubling backoff, and a 401 is
+  never retried until the credential file or the enabled config changes;
+- secrets: the fake token planted beside the real credential subtree never
+  reaches output, cache or exception text (assertions avoid embedding the
+  marker so even a failure cannot print it);
+- urllib is mocked in every network test — NO test touches the network;
+- budget behaviour: snapshot_section serves the cache or scans within its
+  budget; progress is incremental across calls.
+"""
+import importlib.util
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+import urllib.error
+from importlib.machinery import SourceFileLoader
+from unittest import mock
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CLI = os.path.join(REPO, "bin", "remote-agents")
+CAP = os.path.join(REPO, "bin", "tendril_capacity.py")
+FIX = os.path.join(REPO, "tests", "fixtures", "capacity")
+
+
+def _load(name, path):
+    loader = SourceFileLoader(name, path)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+tc = _load("tendril_capacity_test", CAP)
+
+NOW = 1760000000.0
+MARKER = "FAKE-SECRET-TOKEN-h2r"          # synthetic credential marker
+DECOY_EMAIL = "decoy-claude@example.test"
+
+
+def iso(ts):
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(ts)) + ".000Z"
+
+
+def no_leak(self, marker, haystack, what):
+    """Assert absence WITHOUT risking the haystack in a failure message."""
+    if isinstance(haystack, bytes):
+        haystack = haystack.decode("utf-8", "replace")
+    ok = marker not in haystack
+    if not ok:
+        # name the file/stream, never its contents
+        raise AssertionError("marker leaked into %s" % what)
+
+
+class Base(unittest.TestCase):
+    """One fake $HOME plus a scratch cache path, per test."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="tendril-capacity-test-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.home = os.path.join(self.tmp, "home")
+        self.cache = os.path.join(self.tmp, "cache", "capacity.json")
+        os.makedirs(self.home)
+
+    # ----- fixture plumbing -------------------------------------------
+    def subs(self):
+        return {
+            "@T0@": iso(NOW), "@T1@": iso(NOW - 86400),
+            "@T2@": iso(NOW - 2 * 86400), "@T3@": iso(NOW - 3 * 86400),
+            "@T4@": iso(NOW - 4 * 86400), "@T5@": iso(NOW - 5 * 86400),
+            "@T6@": iso(NOW - 6 * 86400),
+            "@TNOW@": iso(NOW), "@TNOW2@": iso(NOW + 60),
+            "@RESET@": str(int(NOW + 3600)),
+            "@RESET2@": str(int(NOW + 8 * 86400)),
+            "@RESET_ISO@": iso(NOW + 3600),
+            "@RESET2_ISO@": iso(NOW + 8 * 86400),
+            "@STALE_ISO@": iso(NOW - 7 * 3600),
+            "@STALE_RESET@": str(int(NOW - 3600)),
+            "@YDAY_ISO@": iso(NOW - 86400),
+            "@MS0@": str(int(NOW * 1000)),
+            "@MS1@": str(int((NOW - 86400) * 1000)),
+        }
+
+    def fixture(self, name):
+        with open(os.path.join(FIX, name), encoding="utf-8") as f:
+            text = f.read()
+        for k, v in self.subs().items():
+            text = text.replace(k, v)
+        return text
+
+    def put(self, rel, content, binary=False):
+        path = os.path.join(self.home, rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb" if binary else "w") as f:
+            f.write(content)
+        return path
+
+    def put_fixture(self, rel, name):
+        return self.put(rel, self.fixture(name))
+
+    def cred(self, which):
+        """Install one credential fixture (with decoy subtrees)."""
+        names = {"claude": ("credentials_claude.json",
+                            ".claude/.credentials.json"),
+                 "codex": ("credentials_codex.json", ".codex/auth.json"),
+                 "pi": ("credentials_pi.json", ".pi/agent/auth.json")}
+        name, rel = names[which]
+        return self.put_fixture(rel, name)
+
+    def enable(self, *aids):
+        for aid in aids:
+            self.assertTrue(tc.set_enabled(aid, True, home=self.home))
+
+    # ----- drivers ------------------------------------------------------
+    def collect(self, refresh=False, budget_s=30.0, now=NOW):
+        return tc.collect(refresh=refresh, budget_s=budget_s, now=now,
+                          home=self.home, cache_path=self.cache)
+
+    def prov(self, pid, now=NOW):
+        sec = self.collect(now=now)
+        for rec in sec.get("providers", []):
+            if rec.get("id") == pid:
+                return rec
+        return None
+
+
+class _FakeResp:
+    def __init__(self, body):
+        self.body = body if isinstance(body, bytes) else body.encode()
+
+    def read(self, n=-1):
+        return self.body if n < 0 else self.body[:n]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+def fake_urllib(body=None, code=200, exc=None):
+    """Build a urlopen stand-in; records (url, headers, timeout) per call."""
+    calls = []
+
+    def handler(req, timeout=None):                     # noqa: ARG001
+        calls.append((req.get_full_url(),
+                      {k.lower(): v for k, v in req.header_items()},
+                      timeout))
+        if exc is not None:
+            raise exc
+        if code != 200:
+            raise urllib.error.HTTPError(req.get_full_url(), code,
+                                         "fake", None, None)
+        return _FakeResp(body)
+
+    handler.calls = calls
+    return handler
+
+
+# ---------- token accounting: cache reads are NEVER counted ----------
+class TestTokenAccounting(Base):
+    def test_docstring_documents_the_definition(self):
+        with open(CAP, encoding="utf-8") as f:
+            doc = f.read().split('"""', 2)[1]
+        self.assertIn("cache_read_input_tokens EXCLUDED", doc)
+        self.assertIn("input_tokens - cached_input_tokens", doc)
+        self.assertIn("input + output + cacheWrite", doc)
+        self.assertIn("CACHE READS", doc)
+        with open(CAP, encoding="utf-8") as f:
+            self.assertIn("ACC_VERSION", f.read())
+
+    def test_claude_week_cache_read_excluded(self):
+        self.put_fixture(".claude/projects/p1/s1.jsonl", "claude_week.jsonl")
+        rec = self.prov("claude")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["tokens_today"], 1600)   # 1000+500+100
+        self.assertEqual(rec["state"], "unknown")
+        self.assertEqual(rec["source"], "claude_local")
+        days = rec["tokens_by_day"]
+        self.assertEqual(len(days), 7)                # stable chart: all 7
+        self.assertEqual([d["tokens"] for d in days], [1600] * 7)
+        self.assertEqual(days[-1]["date"], tc._local_date(NOW))
+        self.assertEqual(days[0]["date"], tc._local_date(NOW - 6 * 86400))
+        self.assertEqual(rec["by_model"],
+                         [{"model": "claude-opus-4-8", "tokens": 11200}])
+        blob = json.dumps(rec)
+        no_leak(self, "900000", blob, "wire record")  # cache reads excluded
+        no_leak(self, "decoy prompt text", blob, "wire record")
+
+    def test_codex_full_input_minus_cached_plus_output(self):
+        self.put_fixture(".codex/sessions/2025/10/rollout-a.jsonl",
+                         "codex_full.jsonl")
+        rec = self.prov("codex")
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["tokens_today"], 4600)   # 3800 + 800
+        self.assertEqual(rec["state"], "critical")    # worst 93.0
+        self.assertEqual(rec["plan"], "plus")
+        self.assertEqual(rec["source"], "codex_rollout")
+        kinds = {w["kind"]: w for w in rec["windows"]}
+        self.assertEqual(kinds["session"]["used_pct"], 93.0)
+        self.assertEqual(kinds["session"]["resets_at"], int(NOW + 3600))
+        self.assertEqual(kinds["session"]["window_min"], 300)
+        self.assertEqual(kinds["weekly"]["used_pct"], 42.5)
+        self.assertEqual(kinds["weekly"]["resets_at"], int(NOW + 8 * 86400))
+        blob = json.dumps(rec)
+        for total in ("12800", "19100", "6300"):
+            no_leak(self, total, blob, "wire record")  # totals never counted
+
+    def test_codex_secondary_null_is_normal(self):
+        self.put_fixture(".codex/sessions/2025/10/rollout-b.jsonl",
+                         "codex_secondary_null.jsonl")
+        rec = self.prov("codex")
+        self.assertEqual(rec["tokens_today"], 300)    # 4000-3900+200
+        self.assertEqual([w["kind"] for w in rec["windows"]], ["session"])
+        self.assertEqual(rec["state"], "ready")
+        self.assertEqual(rec["plan"], "pro")
+
+    def test_codex_legacy_resets_in_seconds_and_delta(self):
+        self.put_fixture(".codex/sessions/2025/10/rollout-c.jsonl",
+                         "codex_legacy.jsonl")
+        rec = self.prov("codex")
+        self.assertEqual(rec["tokens_today"], 2500)   # 4000-2000 + 500
+        session = {w["kind"]: w for w in rec["windows"]}["session"]
+        self.assertEqual(session["resets_at"], int(NOW + 1800))
+        self.assertEqual(session["used_pct"], 10.0)
+        self.assertEqual(rec["state"], "ready")
+        blob = json.dumps(rec)
+        no_leak(self, "5400", blob, "wire record")
+        no_leak(self, "9900", blob, "wire record")
+
+    def test_codex_stale_window_unknown(self):
+        self.put_fixture(".codex/sessions/2025/10/rollout-d.jsonl",
+                         "codex_stale.jsonl")
+        rec = self.prov("codex")
+        self.assertIsNotNone(rec)                     # recent tokens exist
+        self.assertEqual(rec["state"], "unknown")     # window is 7 h old
+        self.assertNotIn("windows", rec)              # never fabricate
+        self.assertEqual(rec["source"], "codex_rollout")
+        days = {d["date"]: d["tokens"] for d in rec["tokens_by_day"]}
+        self.assertEqual(len(rec["tokens_by_day"]), 7)
+        self.assertEqual(sum(days.values()), 350)     # 150 + 200, both counted
+        today = tc._local_date(NOW)
+        self.assertEqual(days[today],
+                         150 if tc._local_date(NOW - 7 * 3600) == today
+                         else 0)
+
+    def test_pi_two_providers_two_days(self):
+        self.put_fixture(".pi/agent/sessions/s1/chunk.jsonl", "pi_two.jsonl")
+        sec = self.collect()
+        ids = [p["id"] for p in sec["providers"]]
+        self.assertEqual(ids, ["zai", "google"])      # fixed first, then rest
+        zai = sec["providers"][0]
+        self.assertEqual(zai["label"], "Z.AI")
+        self.assertEqual(zai["harness"], "pi")
+        self.assertEqual(zai["tokens_today"], 170)    # 100+50+20
+        self.assertEqual(zai["tokens_by_day"][-2]["tokens"], 290)
+        self.assertEqual(zai["tokens_by_day"][-1]["tokens"], 170)
+        self.assertEqual(zai["cost_today_usd"], 0.25)
+        self.assertEqual(zai["by_model"],
+                         [{"model": "glm-4.7", "tokens": 460}])
+        google = sec["providers"][1]
+        self.assertEqual(google["tokens_today"], 600)
+        self.assertNotIn("cost_today_usd", google)
+        blob = json.dumps(sec)
+        for cached in ("40300", "50180"):
+            no_leak(self, cached, blob, "section")    # totalTokens ignored
+        no_leak(self, "decoy user text", blob, "section")
+
+    def test_only_last_seven_days_appear(self):
+        old = json.dumps({
+            "timestamp": iso(NOW - 10 * 86400), "type": "event_msg",
+            "payload": {"type": "token_count", "info": {
+                "last_token_usage": {"input_tokens": 5000,
+                                     "cached_input_tokens": 0,
+                                     "output_tokens": 5000}}}},
+            separators=(",", ":")) + "\n"
+        self.put(".codex/sessions/2025/10/rollout-old.jsonl", old)
+        self.assertIsNone(self.prov("codex"))         # 10 days old: absent
+        self.assertIsNone(self.prov("codex", now=NOW - 3 * 86400))
+        rec = self.prov("codex", now=NOW - 4 * 86400)  # 6 days before that now
+        self.assertIsNotNone(rec)
+        self.assertEqual(rec["tokens_by_day"][0]["tokens"], 10000)
+
+    def test_claude_huge_line_regex_path(self):
+        line = json.dumps({
+            "type": "assistant", "timestamp": iso(NOW),
+            "message": {"model": "claude-opus-4-8", "usage": {
+                "input_tokens": 7, "output_tokens": 3,
+                "cache_creation_input_tokens": 2,
+                "cache_read_input_tokens": 123456}}},
+            separators=(",", ":")).encode() + b" " * (tc.HUGE_LINE + 4096)
+        self.put(".claude/projects/p9/big.jsonl",
+                 line + b"\n", binary=True)
+        rec = self.prov("claude")
+        self.assertEqual(rec["tokens_today"], 12)     # cache read excluded
+        blob = json.dumps(rec)
+        no_leak(self, "123456", blob, "wire record")
+
+    def test_claude_huge_429_ms_reset_normalized(self):
+        ms = int((NOW + 3600) * 1000)
+        line = json.dumps({
+            "type": "x", "apiErrorStatus": 429, "error": "rate_limit",
+            "timestamp": iso(NOW),
+            "message": {"quotaLimits": {"resetsAt": ms,
+                                        "rateLimitType": "seven_day"}}},
+            separators=(",", ":")).encode() + b" " * (tc.HUGE_LINE + 16)
+        self.put(".claude/projects/p9/big429.jsonl",
+                 line + b"\n", binary=True)
+        rec = self.prov("claude")
+        self.assertEqual(rec["state"], "exhausted")
+        self.assertEqual(rec["windows"],
+                         [{"kind": "weekly", "resets_at": int(NOW + 3600)}])
+
+
+# ---------- 429 / thresholds / staleness ----------
+class TestStates(Base):
+    def _w(self, pct, age=0.0, kind="session", net=False):
+        return {"kind": kind, "used_pct": pct, "observed_at": NOW - age,
+                "net": net}
+
+    def test_thresholds(self):
+        for pct, want in ((0.0, "ready"), (69.9, "ready"), (70.0, "pressure"),
+                          (89.0, "pressure"), (89.9, "pressure"),
+                          (90.0, "critical"), (97.0, "critical"),
+                          (97.9, "critical"), (98.0, "exhausted"),
+                          (100.0, "exhausted")):
+            state, _ = tc._state_for([self._w(pct)], None, NOW)
+            self.assertEqual(state, want, pct)
+
+    def test_worst_window_wins(self):
+        state, driver = tc._state_for(
+            [self._w(10.0), self._w(96.0, kind="weekly")], None, NOW)
+        self.assertEqual(state, "critical")
+        self.assertEqual(driver["used_pct"], 96.0)
+
+    def test_stale_windows_are_not_trusted(self):
+        state, driver = tc._state_for([self._w(99.0, age=tc.LOCAL_STALE_S + 1)],
+                                      None, NOW)
+        self.assertEqual(state, "unknown")
+        self.assertIsNone(driver)
+        state, _ = tc._state_for(
+            [self._w(99.0, age=tc.NET_STALE_S - 5, net=True)], None, NOW)
+        self.assertEqual(state, "exhausted")          # network bound 30 min
+
+    def test_claude_429_future_reset_exhausts(self):
+        self.put_fixture(".claude/projects/p1/r429.jsonl", "claude_429.jsonl")
+        rec = self.prov("claude")
+        self.assertEqual(rec["state"], "exhausted")
+        self.assertEqual(rec["windows"],
+                         [{"kind": "session", "resets_at": int(NOW + 3600)}])
+        self.assertEqual(rec["observed_at"], int(NOW))
+        self.assertEqual(rec["source"], "claude_local")
+
+    def test_claude_429_past_reset_not_exhausted(self):
+        text = self.fixture("claude_429.jsonl").replace(
+            '"resetsAt":%d' % (NOW + 3600), '"resetsAt":%d' % (NOW - 60))
+        self.put(".claude/projects/p1/r429.jsonl", text)
+        rec = self.prov("claude")
+        self.assertIsNotNone(rec)
+        self.assertNotEqual(rec["state"], "exhausted")
+        self.assertNotIn("windows", rec)
+
+    def test_provider_state_prefers_429_reset(self):
+        self.put_fixture(".claude/projects/p1/r429.jsonl", "claude_429.jsonl")
+        self.put_fixture(".claude/projects/p1/w.jsonl", "claude_week.jsonl")
+        st = tc.provider_state("claude", now=NOW, home=self.home,
+                               cache_path=self.cache)
+        self.assertEqual(st["id"], "claude")
+        self.assertEqual(st["state"], "exhausted")
+        self.assertEqual(st["resets_at"], int(NOW + 3600))
+        self.assertEqual(st["source"], "claude_local")
+
+    def test_provider_state_codex_worst_window_reset(self):
+        self.put_fixture(".codex/sessions/2025/10/rollout-a.jsonl",
+                         "codex_full.jsonl")
+        st = tc.provider_state("codex", now=NOW, home=self.home,
+                               cache_path=self.cache)
+        self.assertEqual(st["state"], "critical")
+        self.assertEqual(st["resets_at"], int(NOW + 3600))
+
+    def test_provider_state_unknown_provider(self):
+        self.assertIsNone(tc.provider_state("nosuch", now=NOW,
+                                            home=self.home,
+                                            cache_path=self.cache))
+
+
+# ---------- appearance, cache, incremental scans ----------
+class TestScanAndCache(Base):
+    def test_empty_and_garbage_inputs(self):
+        self.put(".claude/projects/p/e1.jsonl", "")
+        self.put(".codex/sessions/2025/10/rollout-e.jsonl", "")
+        self.put(".pi/agent/sessions/s/e2.jsonl", "")
+        self.put(".claude/projects/p/e2.jsonl", "not json at all\n")
+        self.put(".codex/sessions/2025/10/rollout-f.jsonl",
+                 '{"type":"event_msg","payload":{"type":"token_count"\n')
+        self.assertEqual(self.collect()["providers"], [])
+
+    def test_unknown_keys_and_types_ignored(self):
+        weird = {
+            "type": "assistant", "timestamp": iso(NOW), "weird": {"a": 1},
+            "message": {"model": "m", "usage": {
+                "input_tokens": 5, "output_tokens": 5,
+                "future_field": {"x": "y"}, "weird_ratio": "nan"}}}
+        self.put(".claude/projects/p/w.jsonl",
+                 json.dumps(weird, separators=(",", ":")) + "\n")
+        rec = self.prov("claude")
+        self.assertEqual(rec["tokens_today"], 10)
+
+    def test_truncated_tail_line_waits_for_the_rest(self):
+        full = json.dumps({
+            "type": "assistant", "timestamp": iso(NOW + 120),
+            "message": {"model": "m", "usage": {
+                "input_tokens": 11, "output_tokens": 7}}},
+            separators=(",", ":"))
+        path = self.put(".claude/projects/p/t.jsonl",
+                        json.dumps({
+                            "type": "assistant", "timestamp": iso(NOW),
+                            "message": {"model": "m", "usage": {
+                                "input_tokens": 3, "output_tokens": 4}}},
+                            separators=(",", ":")) + "\n")
+        self.assertEqual(self.prov("claude")["tokens_today"], 7)
+        with open(path, "a") as f:
+            f.write(full[:40])                        # partial line, no \n
+        self.assertEqual(self.prov("claude", now=NOW + 61)["tokens_today"], 7)
+        with open(path, "a") as f:
+            f.write(full[40:] + "\n")                 # now complete
+        self.assertEqual(self.prov("claude", now=NOW + 122)["tokens_today"],
+                         25)                          # 7 + 18
+
+    def test_truncation_resets_the_accumulators(self):
+        body = json.dumps({
+            "type": "assistant", "timestamp": iso(NOW),
+            "message": {"model": "m", "usage": {
+                "input_tokens": 30, "output_tokens": 10}}},
+            separators=(",", ":")) + "\n"
+        path = self.put(".claude/projects/p/x.jsonl", body * 2)
+        self.assertEqual(self.prov("claude")["tokens_today"], 80)
+        with open(path, "w") as f:                    # rotated to one line
+            f.write(body)
+        rec = self.prov("claude", now=NOW + 61)
+        self.assertEqual(rec["tokens_today"], 40)
+
+    def test_local_min_interval_gates_rescans(self):
+        path = self.put(".claude/projects/p/m.jsonl", json.dumps({
+            "type": "assistant", "timestamp": iso(NOW),
+            "message": {"model": "m", "usage": {
+                "input_tokens": 5, "output_tokens": 5}}},
+            separators=(",", ":")) + "\n")
+        self.assertEqual(self.prov("claude")["tokens_today"], 10)
+        with open(path, "a") as f:                    # appended too soon
+            f.write(json.dumps({
+                "type": "assistant", "timestamp": iso(NOW + 1),
+                "message": {"model": "m", "usage": {
+                    "input_tokens": 5, "output_tokens": 5}}},
+                separators=(",", ":")) + "\n")
+        self.assertEqual(self.prov("claude", now=NOW + 30)["tokens_today"], 10)
+        self.assertEqual(self.prov("claude", now=NOW + 61)["tokens_today"], 20)
+
+    def test_budget_returns_fast_and_advances(self):
+        line = json.dumps({
+            "type": "assistant", "timestamp": iso(NOW),
+            "message": {"model": "m", "usage": {
+                "input_tokens": 2, "output_tokens": 1}}},
+            separators=(",", ":")) + "\n"
+        path = self.put(".claude/projects/p/huge.jsonl", line * 40000)
+        t0 = time.monotonic()
+        sec = self.collect(budget_s=0.15)
+        self.assertLess(time.monotonic() - t0, 5.0)
+        self.assertIn("providers", sec)
+        entry = tc._load_cache(self.cache)["files"][
+            os.path.realpath(path)]
+        self.assertLess(entry["offset"], os.path.getsize(path))
+        seen = [entry["offset"]]
+        for i in range(1, 12):
+            self.collect(budget_s=0.15, now=NOW + i * 61)
+            seen.append(tc._load_cache(self.cache)["files"][
+                os.path.realpath(path)]["offset"])
+        self.assertEqual(seen, sorted(seen))          # progress is monotonic
+        self.assertGreater(seen[-1], seen[0])
+
+    def test_snapshot_section_serves_fresh_cache_tuple(self):
+        section = {"generated_at": int(NOW) - 5, "providers": [{"id": "x"}]}
+        tc._save_cache({"acc_ver": tc.ACC_VERSION, "built_at": NOW,
+                        "section": section}, self.cache)
+        sec, cap = tc.snapshot_section(now=NOW + 1, home=self.home,
+                                       cache_path=self.cache)
+        self.assertEqual(cap, "capacity")
+        self.assertEqual(sec, section)
+
+    def test_snapshot_section_rebuilds_when_stale_or_old_version(self):
+        tc._save_cache({"built_at": NOW - 3600,
+                        "section": {"generated_at": 1, "providers": []}},
+                       self.cache)
+        sec, cap = tc.snapshot_section(now=NOW, home=self.home,
+                                       cache_path=self.cache)
+        self.assertEqual((bool(sec), cap), (True, "capacity"))
+        self.assertEqual(sec["providers"], [])        # empty home: nothing
+        tc._save_cache({"built_at": NOW,             # pre-ACC_VERSION cache
+                        "section": {"generated_at": 1,
+                                    "providers": [{"tokens_today": 10 ** 9}]}},
+                       self.cache)
+        sec, _ = tc.snapshot_section(now=NOW + 1, home=self.home,
+                                     cache_path=self.cache)
+        self.assertEqual(sec["providers"], [])        # definition change wins
+
+    def test_snapshot_section_never_overruns_its_budget(self):
+        line = json.dumps({
+            "type": "assistant", "timestamp": iso(NOW),
+            "message": {"model": "m", "usage": {
+                "input_tokens": 2, "output_tokens": 1}}},
+            separators=(",", ":")) + "\n"
+        self.put(".claude/projects/p/huge.jsonl", line * 40000)
+        t0 = time.monotonic()
+        sec, cap = tc.snapshot_section(budget_s=0.2, now=NOW, home=self.home,
+                                       cache_path=self.cache)
+        self.assertLess(time.monotonic() - t0, 5.0)
+        self.assertEqual(cap, "capacity")
+        self.assertIsInstance(sec, dict)
+
+
+# ---------- network adapters (mocked; NO real network) ----------
+class TestNetwork(Base):
+    def setUp(self):
+        super().setUp()
+        # the home-derived cache path, so set_enabled()'s 401-revival sees
+        # the same net state the collects write
+        self.cache = os.path.join(self.home, ".cache", "tendril",
+                                  "capacity.json")
+
+    def _enabled_home(self, adapter="claude_oauth", cred="claude"):
+        self.cred(cred)
+        self.enable(adapter)
+
+    def test_no_fetch_without_optin(self):
+        fake = fake_urllib(body="{}")
+        with mock.patch("urllib.request.urlopen", fake):
+            self.collect(refresh=True, budget_s=30)
+        self.assertEqual(fake.calls, [])
+
+    def test_no_fetch_below_network_budget(self):
+        self._enabled_home()
+        fake = fake_urllib(body="{}")
+        with mock.patch("urllib.request.urlopen", fake):
+            self.collect(refresh=False, budget_s=5.0)   # 5 < 11 s
+        self.assertEqual(fake.calls, [])
+
+    def test_oauth_iso_fetch(self):
+        self._enabled_home()
+        fake = fake_urllib(body=self.fixture("oauth_iso.json"))
+        with mock.patch("urllib.request.urlopen", fake):
+            rec = self.prov("claude")
+        self.assertEqual(len(fake.calls), 1)
+        url, headers, timeout = fake.calls[0]
+        self.assertTrue(url.startswith("https://api.anthropic.com/"))
+        self.assertEqual(timeout, 10)
+        auth = headers.get("authorization", "")
+        self.assertTrue(auth.startswith("Bearer "))
+        self.assertGreater(len(auth), 12)
+        self.assertEqual(rec["state"], "critical")     # 0.91 → 91.0
+        self.assertEqual(rec["source"], "claude_oauth")
+        self.assertEqual(rec["plan"], "max")           # subscriptionType
+        kinds = {w["kind"]: w for w in rec["windows"]}
+        self.assertEqual(kinds["session"]["used_pct"], 91.0)
+        self.assertEqual(kinds["session"]["resets_at"], int(NOW + 3600))
+        self.assertEqual(kinds["session"]["window_min"], 300)
+        self.assertEqual(kinds["weekly"]["used_pct"], 42.0)
+        self.assertEqual(kinds["weekly"]["resets_at"], int(NOW + 8 * 86400))
+        no_leak(self, MARKER, json.dumps(rec), "wire record")
+
+    def test_oauth_epoch_resets_exhausted(self):
+        self._enabled_home()
+        fake = fake_urllib(body=self.fixture("oauth_epoch.json"))
+        with mock.patch("urllib.request.urlopen", fake):
+            rec = self.prov("claude")
+        self.assertEqual(rec["state"], "exhausted")    # 99.5 ≥ 98
+        kinds = {w["kind"]: w for w in rec["windows"]}
+        self.assertEqual(kinds["session"]["resets_at"], int(NOW + 3600))
+
+    def test_wham_fetch(self):
+        self._enabled_home("codex_wham", "codex")
+        fake = fake_urllib(body=self.fixture("wham.json"))
+        with mock.patch("urllib.request.urlopen", fake):
+            rec = self.prov("codex")
+        self.assertEqual(rec["source"], "codex_wham")
+        self.assertEqual(rec["state"], "ready")        # worst 50.0
+        kinds = {w["kind"]: w for w in rec["windows"]}
+        self.assertEqual(kinds["session"]["used_pct"], 12.5)
+        self.assertEqual(kinds["session"]["resets_at"], int(NOW + 3600))
+        self.assertEqual(kinds["weekly"]["used_pct"], 50.0)
+        self.assertEqual(kinds["weekly"]["resets_at"], int(NOW + 86400))
+        blob = json.dumps(rec)
+        no_leak(self, MARKER, blob, "wire record")
+        no_leak(self, "decoy-owner", blob, "wire record")
+
+    def test_zai_buckets_and_utilization_forms(self):
+        self._enabled_home("zai_quota", "pi")
+        fake = fake_urllib(body=self.fixture("zai_buckets.json"))
+        with mock.patch("urllib.request.urlopen", fake):
+            rec = self.prov("zai")
+        self.assertEqual(rec["source"], "zai_quota")
+        self.assertEqual(rec["harness"], "pi")
+        kinds = {w["kind"]: w for w in rec["windows"]}
+        self.assertEqual(kinds["session"]["used_pct"], 91.0)
+        self.assertEqual(kinds["weekly"]["used_pct"], 55.0)
+        self.assertEqual(kinds["daily"]["used_pct"], 30.0)  # 30/(30+70)
+        self.assertEqual(rec["state"], "critical")
+        # direct-form fallback
+        fake = fake_urllib(body=self.fixture("zai_forms.json"))
+        with mock.patch("urllib.request.urlopen", fake):
+            rec = self.prov("zai", now=NOW + tc.NET_MIN_S + 1)
+        kinds = {w["kind"]: w for w in rec["windows"]}
+        self.assertEqual(kinds["session"]["used_pct"], 25.0)
+        self.assertEqual(kinds["weekly"]["used_pct"], 80.0)
+        self.assertEqual(rec["state"], "pressure")
+        no_leak(self, MARKER, json.dumps(rec), "wire record")
+        no_leak(self, "decoy-user", json.dumps(rec), "wire record")
+
+    def test_missing_credential_is_nocred_no_fetch(self):
+        self.enable("claude_oauth")                   # no cred file at all
+        fake = fake_urllib(body="{}")
+        with mock.patch("urllib.request.urlopen", fake):
+            self.collect(refresh=True, budget_s=30)
+        self.assertEqual(fake.calls, [])
+        st = tc._load_cache(self.cache)["net"]["claude_oauth"]
+        self.assertEqual(st["fail"], "nocred")
+
+    def test_401_marks_auth_and_never_retries_until_change(self):
+        self._enabled_home()
+        fake = fake_urllib(code=401)
+        with mock.patch("urllib.request.urlopen", fake):
+            self.collect(refresh=True, budget_s=30)
+        self.assertEqual(len(fake.calls), 1)
+        with mock.patch("urllib.request.urlopen", fake):
+            self.collect(refresh=True, budget_s=30, now=NOW + 99999)
+        self.assertEqual(len(fake.calls), 1)          # dead until it changes
+        # a config change (disable + enable) revives it
+        self.assertTrue(tc.set_enabled("claude_oauth", False, home=self.home))
+        self.assertTrue(tc.set_enabled("claude_oauth", True, home=self.home))
+        with mock.patch("urllib.request.urlopen", fake):
+            self.collect(refresh=True, budget_s=30, now=NOW + 199999)
+        self.assertEqual(len(fake.calls), 2)
+
+    def test_401_retries_after_credential_file_changes(self):
+        cred_path = self.cred("claude")
+        self.enable("claude_oauth")
+        fake = fake_urllib(code=401)
+        with mock.patch("urllib.request.urlopen", fake):
+            self.collect(refresh=True, budget_s=30)
+        self.assertEqual(len(fake.calls), 1)
+        with open(cred_path, "w") as f:
+            f.write(self.fixture("credentials_claude.json").replace(
+                "h2r-claude", "h2r-claude-2"))
+        os.utime(cred_path, (time.time() + 5, time.time() + 5))
+        with mock.patch("urllib.request.urlopen", fake):
+            self.collect(refresh=True, budget_s=30, now=NOW + 9999)
+        self.assertEqual(len(fake.calls), 2)
+
+    def test_429_backoff_doubles(self):
+        self._enabled_home()
+        fake = fake_urllib(code=429)
+        with mock.patch("urllib.request.urlopen", fake):
+            self.collect(refresh=True, budget_s=30)          # fail 1
+        st = tc._load_cache(self.cache)["net"]["claude_oauth"]
+        self.assertEqual(st["fail"], "rate")
+        self.assertEqual(st["backoff"], 600)                 # 2 × 300
+        with mock.patch("urllib.request.urlopen", fake):
+            self.collect(refresh=True, budget_s=30, now=NOW + 100)
+        self.assertEqual(len(fake.calls), 1)                 # still backing off
+        with mock.patch("urllib.request.urlopen", fake):
+            self.collect(refresh=True, budget_s=30, now=NOW + 700)
+        self.assertEqual(len(fake.calls), 2)                 # fail 2
+        st = tc._load_cache(self.cache)["net"]["claude_oauth"]
+        self.assertEqual(st["backoff"], 1200)
+
+    def test_shape_failure_then_interval_gate(self):
+        self._enabled_home()
+        fake = fake_urllib(body="this is not json")
+        with mock.patch("urllib.request.urlopen", fake):
+            rec = self.prov("claude")
+        self.assertIsNone(rec)                         # no data ⇒ absent
+        st = tc._load_cache(self.cache)["net"]["claude_oauth"]
+        self.assertEqual(st["fail"], "shape")
+        self.assertEqual(st["backoff"], 600)           # 2 × 300 s
+        with mock.patch("urllib.request.urlopen", fake):
+            self.collect(refresh=True, budget_s=30, now=NOW + 60)
+        self.assertEqual(len(fake.calls), 1)           # still backing off
+        fake2 = fake_urllib(body=self.fixture("oauth_iso.json"))
+        with mock.patch("urllib.request.urlopen", fake2):
+            self.collect(refresh=True, budget_s=30, now=NOW + 700)
+        self.assertEqual(len(fake2.calls), 1)          # backoff elapsed: retry
+        with mock.patch("urllib.request.urlopen", fake2):
+            self.collect(refresh=True, budget_s=30, now=NOW + 900)
+        self.assertEqual(len(fake2.calls), 1)          # 200 s < 300 s interval
+        with mock.patch("urllib.request.urlopen", fake2):
+            rec = self.prov("claude", now=NOW + 1100)
+        self.assertEqual(len(fake2.calls), 2)          # due again
+        self.assertEqual(rec["state"], "critical")
+
+    def test_exception_text_never_reaches_the_cache(self):
+        self._enabled_home()
+        boom = RuntimeError("urllib exploded: " + MARKER)
+        fake = fake_urllib(exc=boom)
+        with mock.patch("urllib.request.urlopen", fake):
+            self.collect(refresh=True, budget_s=30)
+        st = tc._load_cache(self.cache)["net"]["claude_oauth"]
+        self.assertEqual(st["fail"], "net")
+        no_leak(self, MARKER, self._cache_bytes(), "cache file")
+
+    def _cache_bytes(self):
+        with open(self.cache, "rb") as f:
+            return f.read()
+
+    def test_secrets_never_reach_cache_or_section(self):
+        self._enabled_home()
+        fake = fake_urllib(body=self.fixture("oauth_iso.json"))
+        with mock.patch("urllib.request.urlopen", fake):
+            sec = self.collect(refresh=True, budget_s=30)
+        no_leak(self, MARKER, json.dumps(sec), "section")
+        cached = self._cache_bytes()
+        no_leak(self, MARKER, cached, "cache file")
+        no_leak(self, DECOY_EMAIL, json.dumps(sec), "section")
+        no_leak(self, DECOY_EMAIL, cached, "cache file")
+
+    def test_junk_config_enables_nothing(self):
+        self.cred("claude")
+        self.put(".config/tendril/capacity.json",
+                 self.fixture("config_junk.json"))
+        fake = fake_urllib(body="{}")
+        with mock.patch("urllib.request.urlopen", fake):
+            self.collect(refresh=True, budget_s=30)
+        self.assertEqual(fake.calls, [])
+        self.assertEqual(tc.enabled_ids(self.home), [])
+
+
+# ---------- config round-trip ----------
+class TestConfig(Base):
+    def test_enable_disable_roundtrip(self):
+        self.assertEqual(tc.enabled_ids(self.home), [])
+        self.assertTrue(tc.set_enabled("zai_quota", True, home=self.home))
+        self.assertEqual(tc.enabled_ids(self.home), ["zai_quota"])
+        self.assertTrue(
+            tc.set_enabled("claude_oauth", True, home=self.home))
+        self.assertEqual(tc.enabled_ids(self.home),
+                         ["claude_oauth", "zai_quota"])   # stable order
+        self.assertTrue(tc.set_enabled("zai_quota", False, home=self.home))
+        self.assertEqual(tc.enabled_ids(self.home), ["claude_oauth"])
+        path = os.path.join(self.home, ".config", "tendril",
+                            "capacity.json")
+        self.assertEqual(oct(os.stat(path).st_mode & 0o777), "0o600")
+        self.assertEqual(
+            oct(os.stat(os.path.dirname(path)).st_mode & 0o777), "0o700")
+
+    def test_invalid_ids_refused(self):
+        for bad in ("claude", "bogus", "", "claude_oauth ", "../../etc"):
+            self.assertFalse(tc.set_enabled(bad, True, home=self.home))
+        self.assertEqual(tc.enabled_ids(self.home), [])
+
+
+# ---------- human status + the remote-agents verb ----------
+class TestCliAndStatus(Base):
+    def _env(self):
+        env = dict(os.environ)
+        env["HOME"] = self.home
+        return env
+
+    def _cli(self, *args):
+        return subprocess.run(
+            [sys.executable, CLI, "capacity", *args], env=self._env(),
+            capture_output=True, text=True, timeout=60)
+
+    def test_status_text_table_and_no_secrets(self):
+        self.put_fixture(".claude/projects/p1/s1.jsonl", "claude_week.jsonl")
+        sec = self.collect()
+        text = tc.status_text(sec, now=NOW, enabled=["claude_oauth"])
+        self.assertIn("claude", text)
+        self.assertIn("unknown", text)
+        self.assertIn("1.6K", text)
+        self.assertIn("claude_oauth", text)
+        no_leak(self, MARKER, text, "status output")
+        self.assertEqual(tc.status_text({"providers": []}, now=NOW),
+                         "no provider usage found on this host")
+
+    def _live_claude_line(self, tokens_in=1000, tokens_out=500):
+        # CLI subprocesses run with the real wall clock, so the transcript
+        # line must carry a real-time timestamp to land in the 7-day window
+        line = json.dumps({
+            "type": "assistant",
+            "timestamp": iso(time.time()),
+            "message": {"model": "claude-opus-4-8", "usage": {
+                "input_tokens": tokens_in, "output_tokens": tokens_out,
+                "cache_creation_input_tokens": 100,
+                "cache_read_input_tokens": 900000}}},
+            separators=(",", ":"))
+        return line + "\n"
+
+    def test_cli_json_one_line_no_secrets(self):
+        self.put(".claude/projects/p1/s1.jsonl", self._live_claude_line())
+        self.cred("claude")
+        self.put(".config/tendril/capacity.json", '{"enabled":[]}')
+        r = self._cli("--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+        self.assertEqual(len(lines), 1)
+        sec = json.loads(lines[0])
+        self.assertEqual(sec["providers"][0]["id"], "claude")
+        self.assertEqual(sec["providers"][0]["tokens_today"], 1600)
+        no_leak(self, MARKER, r.stdout, "cli stdout")
+        no_leak(self, MARKER, r.stderr, "cli stderr")
+
+    def test_cli_enable_disable_and_validation(self):
+        r = self._cli("enable", "bogus_adapter")
+        self.assertEqual(r.returncode, 2)
+        self.assertIn("unknown adapter", r.stderr)
+        r = self._cli("enable", "zai_quota")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(tc.enabled_ids(self.home), ["zai_quota"])
+        cfg = os.path.join(self.home, ".config", "tendril", "capacity.json")
+        with open(cfg, encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"enabled": ["zai_quota"]})
+        r = self._cli("disable", "zai_quota")
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(tc.enabled_ids(self.home), [])
+        r = self._cli("frobnicate")
+        self.assertEqual(r.returncode, 2)
+
+    def test_cli_status(self):
+        r = self._cli("status")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("no provider usage found on this host", r.stdout)
+        self.put(".claude/projects/p1/s1.jsonl", self._live_claude_line())
+        # drop the cache the first status run wrote: the 60 s local min
+        # interval would otherwise serve it unchanged
+        cachef = os.path.join(self.home, ".cache", "tendril",
+                              "capacity.json")
+        if os.path.exists(cachef):
+            os.unlink(cachef)
+        r = self._cli("status")
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("claude", r.stdout)
+        self.assertIn("1.6K", r.stdout)
+        no_leak(self, MARKER, r.stdout, "cli stdout")
+
+    def test_cli_missing_module(self):
+        env = self._env()
+        env["TENDRIL_TEST_HIDE"] = "1"
+        r = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.argv=['remote-agents','capacity','--json'];\n"
+             "import importlib.machinery, importlib.util, json;\n"
+             "loader=importlib.machinery.SourceFileLoader('ra', %r);\n"
+             "spec=importlib.util.spec_from_loader('ra', loader);\n"
+             "ra=importlib.util.module_from_spec(spec);\n"
+             "sys.modules['tendril_capacity']=None;\n"
+             "loader.exec_module(ra);\n"
+             "sys.exit(ra.main())" % CLI],
+            env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("missing next to remote-agents", r.stderr)
+        no_leak(self, MARKER, r.stdout + r.stderr, "cli output")
+
+
+if __name__ == "__main__":
+    unittest.main()
