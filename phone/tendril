@@ -170,6 +170,7 @@ else
         attach | resolve | focus | link | enter)
             MODE="$1"; ALIAS="$DEFAULT_ALIAS"; ATTACH_ID="${2:-}" ;;
         snapshot)
+            [ "$#" -eq 1 ] || { echo "usage: tendril [<alias>] snapshot"; exit 2; }
             MODE="snapshot"; ALIAS="$DEFAULT_ALIAS" ;;
         capacity)
             [ "$#" -eq 1 ] || { echo "usage: tendril [<alias>] capacity"; exit 2; }
@@ -182,6 +183,7 @@ else
                 attach | resolve | focus | link | enter)
                     MODE="$2"; ALIAS="$1"; ATTACH_ID="${3:-}" ;;
                 snapshot)
+                    [ "$#" -eq 2 ] || { echo "usage: tendril [<alias>] snapshot"; exit 2; }
                     MODE="snapshot"; ALIAS="$1" ;;
                 capacity)
                     [ "$#" -eq 2 ] || { echo "usage: tendril [<alias>] capacity"; exit 2; }

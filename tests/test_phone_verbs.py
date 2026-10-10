@@ -147,6 +147,18 @@ class FixedVerbs(LauncherEnv):
                          ["ssh -o BatchMode=yes -o ConnectTimeout=6 "
                           "testhost remote-agents snapshot"])
 
+    def test_snapshot_extra_arg_is_refused_without_dialing(self):
+        p = self.run_launcher(["snapshot", "--evil"])
+        self.assertEqual(p.returncode, 2)
+        self.assertEqual(self.calls(), [])
+        self.assertIn("usage", p.stdout + p.stderr)
+
+    def test_snapshot_explicit_alias_extra_arg_is_refused(self):
+        p = self.run_launcher(["testhost", "snapshot", "--evil"])
+        self.assertEqual(p.returncode, 2)
+        self.assertEqual(self.calls(), [])
+        self.assertIn("usage", p.stdout + p.stderr)
+
     def test_capacity_is_one_batchmode_ssh_with_a_fixed_command(self):
         p = self.run_launcher(["testhost", "capacity"])
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
