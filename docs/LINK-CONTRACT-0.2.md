@@ -74,8 +74,7 @@ fixed-verb caller. Everything here is additive to snapshot v2; a 0.1.x phone
        "state": "QUEUED|WAITING_FOR_RESET|WAITING_FOR_CAPACITY|READY|RUNNING|DONE|FAILED|CANCELLED",
        "due_at": 1791592000,                // host's best estimate (resets_at for on_reset)
        "created_at": 1791580000, "started_at": null, "finished_at": null,
-       "pane_id": "w19:p4", "failure": "launch refused",   // failure: short safe phrase ≤ 60
-       "reason": "claude does not report capacity to this host"}   // reason: WAITING_FOR_CAPACITY only, when the provider reports no capacity (short safe phrase ≤ 60)
+       "pane_id": "w19:p4", "failure": "launch refused"}   // failure: short safe phrase ≤ 60
     ]
   }
 }
@@ -145,10 +144,8 @@ Launch (argv only): new tab/pane in the target workspace →
 `herdr agent prompt <pane> <PROMPT> --wait` (verify target semantics live;
 fall back to the harness's positional prompt argv if needed). Notify via
 herdr-notify `send()` + `tendril_link.describe()` deep link:
-`TENDRIL · TASK STARTED` / `TASK WAITING` (exactly once when an `at` task
-comes due but the provider is exhausted — QUEUED → WAITING_FOR_CAPACITY;
-body "<title> · waiting for <Provider> capacity"; never on add) /
-`TASK FAILED`; DONE is covered by the existing
+`TENDRIL · TASK STARTED` / `TASK WAITING` (only on entering WAITING_FOR_RESET
+from an `at` trigger) / `TASK FAILED`; DONE is covered by the existing
 herdr finished notification (no duplicate).
 
 ## 4 · Fixed verbs
@@ -173,3 +170,68 @@ CREATE / CANCEL when absent and says so (designed state).
 b64url payload and runs `schedule add|cancel|show` through the existing
 TermuxProbe RUN_COMMAND background channel (20 s timeout, single-flight), then
 triggers a snapshot refresh. Fixture data lives only in debug/preview/test.
+
+## 6 · Herdr health & recovery (0.2 addendum — binding)
+
+Problem: Herdr (the session server) can crash while the host and SSH
+transport stay reachable. Link must tell "host unreachable" from "Herdr
+offline", and offer one safe, verified revive.
+
+### 6.1 Host verbs (fixed, allowlisted; no free arguments)
+
+| Phone argv (RUN_COMMAND) | Remote command | Notes |
+|---|---|---|
+| `health` | `remote-agents health --json` | read-only; MUST NOT depend on a live Herdr server (no `herdr api` call that blocks; bounded probes ≤ 3 s total) |
+| `herdr restart` | `remote-agents herdr restart` | starts Herdr via its supported headless lifecycle, then VERIFIES; one JSON line |
+| (host user) `tendril herdr stop` | — | intentional stop: writes the stop guard, then stops Herdr |
+| (host user) `tendril herdr start` | — | clears the guard, starts + verifies |
+
+`health --json` → one line:
+```jsonc
+{"version":1,"host":"omarchy","generated_at":1791583000,
+ "herdr":{"state":"running|down|stopped|unknown",   // stopped = intentional stop guard set
+          "last_healthy_at":1791582880,             // optional
+          "since":1791582900},                      // optional: when current state began
+ "tendril":{"state":"healthy|degraded","version":"0.9.x"},  // install files present & runnable
+ "notify":{"state":"active|inactive|failed|absent"},
+ "scheduler":{"state":"active|inactive|absent"},
+ "guardian":{"state":"active|inactive|absent"}}
+```
+No secrets, paths, usernames, hostnames of other machines, pids, or env.
+Every key optional on the phone side; malformed ⇒ treated as unknown.
+
+`herdr restart` reply: `{"ok":true,"herdr":{"state":"running"}}` only after
+verification (server status reports running AND `herdr api snapshot`
+answers within 5 s, retried ≤ 10 s total); otherwise
+`{"ok":false,"error":"<safe phrase ≤ 60>"}` (e.g. "Herdr did not come up",
+"Herdr is already running", "Stopped on purpose — start it on the host").
+Restart REFUSES while the intentional-stop guard is set unless the user
+runs `tendril herdr start` on the host (phone sees the designed STOPPED
+state). Rate limit: one restart attempt per 30 s (flock + timestamp).
+
+### 6.2 Guardian (crash notification)
+
+Systemd user `tendril-guardian.timer` (OnBootSec=60s, OnUnitActiveSec=30s)
+→ oneshot `remote-agents health tick`. State file
+`~/.local/state/tendril/herdr-health.json` (0600, atomic, flock):
+`{state, since, last_healthy_at, incident_id, notified_down, notified_up}`.
+Transition running → down (and NOT guard-stopped) opens an incident and
+sends exactly one `TENDRIL · HERDR OFFLINE` / "Host <h> is reachable, but
+Herdr stopped." via the existing herdr-notify `send()` (click = the app,
+no pane). down → running sends at most one `TENDRIL · HERDR RESTORED` per
+incident. Requires 2 consecutive down observations (debounce ~30 s) before
+notifying. The guardian NEVER restarts Herdr (notify + user-initiated
+revive). Intentional stop ⇒ no incident, no notification.
+
+### 6.3 Phone classification
+
+On a snapshot failure (any TopologyFailure other than LAUNCHER_OUTDATED),
+the phone runs `health` once (single-flight, 8 s timeout):
+- health unreachable / transport failure ⇒ HOST_UNREACHABLE (existing state)
+- herdr.state = down ⇒ HERDR_OFFLINE (recovery panel, primary REVIVE HERDR)
+- herdr.state = stopped ⇒ HERDR_STOPPED (calm; no revive; instruction to
+  run `tendril herdr start` on the host)
+- herdr running but snapshot failed ⇒ keep the original failure
+REVIVE HERDR runs `herdr restart`; success ⇒ immediate snapshot refresh
+and the panel resolves into LIVE; failure ⇒ the safe phrase inline +
+RETRY. Capability string: `health` (hosts without it ⇒ old behaviour).

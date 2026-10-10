@@ -57,6 +57,7 @@ import json
 import os
 import re
 import stat
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -770,22 +771,40 @@ def _read_credential(home, spec):
     return token, plan, mtime
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Never follow redirects: urllib would re-send the Authorization
+    header to the redirect target. Returning None makes the opener raise
+    HTTPError for the 3xx itself — no second request is ever made."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _http_get_json(url, token, extra_headers, timeout=NET_TIMEOUT_S):
     """One GET, Bearer only. Returns (kind, data): kind is "ok", "auth"
     (401), "rate" (429), "http", "net" or "shape". NEVER raises; error
-    bodies are never read and never stored — no secret can leak."""
+    bodies are never read and never stored — no secret can leak.
+    Redirects are refused ("net"): the opener never re-issues the request,
+    so the Bearer header can never reach a redirect target."""
     headers = {"Authorization": "Bearer " + token,
                "User-Agent": "tendril-capacity/0.2"}
     headers.update(extra_headers or {})
     req = urllib.request.Request(url, method="GET", headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with _OPENER.open(req, timeout=timeout) as resp:
+            if resp.geturl() != url:            # rewritten underneath us
+                return "net", None
             body = resp.read(MAX_READ_BODY)
     except urllib.error.HTTPError as e:
         if e.code == 401:
             return "auth", None
         if e.code == 429:
             return "rate", None
+        if e.code in (301, 302, 303, 307, 308):
+            return "net", None                  # redirect refused
         return "http", None
     except Exception:
         return "net", None
@@ -1074,11 +1093,9 @@ def set_enabled(adapter_id, on, home=None):
     d = os.path.dirname(path)
     try:
         os.makedirs(d, mode=0o700, exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"enabled": ordered}, f, separators=(",", ":"))
-        os.replace(tmp, path)
-        os.chmod(path, 0o600)
+        body = json.dumps({"enabled": ordered},
+                          separators=(",", ":")).encode("utf-8")
+        _atomic_write(path, body)
     except OSError:
         return False
     if on:
@@ -1311,18 +1328,47 @@ def _load_cache(path):
         return {}
 
 
+def _fsync_dir(d):
+    try:
+        fd = os.open(d, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def _atomic_write(path, body):
+    """Atomic persist (mirrors tendril_schedule.save_store): a unique
+    mkstemp name in the target dir → write+fsync → chmod 0600 →
+    os.replace → dir fsync. A fixed tmp name would let two concurrent
+    writers interleave into the same file and corrupt it."""
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(prefix=".capacity-", dir=d)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(body)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    _fsync_dir(d)
+
+
 def _save_cache(cache, path=None):
     path = path or CACHE_FILE
     try:
-        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(cache, f, separators=(",", ":"))
-        os.replace(tmp, path)
-        try:
-            os.chmod(path, 0o600)
-        except OSError:
-            pass
+        d = os.path.dirname(path)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        _atomic_write(path, json.dumps(cache,
+                                       separators=(",", ":")).encode("utf-8"))
     except OSError:
         pass
 

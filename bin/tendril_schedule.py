@@ -48,6 +48,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import tempfile
 import time
 import uuid
@@ -225,10 +226,23 @@ def load_store(path, now=None, quarantine=True):
 def _locked(lock_path):
     d = os.path.dirname(lock_path)
     os.makedirs(d, exist_ok=True)
+    # Symlink refusal before chmod/open: a symlinked state dir or lock
+    # would point the 0700 tightening and the lock write at an attacker's
+    # target. O_NOFOLLOW backstops the lstat→open race (symlink swap →
+    # ELOOP instead of silently locking the target); O_NONBLOCK keeps a
+    # weirdly-held fd from half-blocking the open, and is cleared right
+    # after so LOCK_EX below keeps its normal blocking semantics.
+    if stat.S_ISLNK(os.lstat(d).st_mode):
+        raise OSError("refusing symlinked schedule state dir: %s" % d)
+    if os.path.lexists(lock_path) \
+            and stat.S_ISLNK(os.lstat(lock_path).st_mode):
+        raise OSError("refusing symlinked schedule lock: %s" % lock_path)
     with contextlib.suppress(OSError):
         os.chmod(d, 0o700)
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW
+                 | os.O_NONBLOCK, 0o600)
     try:
+        os.set_blocking(fd, True)
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             yield

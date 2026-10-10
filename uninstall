@@ -55,6 +55,17 @@ if [ -f "$SCHED_TIMER" ] || [ -f "$SCHED_UNIT" ]; then
     say "removed: tendril-schedule.timer + .service (scheduler disabled)"
 fi
 
+# the guardian timer units (contract §6): stop the 30 s tick before the
+# binaries it calls go away
+GUARD_UNIT="$HOME/.config/systemd/user/tendril-guardian.service"
+GUARD_TIMER="$HOME/.config/systemd/user/tendril-guardian.timer"
+if [ -f "$GUARD_TIMER" ] || [ -f "$GUARD_UNIT" ]; then
+    systemctl --user disable --now tendril-guardian.timer 2>/dev/null
+    rm -f "$GUARD_TIMER" "$GUARD_UNIT"
+    systemctl --user daemon-reload 2>/dev/null
+    say "removed: tendril-guardian.timer + .service (guardian disabled)"
+fi
+
 # client launchers installed by ./install --client (recognised by their header)
 for f in tendril tendril-remote; do
     if [ -f "$BIN_DIR/$f" ] && [ ! -L "$BIN_DIR/$f" ] \

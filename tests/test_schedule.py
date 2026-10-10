@@ -242,6 +242,48 @@ class StoreTests(Base):
         self.assertEqual([t["id"] for t in store["tasks"]], [good["id"]])
 
 
+class LockHardeningTests(Base):
+    """Security review: a symlinked lock or symlinked state dir must be
+    refused with a clear error before any chmod/write, and the symlink
+    target left untouched."""
+
+    def test_symlinked_lock_refused_target_untouched(self):
+        os.makedirs(self.dir)
+        victim = os.path.join(self.home, "victim.lock")
+        with open(victim, "w") as f:
+            f.write("do not touch")
+        os.chmod(victim, 0o644)
+        os.symlink(victim, self.store + ".lock")
+        with self.assertRaises(OSError) as cm:
+            with ts._locked(self.store + ".lock"):
+                pass
+        self.assertIn("symlink", str(cm.exception))
+        self.assertTrue(os.path.islink(self.store + ".lock"))
+        with open(victim) as f:
+            self.assertEqual(f.read(), "do not touch")
+        # the target was never chmod'ed either
+        self.assertEqual(oct(os.stat(victim).st_mode & 0o777), oct(0o644))
+
+    def test_symlinked_state_dir_refused(self):
+        real = os.path.join(self.home, "real-state")
+        os.makedirs(os.path.dirname(self.dir))
+        os.makedirs(real)
+        os.symlink(real, self.dir)
+        with self.assertRaises(OSError) as cm:
+            with ts._locked(self.store + ".lock"):
+                pass
+        self.assertIn("symlink", str(cm.exception))
+        self.assertEqual(os.listdir(real), [])     # nothing written through
+        self.assertTrue(os.path.islink(self.dir))
+
+    def test_plain_lock_still_locks(self):
+        os.makedirs(self.dir)
+        with ts._locked(self.store + ".lock"):
+            self.assertTrue(os.path.exists(self.store + ".lock"))
+        # lock file remains for the next flock cycle and is a plain file
+        self.assertTrue(os.path.isfile(self.store + ".lock"))
+
+
 class AddTests(Base):
     def test_add_at_task_is_queued(self):
         task = self.add()
@@ -1119,11 +1161,12 @@ class UnitInstallTests(Base):
             return (0 if self.active == "active" else 3), self.active, ""
         return 0, "", ""
 
-    def refresh(self, which_bins=("systemctl",), dry=False):
+    def refresh(self, which_bins=("systemctl",), dry=False, python=None):
         out = io.StringIO()
         rc = th.refresh_schedule(self.pkg, run=self.run_fake, dry_run=dry,
                                  out=out, home_dir=self.home,
-                                 which=lambda n: n in set(which_bins))
+                                 which=lambda n: n in set(which_bins),
+                                 python=python)
         return rc, out.getvalue()
 
     def test_install_then_idempotent(self):
@@ -1207,6 +1250,31 @@ class UnitInstallTests(Base):
         self.assertEqual(rc, 1)
         self.assertIn("cannot read", out)
 
+    def test_python_interpreter_is_templated_into_the_unit(self):
+        """Security review: the tick unit must run the install's resolved
+        $PYTHON (like the watcher unit does), not a hardcoded
+        /usr/bin/python3; the template keeps the refresh idempotent."""
+        with open(os.path.join(self.pkg, "systemd", th.SCHEDULE_UNIT),
+                  "w") as f:
+            f.write("[Service]\nType=oneshot\n"
+                    "ExecStart=/usr/bin/python3 %h/.local/bin/remote-agents"
+                    " schedule tick\n")
+        rc, out = self.refresh(python="/opt/py/bin/python3")
+        self.assertEqual(rc, 0)
+        with open(os.path.join(self.user_dir, th.SCHEDULE_UNIT)) as f:
+            body = f.read()
+        self.assertIn("ExecStart=/opt/py/bin/python3 %h/.local/bin"
+                      "/remote-agents schedule tick", body)
+        self.assertNotIn("/usr/bin/python3", body)
+        # the timer has no ExecStart and passes through untouched
+        with open(os.path.join(self.user_dir, th.SCHEDULE_TIMER)) as f:
+            self.assertEqual(f.read(), "# %s body\n" % th.SCHEDULE_TIMER)
+        # same python again → unchanged (the rendered body is compared)
+        self.calls = []
+        rc, out = self.refresh(python="/opt/py/bin/python3")
+        self.assertEqual(rc, 0)
+        self.assertIn("unchanged", out)
+
 
 class UnitFileTests(unittest.TestCase):
     def test_timer_directives_per_contract(self):
@@ -1226,6 +1294,11 @@ class UnitFileTests(unittest.TestCase):
             body = f.read()
         self.assertIn("Type=oneshot", body)
         self.assertIn("remote-agents schedule tick", body)
+        # security-review hardening (safe: herdr's socket lives in
+        # ~/.config/herdr, sd_notify's under $XDG_RUNTIME_DIR — neither
+        # is /tmp; the tick's writes go to ~/.cache + ~/.local/state)
+        self.assertIn("NoNewPrivileges=true", body)
+        self.assertIn("PrivateTmp=true", body)
 
 
 if __name__ == "__main__":

@@ -1497,6 +1497,11 @@ def _optional_sections():
         take("schedule", tendril_schedule.snapshot_section())
     except Exception:
         pass
+    try:
+        import tendril_health
+        take("health", tendril_health.snapshot_section())
+    except Exception:
+        pass
     return extra, caps
 
 
@@ -1526,7 +1531,7 @@ def _enforce_doc_cap(doc):
             break
         for a in victims:
             a["events"].pop(0)           # oldest of a newest-last list
-    for key in ("schedule", "capacity"):
+    for key in ("schedule", "capacity", "health"):
         if _doc_bytes(doc) <= _SNAPSHOT_MAX_BYTES:
             return
         doc.pop(key, None)
@@ -1802,6 +1807,86 @@ def _schedule_cmd(args):
     print("usage: remote-agents schedule tick|list [--json]|show <id>"
           "|add <b64url>|cancel <id>", file=sys.stderr)
     return 2
+
+
+# ---------- health/herdr: Herdr health & recovery (contract §6) ----------
+HEALTH_PUSH = {"offline": ("high", "rotating_light"),
+               "restored": ("default", "white_check_mark")}
+
+
+def _health_notifier():
+    """notifier(kind, title, body) pushing HERDR OFFLINE / HERDR RESTORED
+    via herdr-notify send() — same lazy wiring as _schedule_notifier; None
+    (a no-op) when the watcher is absent or ntfy is unconfigured. Click
+    target stays None on purpose: the notification opens the app, never a
+    pane (contract §6.2)."""
+    mod = _notify_module()
+    if mod is None:
+        return None
+    try:
+        cfg = mod.load_env()
+        if not mod.configured(cfg):
+            return None
+    except Exception:
+        return None
+
+    def notify(kind, title, body):
+        priority, tags = HEALTH_PUSH.get(kind, ("default", "bell"))
+        try:
+            mod.send(cfg, title, body, priority, tags, click=None)
+        except Exception:
+            pass                            # herdr-notify logs its own failures
+    return notify
+
+
+def _health_cmd(args):
+    """`health --json` — ONE bounded (≤ 3 s) JSON line describing Herdr's
+    state, the tendril install, and the three services; `health tick` —
+    one guardian observation (the systemd timer runs it every 30 s; it
+    NEVER restarts Herdr). Read-only besides the guardian state file."""
+    verb = args[0] if args else ""
+    try:
+        import tendril_health
+    except Exception:
+        print("no health module: tendril_health.py missing next to"
+              " remote-agents", file=sys.stderr)
+        return 1
+    if verb == "--json" and len(args) == 1:
+        doc = tendril_health.health_doc(host=HOST_LABEL, herdr=HERDR,
+                                        run=run)
+        print(json.dumps(doc, separators=(",", ":")))
+        return 0
+    if verb == "tick" and len(args) == 1:
+        summary = tendril_health.run_tick(host=HOST_LABEL, herdr=HERDR,
+                                          run=run,
+                                          notifier=_health_notifier())
+        print(json.dumps({"ok": True, "tick": summary},
+                         separators=(",", ":")))
+        return 0
+    print("usage: remote-agents health --json|tick", file=sys.stderr)
+    return 2
+
+
+def _herdr_cmd(args):
+    """`herdr restart|stop|start` — the fixed recovery verbs (contract
+    §6.1): argv-only start through Herdr's supported headless lifecycle,
+    VERIFIED before an ok; guard + rate limit per the contract. Reply is
+    ONE JSON line; exit 0 only on ok."""
+    verb = args[0] if args else ""
+    if verb not in ("restart", "stop", "start") or len(args) != 1:
+        print("usage: remote-agents herdr restart|stop|start",
+              file=sys.stderr)
+        return 2
+    try:
+        import tendril_health
+    except Exception:
+        print("no health module: tendril_health.py missing next to"
+              " remote-agents", file=sys.stderr)
+        return 1
+    doc = tendril_health.herdr_verb(verb, host=HOST_LABEL, herdr=HERDR,
+                                    run=run)
+    print(json.dumps(doc, separators=(",", ":")))
+    return 0 if doc.get("ok") else 1
 
 
 def _capacity_cmd(rest):
@@ -2304,6 +2389,20 @@ persistent AI agents.
                               enqueue {title, prompt, workspace, harness,
                               trigger} as one base64url JSON payload
   tendril schedule cancel <id> cancel a task that has not started running
+  tendril health --json      one bounded (≤ 3 s) JSON line: Herdr state
+                             (running|down|stopped|unknown), the tendril
+                             install, and the notify/scheduler/guardian
+                             services — no secrets, paths or pids (§6.1)
+  tendril health tick        one guardian observation (the user systemd
+                             timer runs this every 30 s; it NOTIFIES, it
+                             never restarts Herdr)
+  tendril herdr restart      the one safe revive: refuses the intentional-
+                             stop guard, rate limited 1/30 s, starts Herdr
+                             via its supported headless lifecycle and
+                             VERIFIES (status running + api snapshot ≤ 10 s)
+  tendril herdr stop         intentional stop: writes the stop guard, then
+                             stops Herdr (guard keeps the guardian silent)
+  tendril herdr start        clears the guard, then starts + verifies
   tendril service status|start|stop|restart|logs
                               the notification watcher, on launchd or systemd
   tendril --pair [--code | --manual]
@@ -2411,6 +2510,10 @@ def main():
         return _capacity_cmd(args[1:])
     if args[:1] == ["schedule"]:
         return _schedule_cmd(args[1:])
+    if args[:1] == ["health"]:
+        return _health_cmd(args[1:])
+    if args[:1] == ["herdr"]:
+        return _herdr_cmd(args[1:])
     if args[:1] == ["service"]:
         return _service(args[1:])
     if len(args) == 2 and args[0] in SUBCOMMANDS:
@@ -2429,6 +2532,8 @@ def main():
         print("       remote-agents snapshot [--json] - LIVE MAP JSON for the Link app",
               file=sys.stderr)
         print("       remote-agents capacity [--json] [--refresh] | capacity status",
+              file=sys.stderr)
+        print("       remote-agents health --json|tick | herdr restart|stop|start",
               file=sys.stderr)
         print("       remote-agents capacity enable|disable "
               "<claude_oauth|codex_wham|zai_quota>", file=sys.stderr)

@@ -33,6 +33,13 @@
 #                                 no Mosh): id is t-YYYYMMDD-8hex, payload is
 #                                 1..16384 base64url chars (A-Z a-z 0-9 _ -)
 #   tendril [<alias>] capacity   host capacity report (JSON) over plain SSH
+#   tendril [<alias>] health     host health report (JSON) over plain SSH:
+#                                Herdr state + tendril/services — the Link
+#                                app's failure classifier (contract §6.3)
+#   tendril [<alias>] herdr restart
+#                                the one safe, VERIFIED revive (contract
+#                                §6.1); fixed strings only — stop/start are
+#                                host-side verbs and are refused here
 #   tendril link                 open the TENDRIL Link app on THIS device
 #                                (Termux: am start; LOCAL ONLY — no ssh, no
 #                                alias, no args, never a URI from input)
@@ -94,7 +101,7 @@ no_alias_help() {
     echo "  set a default:  echo <alias> > ~/.config/tendril/alias"
     echo "                  (or: echo 'export TENDRIL_ALIAS=<alias>' >> ~/.bashrc)"
     echo "usage: tendril [<alias>] [attach|enter|resolve|focus|link <session-id>|snapshot] | tendril ssh <alias>"
-    echo "       tendril [<alias>] [schedule show|cancel <id> | schedule add <payload> | capacity] | tendril link"
+    echo "       tendril [<alias>] [schedule show|cancel <id> | schedule add <payload> | capacity | health | herdr restart] | tendril link"
     echo "first time: see docs/ANDROID.md or docs/MACOS.md — create a key, then: ssh-copy-id <alias>"
 }
 
@@ -175,6 +182,17 @@ else
         capacity)
             [ "$#" -eq 1 ] || { echo "usage: tendril [<alias>] capacity"; exit 2; }
             MODE="capacity"; ALIAS="$DEFAULT_ALIAS" ;;
+        health)
+            [ "$#" -eq 1 ] || { echo "usage: tendril [<alias>] health"; exit 2; }
+            MODE="health"; ALIAS="$DEFAULT_ALIAS" ;;
+        herdr)
+            # contract §6.1: the phone may ask for the verified RESTART
+            # only — stop/start are host-user verbs and are refused here.
+            if [ "$#" -eq 2 ] && [ "$2" = "restart" ]; then
+                MODE="herdr"; ALIAS="$DEFAULT_ALIAS"
+            else
+                echo "usage: tendril [<alias>] herdr restart"; exit 2
+            fi ;;
         schedule)
             { [ "$#" -eq 2 ] || [ "$#" -eq 3 ]; } || { echo "usage: tendril [<alias>] schedule show|add|cancel <arg>"; exit 2; }
             MODE="schedule"; ALIAS="$DEFAULT_ALIAS"; SCHED_SUB="${2:-}"; SCHED_ARG="${3:-}" ;;
@@ -188,6 +206,15 @@ else
                 capacity)
                     [ "$#" -eq 2 ] || { echo "usage: tendril [<alias>] capacity"; exit 2; }
                     MODE="capacity"; ALIAS="$1" ;;
+                health)
+                    [ "$#" -eq 2 ] || { echo "usage: tendril [<alias>] health"; exit 2; }
+                    MODE="health"; ALIAS="$1" ;;
+                herdr)
+                    if [ "$#" -eq 3 ] && [ "$3" = "restart" ]; then
+                        MODE="herdr"; ALIAS="$1"
+                    else
+                        echo "usage: tendril [<alias>] herdr restart"; exit 2
+                    fi ;;
                 schedule)
                     { [ "$#" -eq 3 ] || [ "$#" -eq 4 ]; } || { echo "usage: tendril [<alias>] schedule show|add|cancel <arg>"; exit 2; }
                     MODE="schedule"; ALIAS="$1"; SCHED_SUB="${3:-}"; SCHED_ARG="${4:-}" ;;
@@ -203,6 +230,14 @@ if [ "$MODE" = "snapshot" ]; then
 elif [ "$MODE" = "capacity" ]; then
     # capacity is read-only and takes NO arguments: a fixed remote command.
     REMOTE_CMD="$REMOTE_BIN capacity --json"
+elif [ "$MODE" = "health" ]; then
+    # health is read-only and takes NO arguments: a fixed remote command
+    # (contract §6.1; bounded probes server-side, ≤ 3 s).
+    REMOTE_CMD="$REMOTE_BIN health --json"
+elif [ "$MODE" = "herdr" ]; then
+    # only the verified restart is reachable from the phone (§6.1):
+    # fixed strings, no argument of any kind is forwarded.
+    REMOTE_CMD="$REMOTE_BIN herdr restart"
 elif [ "$MODE" = "schedule" ]; then
     # LINK-CONTRACT-0.2 §4: the sub and its argument are validated against
     # the contract regexes HERE, then single-quoted into the remote command.
@@ -260,7 +295,7 @@ fi
 # hanging session.
 case "$MODE" in
     resolve | focus | link) exec ssh "$ALIAS" "$REMOTE_CMD" ;;
-    snapshot | schedule | capacity)
+    snapshot | schedule | capacity | health | herdr)
         exec ssh -o BatchMode=yes -o ConnectTimeout=6 "$ALIAS" "$REMOTE_CMD" ;;
 esac
 

@@ -324,7 +324,7 @@ upgrade_install() {
        && cmp -s "$BIN_DIR/herdr-notify" "$PKG_DIR/bin/herdr-notify"; then
         BIN_CHANGED=0
     fi
-    for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py tendril_upgrade.py tendril_phone.py tendril_telemetry.py tendril_schedule.py; do
+    for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py tendril_upgrade.py tendril_phone.py tendril_telemetry.py tendril_schedule.py tendril_health.py; do
         [ -f "$BIN_DIR/$f" ] && backup "$BIN_DIR/$f"
         act "install $BIN_DIR/$f" install -m 755 "$PKG_DIR/bin/$f" "$BIN_DIR/$f"
     done
@@ -361,9 +361,16 @@ upgrade_install() {
     # scheduler timer units: content-diffed install, enable --now only on
     # change; a launchd host is the documented no-op (tendril_host.py)
     if [ "$DRY_RUN" = "1" ]; then
-        python3 "$HOST_HELPER" schedule-unit refresh --pkg "$PKG_DIR" --dry-run
+        python3 "$HOST_HELPER" schedule-unit refresh --pkg "$PKG_DIR" --python "$PYTHON" --dry-run
     else
-        python3 "$HOST_HELPER" schedule-unit refresh --pkg "$PKG_DIR"
+        python3 "$HOST_HELPER" schedule-unit refresh --pkg "$PKG_DIR" --python "$PYTHON"
+    fi
+    # guardian timer units (contract §6): same content-diffed install; the
+    # tick notifies on Herdr crashes and never restarts anything
+    if [ "$DRY_RUN" = "1" ]; then
+        python3 "$HOST_HELPER" guardian-unit refresh --pkg "$PKG_DIR" --python "$PYTHON" --dry-run
+    else
+        python3 "$HOST_HELPER" guardian-unit refresh --pkg "$PKG_DIR" --python "$PYTHON"
     fi
     say ""
 
@@ -582,7 +589,7 @@ else
     printf '%s\n' "$CONF_BODY" > "$CONFIG"
     chmod 600 "$CONFIG"
 fi
-for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py tendril_upgrade.py tendril_phone.py tendril_telemetry.py tendril_schedule.py; do
+for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py tendril_upgrade.py tendril_phone.py tendril_telemetry.py tendril_schedule.py tendril_health.py; do
     [ -f "$BIN_DIR/$f" ] && backup "$BIN_DIR/$f"
     act "install $BIN_DIR/$f" install -m 755 "$PKG_DIR/bin/$f" "$BIN_DIR/$f"
 done
@@ -724,9 +731,16 @@ fi
 # scheduler timer units: content-diffed install, enable --now only on
 # change; a launchd host is the documented no-op (tendril_host.py)
 if [ "$DRY_RUN" = "1" ]; then
-    python3 "$HOST_HELPER" schedule-unit refresh --pkg "$PKG_DIR" --dry-run
+    python3 "$HOST_HELPER" schedule-unit refresh --pkg "$PKG_DIR" --python "$PYTHON" --dry-run
 else
-    python3 "$HOST_HELPER" schedule-unit refresh --pkg "$PKG_DIR"
+    python3 "$HOST_HELPER" schedule-unit refresh --pkg "$PKG_DIR" --python "$PYTHON"
+fi
+# guardian timer units (contract §6): same content-diffed install; the
+# tick notifies on Herdr crashes and never restarts anything
+if [ "$DRY_RUN" = "1" ]; then
+    python3 "$HOST_HELPER" guardian-unit refresh --pkg "$PKG_DIR" --python "$PYTHON" --dry-run
+else
+    python3 "$HOST_HELPER" guardian-unit refresh --pkg "$PKG_DIR" --python "$PYTHON"
 fi
 say ""
 

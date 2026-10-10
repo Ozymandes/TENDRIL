@@ -26,6 +26,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import tempfile
 import time
 import unittest
@@ -1376,3 +1377,45 @@ class PhaseAndEvents(Base):
                          "subagent"} <= kinds)
         self.assertNotIn("SECRET-CMD", json.dumps(res))
 
+
+
+class CacheWrites(Base):
+    """Security review: the telemetry cache writer must use a unique
+    mkstemp name (a fixed `.tmp` lets two interleaved writers corrupt
+    each other), fsync, os.replace and land at 0600."""
+
+    def test_stale_fixed_tmp_never_poisons_writes(self):
+        os.makedirs(os.path.dirname(self.cache), exist_ok=True)
+        with open(self.cache + ".tmp", "w") as f:
+            f.write('{"stale": ')               # leftover from an old writer
+        tt._save_cache(self.cache, {"a": 1})
+        tt._save_cache(self.cache, {"a": 2})
+        with open(self.cache) as f:
+            self.assertEqual(json.load(f), {"a": 2})
+
+    def test_concurrent_writers_never_produce_corrupt_json(self):
+        docs = [{"writer": i} for i in range(2)]
+        errors = []
+
+        def writer(doc):
+            try:
+                for _ in range(40):
+                    tt._save_cache(self.cache, doc)
+            except Exception as exc:            # must never raise
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer, args=(d,)) for d in docs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        with open(self.cache) as f:             # valid JSON, one writer won
+            self.assertIn(json.load(f), docs)
+        litter = [f for f in os.listdir(os.path.dirname(self.cache))
+                  if f.startswith(".telemetry-")]
+        self.assertEqual(litter, [])
+
+    def test_cache_written_0600(self):
+        tt._save_cache(self.cache, {"a": 1})
+        self.assertEqual(oct(os.stat(self.cache).st_mode & 0o777), oct(0o600))

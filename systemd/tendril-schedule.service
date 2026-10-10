@@ -5,3 +5,11 @@ After=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/python3 %h/.local/bin/remote-agents schedule tick
+# Hardening: NoNewPrivileges — the tick never needs setuid helpers.
+# PrivateTmp is safe: herdr's socket lives in ~/.config/herdr and the
+# watcher's sd_notify socket is under $XDG_RUNTIME_DIR, neither of which
+# private-tmp virtualizes (only /tmp and /var/tmp). ProtectSystem is
+# deliberately NOT set — the tick writes ~/.cache/tendril and
+# ~/.local/state/tendril.
+NoNewPrivileges=true
+PrivateTmp=true

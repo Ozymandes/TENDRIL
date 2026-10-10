@@ -1,0 +1,12 @@
+[Unit]
+Description=Run the TENDRIL herdr guardian tick every 30 s (contract §6)
+
+[Timer]
+OnBootSec=60s
+OnUnitActiveSec=30s
+Persistent=true
+AccuracySec=5s
+Unit=tendril-guardian.service
+
+[Install]
+WantedBy=timers.target

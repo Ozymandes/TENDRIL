@@ -70,7 +70,7 @@ SNAPSHOT = {"result": {"snapshot": {
 }}}
 
 DOC_KEYS = {"version", "host", "generated_at", "focused_workspace",
-            "focused_pane", "workspaces", "capabilities"}
+            "focused_pane", "workspaces", "capabilities", "health"}
 WS_KEYS = {"id", "label", "number", "focused", "agents"}
 AGENT_KEYS = {"pane_id", "tab_id", "agent", "status", "focused",
               "harness"}
@@ -340,13 +340,14 @@ class OptionalSections(unittest.TestCase):
     (section_dict | None, capability_string). Absence, failure or an empty
     section omits BOTH the section and the capability."""
 
-    def call(self, cap="absent", sched="absent"):
+    def call(self, cap="absent", sched="absent", health="absent"):
         # NOTE: sibling modules may be importable depending on ambient
         # sys.path (other test files insert REPO/bin), so every case pins
-        # BOTH module slots explicitly: None makes `import` raise.
+        # ALL module slots explicitly: None makes `import` raise.
         mods = {}
         for key, val in (("tendril_capacity", cap), ("tendril_schedule",
-                                                     sched)):
+                                                     sched),
+                         ("tendril_health", health)):
             if val == "absent" or val is None:
                 mods[key] = None            # `import` raises ImportError
             else:
@@ -393,6 +394,7 @@ class OptionalSections(unittest.TestCase):
         cap = ({"generated_at": 7, "providers": [{"id": "claude"}]},
                "capacity")
         sched = ({"available": True, "tasks": []}, "schedule")
+        health = ({"available": True}, "health")
 
         def fake_run(args, timeout=6):
             if args[1:] == ["api", "snapshot"]:
@@ -403,7 +405,9 @@ class OptionalSections(unittest.TestCase):
                 "tendril_capacity": _fake_module("tendril_capacity",
                                                  lambda budget_s=1.0: cap),
                 "tendril_schedule": _fake_module("tendril_schedule",
-                                                 lambda: sched)}), \
+                                                 lambda: sched),
+                "tendril_health": _fake_module("tendril_health",
+                                               lambda: health)}), \
              mock.patch.object(ra, "HERDR", "herdr"), \
              mock.patch.object(ra, "HOST_LABEL", "testhost"), \
              mock.patch.object(ra, "run", fake_run):
@@ -411,8 +415,9 @@ class OptionalSections(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(doc["capacity"]["generated_at"], 7)
         self.assertEqual(doc["schedule"], {"available": True, "tasks": []})
+        self.assertEqual(doc["health"], {"available": True})
         self.assertEqual(doc["capabilities"],
-                         ["subagents", "capacity", "schedule"])
+                         ["subagents", "capacity", "schedule", "health"])
         self.assertLessEqual(ra._doc_bytes(doc), ra._SNAPSHOT_MAX_BYTES)
 
     def test_hook_failure_omits_the_section_from_the_doc(self):
@@ -426,7 +431,8 @@ class OptionalSections(unittest.TestCase):
 
         with mock.patch.dict(sys.modules, {
                 "tendril_capacity": _fake_module("tendril_capacity", boom),
-                "tendril_schedule": None}), \
+                "tendril_schedule": None,
+                "tendril_health": None}), \
              mock.patch.object(ra, "HERDR", "herdr"), \
              mock.patch.object(ra, "HOST_LABEL", "testhost"), \
              mock.patch.object(ra, "run", fake_run):
@@ -434,6 +440,7 @@ class OptionalSections(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("capacity", doc)
         self.assertNotIn("schedule", doc)
+        self.assertNotIn("health", doc)
         self.assertEqual(doc["capabilities"], ["subagents"])
 
 

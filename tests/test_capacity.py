@@ -20,6 +20,7 @@ Under test (docs/LINK-CONTRACT-0.2.md, all fixtures synthetic):
 - budget behaviour: snapshot_section serves the cache or scans within its
   budget; progress is incremental across calls.
 """
+import http.server
 import importlib.util
 import json
 import os
@@ -27,6 +28,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import urllib.error
@@ -141,11 +143,15 @@ class Base(unittest.TestCase):
 
 
 class _FakeResp:
-    def __init__(self, body):
+    def __init__(self, body, url=""):
         self.body = body if isinstance(body, bytes) else body.encode()
+        self.url = url
 
     def read(self, n=-1):
         return self.body if n < 0 else self.body[:n]
+
+    def geturl(self):
+        return self.url
 
     def __enter__(self):
         return self
@@ -155,7 +161,9 @@ class _FakeResp:
 
 
 def fake_urllib(body=None, code=200, exc=None):
-    """Build a urlopen stand-in; records (url, headers, timeout) per call."""
+    """Build an opener.open stand-in; records (url, headers, timeout)
+    per call. Patches tendril_capacity._OPENER.open — the no-redirect
+    opener _http_get_json actually uses."""
     calls = []
 
     def handler(req, timeout=None):                     # noqa: ARG001
@@ -167,7 +175,7 @@ def fake_urllib(body=None, code=200, exc=None):
         if code != 200:
             raise urllib.error.HTTPError(req.get_full_url(), code,
                                          "fake", None, None)
-        return _FakeResp(body)
+        return _FakeResp(body, req.get_full_url())
 
     handler.calls = calls
     return handler
@@ -534,6 +542,57 @@ class TestScanAndCache(Base):
         self.assertIsInstance(sec, dict)
 
 
+class TestCacheWrites(Base):
+    """Security review: the cache/config writers must use a unique
+    mkstemp name (a fixed `.tmp` lets two interleaved writers corrupt
+    each other), fsync, os.replace and land at 0600."""
+
+    def test_stale_fixed_tmp_never_poisons_writes(self):
+        os.makedirs(os.path.dirname(self.cache), exist_ok=True)
+        with open(self.cache + ".tmp", "w") as f:
+            f.write('{"stale": ')               # leftover from an old writer
+        tc._save_cache({"built_at": NOW}, self.cache)
+        tc._save_cache({"built_at": NOW, "n": 2}, self.cache)
+        self.assertEqual(tc._load_cache(self.cache),
+                         {"built_at": NOW, "n": 2})
+
+    def test_concurrent_writers_never_produce_corrupt_json(self):
+        import threading
+        docs = [{"writer": i, "built_at": NOW} for i in range(2)]
+        errors = []
+
+        def writer(doc):
+            try:
+                for _ in range(40):
+                    tc._save_cache(doc, self.cache)
+            except Exception as exc:            # must never raise
+                errors.append(exc)
+
+        threads = [threading.Thread(target=writer, args=(d,)) for d in docs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(errors, [])
+        loaded = tc._load_cache(self.cache)     # _load_cache: {} on garbage
+        self.assertIn(loaded, docs)
+        litter = [f for f in os.listdir(os.path.dirname(self.cache))
+                  if f.startswith(".capacity-")]
+        self.assertEqual(litter, [])
+
+    def test_cache_and_config_written_0600(self):
+        tc._save_cache({"built_at": NOW}, self.cache)
+        self.assertEqual(oct(os.stat(self.cache).st_mode & 0o777),
+                         oct(0o600))
+        self.assertTrue(tc.set_enabled("claude_oauth", True,
+                                       home=self.home))
+        cfg = os.path.join(self.home, ".config", "tendril", "capacity.json")
+        self.assertEqual(oct(os.stat(cfg).st_mode & 0o777), oct(0o600))
+        with open(cfg) as f:
+            self.assertEqual(json.load(f), {"enabled": ["claude_oauth"]})
+        self.assertFalse(os.path.exists(cfg + ".tmp"))
+
+
 # ---------- network adapters (mocked; NO real network) ----------
 class TestNetwork(Base):
     def setUp(self):
@@ -549,21 +608,65 @@ class TestNetwork(Base):
 
     def test_no_fetch_without_optin(self):
         fake = fake_urllib(body="{}")
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             self.collect(refresh=True, budget_s=30)
         self.assertEqual(fake.calls, [])
 
     def test_no_fetch_below_network_budget(self):
         self._enabled_home()
         fake = fake_urllib(body="{}")
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             self.collect(refresh=False, budget_s=5.0)   # 5 < 11 s
         self.assertEqual(fake.calls, [])
+
+    def test_redirect_refused_bearer_never_resent(self):
+        """Security review: a 302 must not let urllib re-send the
+        Authorization header to the redirect target. The no-redirect
+        opener classifies the redirect as "net" and makes no second
+        request at all — verified against a real local server."""
+        hits = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                hits.append(self.path)
+                if self.path == "/":
+                    self.send_response(302)
+                    self.send_header("Location", "/final")
+                    self.end_headers()
+                else:
+                    body = b"{\"steal\": true}"
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)          # LIFO: shutdown, then close
+        url = "http://127.0.0.1:%d/" % srv.server_port
+        kind, data = tc._http_get_json(url, "Bearer-goes-here", None)
+        self.assertEqual((kind, data), ("net", None))
+        self.assertEqual(hits, ["/"], "no request may follow the redirect")
+
+    def test_redirect_responses_are_classified_net(self):
+        """The opener raises HTTPError for a refused 3xx; every redirect
+        class must come back as "net", never "http" (retryable) or data."""
+        for code in (301, 302, 303, 307, 308):
+            fake = fake_urllib(code=code)
+            with mock.patch.object(tc._OPENER, "open", fake):
+                kind, data = tc._http_get_json(
+                    "https://capacity.example.test/u", "tok", None)
+            self.assertEqual((kind, data), ("net", None), "code %d" % code)
 
     def test_oauth_iso_fetch(self):
         self._enabled_home()
         fake = fake_urllib(body=self.fixture("oauth_iso.json"))
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             rec = self.prov("claude")
         self.assertEqual(len(fake.calls), 1)
         url, headers, timeout = fake.calls[0]
@@ -586,7 +689,7 @@ class TestNetwork(Base):
     def test_oauth_epoch_resets_exhausted(self):
         self._enabled_home()
         fake = fake_urllib(body=self.fixture("oauth_epoch.json"))
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             rec = self.prov("claude")
         self.assertEqual(rec["state"], "exhausted")    # 99.5 ≥ 98
         kinds = {w["kind"]: w for w in rec["windows"]}
@@ -595,7 +698,7 @@ class TestNetwork(Base):
     def test_wham_fetch(self):
         self._enabled_home("codex_wham", "codex")
         fake = fake_urllib(body=self.fixture("wham.json"))
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             rec = self.prov("codex")
         self.assertEqual(rec["source"], "codex_wham")
         self.assertEqual(rec["state"], "ready")        # worst 50.0
@@ -611,7 +714,7 @@ class TestNetwork(Base):
     def test_zai_buckets_and_utilization_forms(self):
         self._enabled_home("zai_quota", "pi")
         fake = fake_urllib(body=self.fixture("zai_buckets.json"))
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             rec = self.prov("zai")
         self.assertEqual(rec["source"], "zai_quota")
         self.assertEqual(rec["harness"], "pi")
@@ -622,7 +725,7 @@ class TestNetwork(Base):
         self.assertEqual(rec["state"], "critical")
         # direct-form fallback
         fake = fake_urllib(body=self.fixture("zai_forms.json"))
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             rec = self.prov("zai", now=NOW + tc.NET_MIN_S + 1)
         kinds = {w["kind"]: w for w in rec["windows"]}
         self.assertEqual(kinds["session"]["used_pct"], 25.0)
@@ -634,7 +737,7 @@ class TestNetwork(Base):
     def test_missing_credential_is_nocred_no_fetch(self):
         self.enable("claude_oauth")                   # no cred file at all
         fake = fake_urllib(body="{}")
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             self.collect(refresh=True, budget_s=30)
         self.assertEqual(fake.calls, [])
         st = tc._load_cache(self.cache)["net"]["claude_oauth"]
@@ -643,16 +746,16 @@ class TestNetwork(Base):
     def test_401_marks_auth_and_never_retries_until_change(self):
         self._enabled_home()
         fake = fake_urllib(code=401)
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             self.collect(refresh=True, budget_s=30)
         self.assertEqual(len(fake.calls), 1)
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             self.collect(refresh=True, budget_s=30, now=NOW + 99999)
         self.assertEqual(len(fake.calls), 1)          # dead until it changes
         # a config change (disable + enable) revives it
         self.assertTrue(tc.set_enabled("claude_oauth", False, home=self.home))
         self.assertTrue(tc.set_enabled("claude_oauth", True, home=self.home))
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             self.collect(refresh=True, budget_s=30, now=NOW + 199999)
         self.assertEqual(len(fake.calls), 2)
 
@@ -660,29 +763,29 @@ class TestNetwork(Base):
         cred_path = self.cred("claude")
         self.enable("claude_oauth")
         fake = fake_urllib(code=401)
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             self.collect(refresh=True, budget_s=30)
         self.assertEqual(len(fake.calls), 1)
         with open(cred_path, "w") as f:
             f.write(self.fixture("credentials_claude.json").replace(
                 "h2r-claude", "h2r-claude-2"))
         os.utime(cred_path, (time.time() + 5, time.time() + 5))
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             self.collect(refresh=True, budget_s=30, now=NOW + 9999)
         self.assertEqual(len(fake.calls), 2)
 
     def test_429_backoff_doubles(self):
         self._enabled_home()
         fake = fake_urllib(code=429)
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             self.collect(refresh=True, budget_s=30)          # fail 1
         st = tc._load_cache(self.cache)["net"]["claude_oauth"]
         self.assertEqual(st["fail"], "rate")
         self.assertEqual(st["backoff"], 600)                 # 2 × 300
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             self.collect(refresh=True, budget_s=30, now=NOW + 100)
         self.assertEqual(len(fake.calls), 1)                 # still backing off
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             self.collect(refresh=True, budget_s=30, now=NOW + 700)
         self.assertEqual(len(fake.calls), 2)                 # fail 2
         st = tc._load_cache(self.cache)["net"]["claude_oauth"]
@@ -691,23 +794,23 @@ class TestNetwork(Base):
     def test_shape_failure_then_interval_gate(self):
         self._enabled_home()
         fake = fake_urllib(body="this is not json")
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             rec = self.prov("claude")
         self.assertIsNone(rec)                         # no data ⇒ absent
         st = tc._load_cache(self.cache)["net"]["claude_oauth"]
         self.assertEqual(st["fail"], "shape")
         self.assertEqual(st["backoff"], 600)           # 2 × 300 s
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             self.collect(refresh=True, budget_s=30, now=NOW + 60)
         self.assertEqual(len(fake.calls), 1)           # still backing off
         fake2 = fake_urllib(body=self.fixture("oauth_iso.json"))
-        with mock.patch("urllib.request.urlopen", fake2):
+        with mock.patch.object(tc._OPENER, "open", fake2):
             self.collect(refresh=True, budget_s=30, now=NOW + 700)
         self.assertEqual(len(fake2.calls), 1)          # backoff elapsed: retry
-        with mock.patch("urllib.request.urlopen", fake2):
+        with mock.patch.object(tc._OPENER, "open", fake2):
             self.collect(refresh=True, budget_s=30, now=NOW + 900)
         self.assertEqual(len(fake2.calls), 1)          # 200 s < 300 s interval
-        with mock.patch("urllib.request.urlopen", fake2):
+        with mock.patch.object(tc._OPENER, "open", fake2):
             rec = self.prov("claude", now=NOW + 1100)
         self.assertEqual(len(fake2.calls), 2)          # due again
         self.assertEqual(rec["state"], "critical")
@@ -716,7 +819,7 @@ class TestNetwork(Base):
         self._enabled_home()
         boom = RuntimeError("urllib exploded: " + MARKER)
         fake = fake_urllib(exc=boom)
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             self.collect(refresh=True, budget_s=30)
         st = tc._load_cache(self.cache)["net"]["claude_oauth"]
         self.assertEqual(st["fail"], "net")
@@ -729,7 +832,7 @@ class TestNetwork(Base):
     def test_secrets_never_reach_cache_or_section(self):
         self._enabled_home()
         fake = fake_urllib(body=self.fixture("oauth_iso.json"))
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             sec = self.collect(refresh=True, budget_s=30)
         no_leak(self, MARKER, json.dumps(sec), "section")
         cached = self._cache_bytes()
@@ -742,7 +845,7 @@ class TestNetwork(Base):
         self.put(".config/tendril/capacity.json",
                  self.fixture("config_junk.json"))
         fake = fake_urllib(body="{}")
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(tc._OPENER, "open", fake):
             self.collect(refresh=True, budget_s=30)
         self.assertEqual(fake.calls, [])
         self.assertEqual(tc.enabled_ids(self.home), [])

@@ -33,6 +33,8 @@ LABEL = "com.tendril.herdr-notify"
 UNIT = "herdr-notify.service"
 SCHEDULE_UNIT = "tendril-schedule.service"
 SCHEDULE_TIMER = "tendril-schedule.timer"
+GUARDIAN_UNIT = "tendril-guardian.service"
+GUARDIAN_TIMER = "tendril-guardian.timer"
 TAILSCALE_APP = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
 # Where macOS package managers put binaries. Neither is on the PATH that
 # sshd hands a non-interactive session (`/usr/bin:/bin:/usr/sbin:/sbin`).
@@ -552,8 +554,17 @@ class Systemd(_Backend):
         return "journalctl --user -u herdr-notify -f"
 
 
+def _render_unit(body, python):
+    """Template the ExecStart interpreter the way the watcher install gets
+    $PYTHON (`service install --python "$PYTHON"`): swap the unit's
+    literal /usr/bin/python3 token for the resolved interpreter. The
+    timer has no ExecStart and passes through unchanged."""
+    return re.sub(r"(ExecStart=)/usr/bin/python3(?=\s)",
+                  lambda m: m.group(1) + python, body, count=1)
+
+
 def refresh_schedule(pkg_dir, run=_run, dry_run=False, out=None,
-                     home_dir=None, which=shutil.which):
+                     home_dir=None, which=shutil.which, python=None):
     """Install/refresh the scheduler units (tendril-schedule.service and
     tendril-schedule.timer, LINK-CONTRACT-0.2 §3) beside the watcher unit,
     mirroring the watcher refresh: write each unit only when its content
@@ -579,6 +590,9 @@ def refresh_schedule(pkg_dir, run=_run, dry_run=False, out=None,
         try:
             with open(src, "rb") as f:
                 body = f.read()
+            if python and name == SCHEDULE_UNIT:
+                body = _render_unit(body.decode("utf-8"),
+                                    python).encode("utf-8")
         except OSError as exc:
             print("  scheduler: cannot read %s: %s" % (src, exc), file=out)
             return 1
@@ -618,6 +632,84 @@ def refresh_schedule(pkg_dir, run=_run, dry_run=False, out=None,
         return 0
     rc, _, _ = run(["systemctl", "--user", "enable", "--now", SCHEDULE_TIMER], 8)
     print("  scheduler: timer was inactive - %s"
+          % ("enabled" if rc == 0 else "enable FAILED"), file=out)
+    return 0 if rc == 0 else 1
+
+
+def refresh_guardian(pkg_dir, run=_run, dry_run=False, out=None,
+                     home_dir=None, which=shutil.which, python=None):
+    """Install/refresh the guardian units (tendril-guardian.service and
+    tendril-guardian.timer, LINK-CONTRACT-0.2 §6) beside the scheduler
+    units: write each unit only when its content differs, daemon-reload
+    only when something was written, and `enable --now` the timer only
+    then (or when it is not active). A launchd host or a machine without
+    a user systemd is the documented no-op (the guardian can be run by
+    hand: `remote-agents health tick`). Never raises; 0 ok.
+
+    Self-contained on purpose: refresh_schedule (the scheduler's own
+    refresh) is left strictly alone so the two refreshes never conflict.
+    """
+    out = out or sys.stdout
+    if which("launchctl"):
+        # launchd host (backend()'s precedence): no user systemd timer
+        print("  guardian: launchd host - no systemd timer; run"
+              " `remote-agents health tick` by hand", file=out)
+        return 0
+    if not which("systemctl"):
+        print("  guardian: no systemctl - enable tendril-guardian.timer by"
+              " hand", file=out)
+        return 0
+    unit_dir = os.path.join(home_dir or home(), ".config", "systemd", "user")
+    changed = []
+    for name in (GUARDIAN_UNIT, GUARDIAN_TIMER):
+        src = os.path.join(pkg_dir, "systemd", name)
+        dst = os.path.join(unit_dir, name)
+        try:
+            with open(src, "rb") as f:
+                body = f.read()
+            if python and name == GUARDIAN_UNIT:
+                body = _render_unit(body.decode("utf-8"),
+                                    python).encode("utf-8")
+        except OSError as exc:
+            print("  guardian: cannot read %s: %s" % (src, exc), file=out)
+            return 1
+        try:
+            with open(dst, "rb") as f:
+                current = f.read()
+        except OSError:
+            current = None
+        if current == body:
+            print("  guardian: %s unchanged" % name, file=out)
+            continue
+        changed.append(name)
+        if dry_run:
+            print("  [dry-run] guardian: install %s" % dst, file=out)
+            continue
+        os.makedirs(unit_dir, exist_ok=True)
+        _atomic_write(dst, body, 0o600)
+        print("  guardian: installed %s" % name, file=out)
+    if dry_run:
+        print("  [dry-run] guardian: daemon-reload + enable --now %s"
+              % GUARDIAN_TIMER, file=out)
+        return 0
+    if changed:
+        run(["systemctl", "--user", "daemon-reload"], 8)
+        rc, _, _ = run(["systemctl", "--user", "enable", "--now",
+                        GUARDIAN_TIMER], 8)
+        print("  guardian: timer %s" % ("enabled" if rc == 0
+                                         else "enable FAILED"), file=out)
+        return 0 if rc == 0 else 1
+    dst = os.path.join(unit_dir, GUARDIAN_TIMER)
+    if not os.path.isfile(dst):
+        print("  guardian: timer not installed - skipped", file=out)
+        return 0
+    _, state, _ = run(["systemctl", "--user", "is-active", GUARDIAN_TIMER], 5)
+    if state.strip() == "active":
+        print("  guardian: timer active", file=out)
+        return 0
+    rc, _, _ = run(["systemctl", "--user", "enable", "--now",
+                    GUARDIAN_TIMER], 8)
+    print("  guardian: timer was inactive - %s"
           % ("enabled" if rc == 0 else "enable FAILED"), file=out)
     return 0 if rc == 0 else 1
 
@@ -801,7 +893,14 @@ def main(argv=None):
             and words[1] in ("install", "refresh"):
         pkg = _opt(argv, "--pkg", os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))))
-        return refresh_schedule(pkg, dry_run=dry)
+        py = _opt(argv, "--python", sys.executable)
+        return refresh_schedule(pkg, dry_run=dry, python=py)
+    if words[:1] == ["guardian-unit"] and len(words) == 2 \
+            and words[1] in ("install", "refresh"):
+        pkg = _opt(argv, "--pkg", os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        py = _opt(argv, "--python", sys.executable)
+        return refresh_guardian(pkg, dry_run=dry, python=py)
     if words[:1] == ["service"] and len(words) == 2:
         verb = words[1]
         b = backend(dry_run=dry)

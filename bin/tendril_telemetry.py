@@ -48,6 +48,7 @@ import os
 import re
 import shlex
 import stat
+import tempfile
 import time
 from datetime import datetime, timezone
 
@@ -757,13 +758,29 @@ def _load_cache(path):
 
 def _save_cache(path, cache):
     try:
-        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(cache, f, separators=(",", ":"))
-        os.replace(tmp, path)
+        d = os.path.dirname(path)
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        body = json.dumps(cache, separators=(",", ":")).encode("utf-8")
+        fd, tmp = tempfile.mkstemp(prefix=".telemetry-", dir=d)
         try:
-            os.chmod(path, 0o600)
+            with os.fdopen(fd, "wb") as f:
+                f.write(body)
+                f.flush()
+                os.fsync(f.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+        try:
+            dfd = os.open(d, os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
         except OSError:
             pass
     except OSError:
