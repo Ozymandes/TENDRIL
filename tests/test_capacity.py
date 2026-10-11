@@ -189,10 +189,11 @@ class TestTokenAccounting(Base):
     def test_docstring_documents_the_definition(self):
         with open(CAP, encoding="utf-8") as f:
             doc = f.read().split('"""', 2)[1]
-        self.assertIn("cache_read_input_tokens EXCLUDED", doc)
+        self.assertIn("cache_read_input_tokens → cache_read", doc)
         self.assertIn("input_tokens - cached_input_tokens", doc)
         self.assertIn("input + output + cacheWrite", doc)
         self.assertIn("CACHE READS", doc)
+        self.assertIn("by_model_window_days", doc)
         with open(CAP, encoding="utf-8") as f:
             self.assertIn("ACC_VERSION", f.read())
 
@@ -208,11 +209,26 @@ class TestTokenAccounting(Base):
         self.assertEqual([d["tokens"] for d in days], [1600] * 7)
         self.assertEqual(days[-1]["date"], tc._local_date(NOW))
         self.assertEqual(days[0]["date"], tc._local_date(NOW - 6 * 86400))
+        # headline tokens = input+output+cache_write; cache reads ride
+        # SEPARATELY, labelled (900000 today) — never inside the headline
+        self.assertEqual(days[-1],
+                         {"date": tc._local_date(NOW), "tokens": 1600,
+                          "input": 1000, "output": 500, "cache_write": 100,
+                          "cache_read": 900000})
         self.assertEqual(rec["by_model"],
-                         [{"model": "claude-opus-4-8", "tokens": 11200}])
-        blob = json.dumps(rec)
-        no_leak(self, "900000", blob, "wire record")  # cache reads excluded
-        no_leak(self, "decoy prompt text", blob, "wire record")
+                         [{"model": "claude-opus-4-8", "tokens": 11200,
+                           "input": 7000, "output": 3500,
+                           "cache_write": 700, "cache_read": 4800000}])
+        self.assertEqual(rec["by_model_window_days"], 7)
+        self.assertEqual(rec["days_source"],
+                         ["local_transcripts:claude_code"])
+        self.assertEqual(rec["by_model_source"],
+                         ["local_transcripts:claude_code"])
+        headline = json.dumps(
+            {"tokens": [d["tokens"] for d in days],
+             "model_tokens": [m["tokens"] for m in rec["by_model"]]})
+        no_leak(self, "900000", headline, "headline token fields")
+        no_leak(self, "decoy prompt text", json.dumps(rec), "wire record")
 
     def test_codex_full_input_minus_cached_plus_output(self):
         self.put_fixture(".codex/sessions/2025/10/rollout-a.jsonl",
@@ -284,7 +300,13 @@ class TestTokenAccounting(Base):
         self.assertEqual(zai["tokens_by_day"][-1]["tokens"], 170)
         self.assertEqual(zai["cost_today_usd"], 0.25)
         self.assertEqual(zai["by_model"],
-                         [{"model": "glm-4.7", "tokens": 460}])
+                         [{"model": "glm-4.7", "tokens": 460,
+                           "input": 300, "output": 110, "cache_write": 50,
+                           "cache_read": 90000}])
+        self.assertEqual(zai["today_by_model"],
+                         [{"model": "glm-4.7", "tokens": 170,
+                           "input": 100, "output": 50, "cache_write": 20,
+                           "cache_read": 50000}])
         google = sec["providers"][1]
         self.assertEqual(google["tokens_today"], 600)
         self.assertNotIn("cost_today_usd", google)
@@ -320,8 +342,12 @@ class TestTokenAccounting(Base):
                  line + b"\n", binary=True)
         rec = self.prov("claude")
         self.assertEqual(rec["tokens_today"], 12)     # cache read excluded
-        blob = json.dumps(rec)
-        no_leak(self, "123456", blob, "wire record")
+        # …and labelled separately on the wire, never folded in
+        self.assertEqual(rec["tokens_by_day"][-1]["cache_read"], 123456)
+        self.assertEqual(rec["by_model"][0]["cache_read"], 123456)
+        headline = json.dumps({"tokens": rec["tokens_today"],
+                               "m": rec["by_model"][0]["tokens"]})
+        no_leak(self, "123456", headline, "headline token fields")
 
     def test_claude_huge_429_ms_reset_normalized(self):
         ms = int((NOW + 3600) * 1000)
@@ -340,6 +366,211 @@ class TestTokenAccounting(Base):
 
 
 # ---------- 429 / thresholds / staleness ----------
+# ---------- §12 by-model windowing, provenance, harness split ----------
+class TestByModelWindowAndProvenance(Base):
+    """by_model speaks for EXACTLY the same 7 host-local days as
+    tokens_by_day; cache reads are labelled separately; every list
+    carries its source; multi-harness providers split by harness; the
+    cache's per-model buckets stay bounded."""
+
+    def cache_with(self, files, net=None):
+        cache = {"acc_ver": tc.ACC_VERSION, "files": files}
+        if net:
+            cache["net"] = net
+        return cache
+
+    def cache_with_mday(self, mday, days=None, kind="claude", extra=None):
+        today = tc._local_date(NOW)
+        files = {
+            "/h/x.jsonl": {"kind": kind, "last_ts": NOW,
+                           "days": days if days is not None else
+                           {today: {"tok": 10, "in": 10}},
+                           "mday": mday},
+        }
+        if kind == "codex":
+            files["/h/x.jsonl"]["limit"] = None
+            files["/h/x.jsonl"]["prev"] = None
+        files.update(extra or {})
+        return self.cache_with(files)
+
+    def models(self, cache):
+        provs = {p["id"]: p for p in
+                 tc._assemble(cache, NOW, enabled=[])["providers"]}
+        return provs
+
+    def test_stale_model_outside_the_window_is_excluded(self):
+        """A model the source recorded only on day-8 must not appear as
+        current — the September-models bug."""
+        today = tc._local_date(NOW)
+        day8 = tc._local_date(NOW - 8 * 86400)
+        provs = self.models(self.cache_with_mday({
+            "claude-fable-5": {day8: {"tok": 999, "in": 999}},
+            "claude-opus-5-5": {today: {"tok": 40, "in": 40}},
+        }))
+        claude = provs["claude"]
+        self.assertEqual([m["model"] for m in claude["by_model"]],
+                         ["claude-opus-5-5"])
+        self.assertEqual(claude["by_model_window_days"], 7)
+
+    def test_window_is_seven_local_days_ending_today(self):
+        """The boundary is the local calendar: day-6 in, day-7 out —
+        a bucket one hour either side of local midnight lands on one
+        local date, and that date decides."""
+        in6 = tc._local_date(NOW - 6 * 86400)      # oldest in-window day
+        out7 = tc._local_date(NOW - 7 * 86400)     # one day older: outside
+        self.assertEqual(len({in6, out7, tc._local_date(NOW)}), 3)
+        provs = self.models(self.cache_with_mday({
+            "m-in": {in6: {"tok": 6, "in": 6}},
+            "m-out": {out7: {"tok": 7, "in": 7}},
+            "m-today": {tc._local_date(NOW): {"tok": 1, "in": 1}},
+        }))
+        names = [m["model"] for m in provs["claude"]["by_model"]]
+        self.assertEqual(names, ["m-in", "m-today"])   # sorted by tokens
+
+    def test_today_by_model_covers_today_only(self):
+        today = tc._local_date(NOW)
+        yday = tc._local_date(NOW - 86400)
+        provs = self.models(self.cache_with_mday({
+            "m-now": {today: {"tok": 5, "in": 5}},
+            "m-past": {yday: {"tok": 9, "in": 9}},
+        }, days={today: {"tok": 5, "in": 5},
+                 yday: {"tok": 9, "in": 9}}))
+        claude = provs["claude"]
+        self.assertEqual([m["model"] for m in claude["by_model"]],
+                         ["m-past", "m-now"])
+        self.assertEqual([m["model"] for m in claude["today_by_model"]],
+                         ["m-now"])
+        self.assertEqual(claude["tokens_today"], 5)
+
+    def test_cache_read_separate_on_every_list(self):
+        line = json.dumps({
+            "type": "message", "message": {
+                "role": "assistant", "provider": "zai",
+                "model": "glm-5.3-flash", "timestamp": NOW * 1000,
+                "usage": {"input": 100, "output": 50, "cacheWrite": 20,
+                          "cacheRead": 777777}}},
+            separators=(",", ":")).encode() + b"\n"
+        self.put(".pi/agent/sessions/s9/chunk.jsonl", line.decode())
+        rec = self.prov("zai")
+        self.assertEqual(rec["tokens_today"], 170)    # reads never counted
+        self.assertEqual(rec["tokens_by_day"][-1]["cache_read"], 777777)
+        self.assertEqual(rec["by_model"][0],
+                         {"model": "glm-5.3-flash", "tokens": 170,
+                          "input": 100, "output": 50, "cache_write": 20,
+                          "cache_read": 777777})
+        self.assertEqual(rec["today_by_model"][0]["cache_read"], 777777)
+        headline = json.dumps({"t": rec["tokens_today"],
+                               "m": [m["tokens"] for m in rec["by_model"]]})
+        no_leak(self, "777777", headline, "headline token fields")
+
+    def test_codex_cached_input_is_labelled_cache_read(self):
+        line = json.dumps({
+            "timestamp": iso(NOW), "type": "event_msg",
+            "payload": {"type": "token_count", "info": {
+                "last_token_usage": {"input_tokens": 4000,
+                                     "cached_input_tokens": 3900,
+                                     "output_tokens": 200}}}},
+            separators=(",", ":")).encode() + b"\n"
+        self.put(".codex/sessions/2025/10/rollout-cr.jsonl", line.decode())
+        rec = self.prov("codex")
+        self.assertEqual(rec["tokens_today"], 300)    # 4000-3900+200
+        self.assertEqual(rec["tokens_by_day"][-1]["cache_read"], 3900)
+        # codex rollouts carry no model attribution: §12 sentence, not a list
+        self.assertIsNone(rec["by_model"])
+        self.assertEqual(rec["by_model_unavailable_reason"],
+                         "no_model_attribution")
+        self.assertEqual(rec["by_model_window_days"], 7)
+
+    def test_by_harness_splits_multi_harness_providers(self):
+        today = tc._local_date(NOW)
+        yday = tc._local_date(NOW - 86400)
+        cache = self.cache_with({
+            "/h/.claude/c.jsonl": {"kind": "claude", "last_ts": NOW,
+                "days": {today: {"tok": 50, "in": 50},
+                         yday: {"tok": 70, "in": 70}}, "mday": {}},
+            "/h/.pi/b.jsonl": {"kind": "pi", "last_ts": NOW, "prov": {
+                "claude-bridge": {"days": {today: {"tok": 100,
+                                                 "in": 100}},
+                                  "mday": {}}}}})
+        claude = self.models(cache)["claude"]
+        self.assertEqual(claude["by_harness"],
+                         {"claude_code": 120, "pi": 100})
+        self.assertEqual(sum(claude["by_harness"].values()),
+                         sum(d["tokens"] for d in claude["tokens_by_day"]))
+        self.assertEqual(claude["days_source"],
+                         ["local_transcripts:claude_code",
+                          "local_transcripts:pi"])
+        self.assertEqual(claude["by_model_source"],
+                         claude["days_source"])
+
+    def test_single_harness_never_carries_by_harness(self):
+        self.put_fixture(".pi/agent/sessions/s1/chunk.jsonl", "pi_two.jsonl")
+        rec = self.prov("zai")
+        self.assertNotIn("by_harness", rec)
+        self.assertEqual(rec["days_source"], ["local_transcripts:pi"])
+
+    def test_provider_api_windows_are_never_summed_with_transcripts(self):
+        self.put_fixture(".claude/projects/p1/s1.jsonl", "claude_week.jsonl")
+        self.cred("claude")
+        self.enable("claude_oauth")
+        fake = fake_urllib(body=self.fixture("oauth_iso.json"))
+        with mock.patch.object(tc._OPENER, "open", fake):
+            net = self.prov("claude")
+        no_net = self.prov("claude")
+        # the usage API adds windows (and plan) — never tokens
+        self.assertIn("windows", net)
+        self.assertEqual(net["tokens_today"], no_net["tokens_today"])
+        self.assertEqual(net["tokens_by_day"], no_net["tokens_by_day"])
+        self.assertEqual(net["by_model"], no_net["by_model"])
+        self.assertEqual(net.get("by_harness"), no_net.get("by_harness"))
+        if "by_harness" in net:
+            self.assertEqual(sum(net["by_harness"].values()),
+                             sum(d["tokens"]
+                                 for d in net["tokens_by_day"]))
+
+    def test_mday_buckets_pruned_past_35_days(self):
+        today = tc._local_date(NOW)
+        old40 = tc._local_date(NOW - 40 * 86400)
+        old34 = tc._local_date(NOW - 34 * 86400)
+        cache = self.cache_with_mday({
+            "m-gone": {old40: {"tok": 1, "in": 1}},
+            "m-kept": {old34: {"tok": 2, "in": 2},
+                       today: {"tok": 3, "in": 3}},
+        })
+        tc._prune_cache_mdays(cache, NOW)
+        md = cache["files"]["/h/x.jsonl"]["mday"]
+        self.assertNotIn("m-gone", md)          # 40 days: bounded growth
+        self.assertIn("m-kept", md)
+        # a full collect() prunes the persisted cache too (scratch path)
+        self.put_fixture(".claude/projects/p1/s1.jsonl", "claude_week.jsonl")
+        stale = {"acc_ver": tc.ACC_VERSION, "scanned_at": 0, "files": {
+            "/h/.claude/projects/p1/s1.jsonl": {
+                "kind": "claude", "size": 1, "mtime": 0.0, "offset": 0,
+                "last_ts": 0, "days": {}, "r429": None,
+                "mday": {"sep-only-model": {old40: {"tok": 5,
+                                                    "in": 5}}}}}}
+        os.makedirs(os.path.dirname(self.cache), exist_ok=True)
+        with open(self.cache, "w") as f:
+            json.dump(stale, f)
+        self.collect(refresh=True, budget_s=30)
+        with open(self.cache) as f:
+            persisted = json.load(f)
+        entry = persisted["files"]["/h/.claude/projects/p1/s1.jsonl"]
+        self.assertNotIn("sep-only-model", entry["mday"])
+
+    def test_pre_v4_cache_rebuilds_clean(self):
+        old = {"acc_ver": 3, "scanned_at": NOW, "files": {
+            "/h/.pi/x.jsonl": {"kind": "pi", "last_ts": NOW, "prov": {
+                "zai": {"days": {tc._local_date(NOW): {"tok": 9}},
+                        "mday": {"glm-4.7": {tc._local_date(NOW): 9}}}}}}}
+        self.assertNotEqual(tc.ACC_VERSION, 3)
+        cache = old
+        if cache.get("acc_ver") != tc.ACC_VERSION:     # collect()'s rule
+            cache = {"acc_ver": tc.ACC_VERSION}
+            cache["scanned_at"] = 0
+        self.assertIsNone(cache.get("files"))          # numbers never mix
+
+
 class TestStates(Base):
     def _w(self, pct, age=0.0, kind="session", net=False):
         return {"kind": kind, "used_pct": pct, "observed_at": NOW - age,
