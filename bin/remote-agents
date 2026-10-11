@@ -1735,7 +1735,22 @@ def _schedule_launcher():
     into the pane chosen at add — never a new pane, never typed into a
     terminal. TARGET takes a pane id (verified live via
     `herdr agent get <pane>`). Failure phrases are exactly the
-    contract's three."""
+    contract's three.
+
+    D10 (§13 release blocker): `--wait` used to wait for the turn to
+    SETTLE with --timeout 15000, so any turn longer than 15 s — most
+    real prompts — returned herdr's `timeout` after the prompt had been
+    ACCEPTED and launched, and the task was stamped FAILED `prompt
+    rejected` while the agent kept working (reproduced live 2026-10-11:
+    a 25 s sleep task → FAILED at +15 s, pane finished at +40 s). The
+    launch acknowledgment is now herdr's own pickup proof: `--wait` with
+    the full `--until working blocked idle done` match set returns rc 0
+    as soon as herdr OBSERVES the agent leave idle after the submission
+    (its 5 s activity gate) or sees the turn already settled — rc 0
+    proves execution started (or finished), never merely that bytes were
+    typed. A longer turn stays RUNNING and the tick/snapshot reconcile
+    finishes it (pane idle/done ⇒ DONE); rc ≠ 0 still means no execution
+    evidence ⇒ FAILED `prompt rejected`."""
     def launch(task):
         if not HERDR:
             return False, None, "launch refused"
@@ -1746,6 +1761,8 @@ def _schedule_launcher():
                 return False, None, "launch refused"
             rc, out, err = run([HERDR, "agent", "prompt", pane,
                                 task.get("prompt") or "", "--wait",
+                                "--until", "working", "--until", "blocked",
+                                "--until", "idle", "--until", "done",
                                 "--timeout", "15000"], 25)
             if rc != 0:
                 return False, None, "prompt rejected"
@@ -1770,8 +1787,13 @@ def _schedule_launcher():
                             "--timeout", "30000"], 45)
         if rc != 0:
             return False, None, "launch refused"
+        # same pickup acknowledgment as the §7.3 existing path (D10): rc 0
+        # proves the fresh agent took the prompt; the turn's real length is
+        # the tick/reconcile RUNNING→DONE business, not the launcher's.
         rc, out, err = run([HERDR, "agent", "prompt", pane,
                             task.get("prompt") or "", "--wait",
+                            "--until", "working", "--until", "blocked",
+                            "--until", "idle", "--until", "done",
                             "--timeout", "15000"], 25)
         if rc != 0:
             return False, None, "prompt rejected"
