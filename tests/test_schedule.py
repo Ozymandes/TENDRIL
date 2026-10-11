@@ -1141,6 +1141,47 @@ exit 0
                 len([ln for ln in f
                      if ln.startswith(("tab\t", "agent\t"))]), 3)
 
+    def test_cli_tick_background_refreshes_capacity_and_enable_is_offline_safe(self):
+        """The tick's capacity keeper runs inside the real CLI process
+        against a temp HOME (contract §2): `capacity enable` succeeds
+        offline with its honest line, and the next tick's bounded refresh
+        records the enabled-but-credential-less adapter as "nocred" — a
+        classification word, no fetch attempted, no network touched — and
+        leaves a 0600 refresh lock beside the 0600 cache."""
+        r = subprocess.run([sys.executable, "-u", CLI,
+                            "capacity", "enable", "zai_quota"],
+                           capture_output=True, text=True, env=self.env,
+                           timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = [ln for ln in r.stdout.splitlines() if ln.strip()]
+        self.assertEqual(lines[0], "zai_quota enabled")   # result FIRST
+        self.assertEqual(lines[1],
+                         "enabled; first sample will arrive within 5 min")
+        cfg = os.path.join(self.home, ".config", "tendril",
+                           "capacity.json")
+        with open(cfg) as f:
+            self.assertEqual(json.load(f), {"enabled": ["zai_quota"]})
+        r = self.cli("tick")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(json.loads(r.stdout)["ok"])       # tick unaffected
+        cache = os.path.join(self.home, ".cache", "tendril",
+                             "capacity.json")
+        with open(cache) as f:
+            doc = json.load(f)
+        self.assertEqual(doc["net"]["zai_quota"]["fail"], "nocred")
+        self.assertEqual(doc["net"]["zai_quota"]["windows"], [])  # none faked
+        lock = os.path.join(self.home, ".cache", "tendril",
+                            "capacity-refresh.lock")
+        self.assertEqual(oct(os.stat(lock).st_mode & 0o777), "0o600")
+        self.assertEqual(oct(os.stat(cache).st_mode & 0o777), "0o600")
+        # the honest line told the truth: still no sample, still nocred
+        r = subprocess.run([sys.executable, "-u", CLI, "capacity",
+                            "enable", "zai_quota"],
+                           capture_output=True, text=True, env=self.env,
+                           timeout=60)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("first sample will arrive within 5 min", r.stdout)
+
     def test_cli_tick_reports_contract_failure_phrase(self):
         self.cli("add", b64(payload(trigger={"kind": "at",
                                              "at": AT_PAST})))

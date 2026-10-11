@@ -48,10 +48,13 @@ Network adapters (`claude_oauth`, `codex_wham`, `zai_quota`) are default OFF;
 GET only, Bearer only, 10 s timeout, single attempt, response schema-
 projected to numbers before storage, min interval 300 s, 2× backoff on
 failures, never retried after 401 until the credential file or the enabled
-config changes.
+config changes. The scheduler tick keeps the enabled adapters fresh via
+`background_refresh()` (bounded, non-blocking lock) — `capacity --refresh`
+stays the manual backstop.
 
 Stdlib only; every failure mode degrades to "no data" — never an error.
 """
+import fcntl
 import glob
 import json
 import os
@@ -71,6 +74,9 @@ CONFIG_DIR = os.path.expanduser("~/.config/tendril")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "capacity.json")
 BUDGET_S = 1.0              # snapshot_section default wall-clock budget
 REFRESH_BUDGET_S = 30.0     # CLI --refresh: generous, cold backfills fit
+BG_BUDGET_S = 12.0          # scheduler-tick background refresh: covers a
+#                            single worst-case 10 s fetch (≤ 12 s wall),
+#                            never delays a launch (the tick calls it after)
 CATCHUP_GRACE_S = 8.5       # extra allowance for one cold full backfill
 LOCAL_MIN_S = 60            # min interval between local transcript scans
 NET_MIN_S = 300             # min interval between network checks
@@ -1007,10 +1013,15 @@ def _valid_net(st):
         and isinstance(st.get("backoff"), (int, float))
 
 
-def _net_phase(cache, now, allow_network, home):
+def _net_phase(cache, now, allow_network, home, net_deadline=None):
     """Attempt each enabled, due network adapter at most once. 401 marks the
     adapter failed until the credential file changes (or it is re-enabled);
-    other failures double the backoff, capped."""
+    other failures double the backoff, capped. net_deadline (a monotonic
+    stamp) bounds the pass: an adapter's fetch is only started while a full
+    10 s timeout still fits, so a multi-adapter sweep cannot overrun its
+    budget (the background tick's refresh stays ≤ its 12 s bound; a skipped
+    adapter simply waits for the next call — its own interval gates mean it
+    loses no freshness that matters)."""
     if not allow_network:
         return
     enabled = set(enabled_ids(home))
@@ -1018,6 +1029,9 @@ def _net_phase(cache, now, allow_network, home):
     for aid in NET_IDS:
         if aid not in enabled:
             continue
+        if net_deadline is not None \
+                and _mono() + NET_TIMEOUT_S > net_deadline:
+            break                              # out of budget for this pass
         st = states.get(aid)
         if not _valid_net(st):
             st = _fresh_net_state()
@@ -1136,6 +1150,22 @@ def set_enabled(adapter_id, on, home=None):
         except Exception:
             pass
     return True
+
+
+def adapter_reported(adapter_id, home=None):
+    """True when the adapter holds at least one network sample in the cache
+    (fresh or stale) — "did a fetch ever land". Never raises; unknown ids
+    and unreadable caches are False. `capacity enable` uses this to print
+    one honest line when the first sample did not arrive immediately."""
+    try:
+        if adapter_id not in NET_IDS:
+            return False
+        path = CACHE_FILE if home is None else os.path.join(
+            home, ".cache", "tendril", "capacity.json")
+        st = (_load_cache(path).get("net") or {}).get(adapter_id)
+        return bool(_valid_net(st) and st.get("observed_at"))
+    except Exception:
+        return False
 
 
 # ---------- assembly ----------
@@ -1464,10 +1494,18 @@ def collect(refresh=False, budget_s=None, now=None, home=None,
     if refresh or now - scanned_at >= LOCAL_MIN_S:
         _scan_all(cache, deadline, hard, now, home)
         cache["scanned_at"] = now
-        try:
-            _net_phase(cache, now, allow_network, home)
-        except Exception:
-            pass
+    # The network phase rides its own gates — the budget (≥ NET_BUDGET_MIN_S)
+    # plus each adapter's 300 s min interval / backoff / never-retry-401 —
+    # NOT the local scan cadence: the background tick refresh runs every
+    # 30 s while snapshots keep scanned_at fresh, and a due adapter must
+    # still be reachable here or enabled adapters decay to unknown/no_data
+    # (NET_STALE_S) with nobody around to run --refresh. With a small
+    # budget this returns before touching anything (allow_network False).
+    try:
+        _net_phase(cache, now, allow_network, home,
+                   net_deadline=hard if refresh else deadline)
+    except Exception:
+        pass
     section = _assemble(cache, now, enabled=enabled_ids(home))
     cache["section"] = section
     cache["built_at"] = now
@@ -1567,6 +1605,51 @@ def provider_state(provider_id, budget_s=NET_BUDGET_MIN_S, now=None,
         return None
     except Exception:
         return None
+
+
+def background_refresh(now=None, home=None, lock_path=None):
+    """Scheduler-tick hook (contract §2): keep the enabled network adapters
+    inside their 30 min staleness bound without anybody running
+    `capacity --refresh`. Runs on the tick's EXISTING timer, after the
+    scheduling work: returns immediately when no adapter is enabled;
+    otherwise one bounded collect() whose budget covers a single worst-case
+    10 s fetch (BG_BUDGET_S) — the per-adapter 300 s min interval, 2×
+    backoff and never-retry-401 rules still decide whether the network is
+    actually hit. Overlapping ticks never double-fetch: a non-blocking
+    flock makes a busy lock a skip, never a wait. Cache writes keep the
+    existing atomic/0600 discipline; the lock file is 0600, O_NOFOLLOW.
+    NEVER raises; returns True only when a refresh attempt ran."""
+    if home is None:
+        home = HOME
+    if not enabled_ids(home):
+        return False                         # nothing opted in: no work
+    path = os.path.join(home, ".cache", "tendril", "capacity.json")
+    lpath = lock_path or os.path.join(os.path.dirname(path),
+                                      "capacity-refresh.lock")
+    fd = None
+    try:
+        os.makedirs(os.path.dirname(lpath), mode=0o700, exist_ok=True)
+        fd = os.open(lpath, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    except OSError:
+        return False                         # unwritable cache dir: skip
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (BlockingIOError, OSError):
+            return False                     # another refresh in flight
+        try:
+            collect(budget_s=BG_BUDGET_S, now=now, home=home,
+                    cache_path=path)
+        except Exception:
+            pass                             # a refresh never fails its caller
+        return True
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            os.close(fd)
 
 
 # ---------- human status (no secrets exist in these records) ----------

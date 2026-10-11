@@ -20,8 +20,11 @@ Under test (docs/LINK-CONTRACT-0.2.md, all fixtures synthetic):
 - budget behaviour: snapshot_section serves the cache or scans within its
   budget; progress is incremental across calls.
 """
+import contextlib
+import fcntl
 import http.server
 import importlib.util
+import io
 import json
 import os
 import shutil
@@ -875,6 +878,160 @@ class TestConfig(Base):
         self.assertEqual(tc.enabled_ids(self.home), [])
 
 
+# ---------- scheduler-tick background refresh (contract §2 defect fix) ----------
+class TestBackgroundRefresh(Base):
+    """background_refresh — the tick's capacity keeper: returns when no
+    adapter is enabled; otherwise one bounded collect() whose budget covers
+    a single worst-case 10 s fetch. The existing per-adapter gates (300 s
+    min interval, 2× backoff, never-retry-401, nocred) decide whether the
+    network is actually hit; a busy lock is a skip; a blow-up never
+    propagates and releases the lock. urllib is mocked throughout."""
+
+    def setUp(self):
+        super().setUp()
+        # the home-derived cache path, exactly what background_refresh and
+        # set_enabled's 401-revival use
+        self.cache = os.path.join(self.home, ".cache", "tendril",
+                                  "capacity.json")
+
+    def seed(self, age=None, adapter="claude_oauth", cred="claude"):
+        """Enable the adapter (credential installed) and optionally plant a
+        stale net sample observed `age` seconds ago."""
+        if cred:
+            self.cred(cred)
+        self.enable(adapter)
+        if age is not None:
+            st = tc._fresh_net_state()
+            st["observed_at"] = NOW - age
+            tc._save_cache({"acc_ver": tc.ACC_VERSION,
+                            "net": {adapter: st}}, self.cache)
+
+    def test_no_enabled_adapter_never_fetches(self):
+        fake = fake_urllib(body="{}")
+        with mock.patch.object(tc._OPENER, "open", fake):
+            self.assertFalse(tc.background_refresh(now=NOW, home=self.home))
+        self.assertEqual(fake.calls, [])
+        self.assertFalse(os.path.exists(self.cache))   # not even a write
+
+    def test_stale_sample_is_fetched_exactly_once(self):
+        self.seed(age=tc.NET_MIN_S + 1)
+        fake = fake_urllib(body=self.fixture("oauth_iso.json"))
+        with mock.patch.object(tc._OPENER, "open", fake):
+            self.assertTrue(tc.background_refresh(now=NOW, home=self.home))
+        self.assertEqual(len(fake.calls), 1)
+        url, headers, timeout = fake.calls[0]
+        self.assertTrue(url.startswith("https://api.anthropic.com/"))
+        self.assertEqual(timeout, 10)
+        self.assertTrue(headers.get("authorization", "").startswith("Bearer "))
+        # the fresh section is in the cache for the phone's next snapshot
+        recs = tc._load_cache(self.cache).get("section", {}).get("providers")
+        self.assertEqual(recs[0]["source"], "claude_oauth")
+        self.assertEqual(recs[0]["state"], "critical")
+
+    def test_min_interval_governs_consecutive_ticks(self):
+        self.seed(age=tc.NET_MIN_S + 1)
+        fake = fake_urllib(body=self.fixture("oauth_iso.json"))
+        with mock.patch.object(tc._OPENER, "open", fake):
+            tc.background_refresh(now=NOW, home=self.home)
+            self.assertEqual(len(fake.calls), 1)        # stale: fetched
+            tc.background_refresh(now=NOW + 30, home=self.home)
+            self.assertEqual(len(fake.calls), 1)        # 30 s < 300 s: skip
+            tc.background_refresh(now=NOW + 60, home=self.home)
+            self.assertEqual(len(fake.calls), 1)        # 60 s < 300 s: skip
+            tc.background_refresh(now=NOW + 301, home=self.home)
+            self.assertEqual(len(fake.calls), 2)        # due again: fetched
+
+    def test_scan_gate_does_not_starve_the_network_phase(self):
+        """The defect itself: snapshot collects (1 s budget) keep the
+        cache freshly scanned, so a refresh nested behind the 60 s local
+        scan gate could never reach a due adapter — 30 min later both
+        adapters were unknown/no_data. The network phase must run on its
+        own budget/interval gates."""
+        self.seed(age=tc.NET_MIN_S + 1)
+        fake = fake_urllib(body=self.fixture("oauth_iso.json"))
+        with mock.patch.object(tc._OPENER, "open", fake):
+            tc.collect(budget_s=1.0, now=NOW - 31, home=self.home,
+                       cache_path=self.cache)   # snapshot-like fresh scan
+            self.assertEqual(fake.calls, [])     # 1 s budget: never fetches
+            tc.background_refresh(now=NOW, home=self.home)
+            self.assertEqual(len(fake.calls), 1)  # tick still reaches it
+
+    def test_401_is_never_retried_by_background_refresh(self):
+        self.seed()
+        fake = fake_urllib(code=401)
+        with mock.patch.object(tc._OPENER, "open", fake):
+            tc.background_refresh(now=NOW, home=self.home)
+            self.assertEqual(len(fake.calls), 1)
+            tc.background_refresh(now=NOW + 90000, home=self.home)
+            self.assertEqual(len(fake.calls), 1)   # dead until it changes
+
+    def test_nocred_records_the_word_and_never_fetches(self):
+        self.seed(cred=None)                       # enabled, no credential
+        fake = fake_urllib(body="{}")
+        with mock.patch.object(tc._OPENER, "open", fake):
+            tc.background_refresh(now=NOW, home=self.home)
+        self.assertEqual(fake.calls, [])
+        st = tc._load_cache(self.cache)["net"]["claude_oauth"]
+        self.assertEqual(st["fail"], "nocred")
+
+    def test_busy_lock_skips_never_waits(self):
+        self.seed(age=tc.NET_MIN_S + 1)
+        fake = fake_urllib(body="{}")
+        lock = os.path.join(self.home, ".cache", "tendril",
+                            "capacity-refresh.lock")
+        os.makedirs(os.path.dirname(lock), exist_ok=True)
+        fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+        fcntl.flock(fd, fcntl.LOCK_EX)             # an overlapping tick
+        try:
+            with mock.patch.object(tc._OPENER, "open", fake):
+                self.assertFalse(tc.background_refresh(
+                    now=NOW, home=self.home, lock_path=lock))
+            self.assertEqual(fake.calls, [])       # skipped, not waited on
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+        with mock.patch.object(tc._OPENER, "open", fake):
+            self.assertTrue(tc.background_refresh(now=NOW, home=self.home))
+        self.assertEqual(len(fake.calls), 1)       # released: next tick works
+
+    def test_refresh_exception_never_propagates_and_releases_the_lock(self):
+        self.seed()
+        with mock.patch.object(tc, "collect",
+                               side_effect=RuntimeError("boom")):
+            self.assertTrue(tc.background_refresh(now=NOW, home=self.home))
+        with mock.patch.object(tc, "collect",
+                               side_effect=RuntimeError("boom")) as m:
+            tc.background_refresh(now=NOW + 1, home=self.home)
+        self.assertEqual(m.call_count, 1)          # lock was not leaked
+
+    def test_net_phase_deadline_gate_bounds_a_multi_adapter_pass(self):
+        """The ≤ 12 s wall bound: an adapter's fetch only starts while a
+        full 10 s timeout still fits the pass budget."""
+        self.seed()
+        cache = {"acc_ver": tc.ACC_VERSION, "net": {}}
+        fake = fake_urllib(body=self.fixture("oauth_iso.json"))
+        with mock.patch.object(tc._OPENER, "open", fake):
+            tc._net_phase(cache, NOW, True, self.home,
+                          net_deadline=tc._mono() - 1)
+            self.assertEqual(fake.calls, [])       # out of budget: none
+            tc._net_phase(cache, NOW, True, self.home,
+                          net_deadline=tc._mono() + tc.NET_TIMEOUT_S + 1.0)
+            self.assertEqual(len(fake.calls), 1)   # a full timeout fits
+
+    def test_background_budget_covers_one_fetch_and_stays_bounded(self):
+        self.assertGreaterEqual(tc.BG_BUDGET_S, tc.NET_BUDGET_MIN_S)
+        self.assertLessEqual(tc.BG_BUDGET_S, 12.0)
+
+    def test_adapter_reported_and_first_sample_after_enable(self):
+        self.seed()
+        self.assertFalse(tc.adapter_reported("claude_oauth", home=self.home))
+        self.assertFalse(tc.adapter_reported("bogus", home=self.home))
+        fake = fake_urllib(body=self.fixture("oauth_iso.json"))
+        with mock.patch.object(tc._OPENER, "open", fake):
+            tc.background_refresh(now=NOW, home=self.home)
+        self.assertTrue(tc.adapter_reported("claude_oauth", home=self.home))
+
+
 # ---------- human status + the remote-agents verb ----------
 class TestCliAndStatus(Base):
     def _env(self):
@@ -1208,6 +1365,164 @@ class TestReasonsAndHealth(Base):
         if cache.get("acc_ver") != tc.ACC_VERSION:     # collect()'s rule
             cache = {"acc_ver": tc.ACC_VERSION}
         self.assertEqual(cache.get("files"), None)
+
+
+# ---------- remote-agents wiring: the tick and enable verbs ----------
+class TestRemoteAgentsWiring(unittest.TestCase):
+    """The verbs call tendril_capacity.background_refresh. The real
+    remote-agents module and the real bin/tendril_capacity +
+    bin/tendril_schedule are loaded here (sys.modules names), with the
+    refresh hooks patched at their own names — so only the wiring is
+    under test and no test ever touches the network or the real HOME:
+    the store lives in a tempdir, the launcher is a stub, and set_enabled
+    is stubbed (its round-trip is covered above and in test_schedule)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.bin_dir = os.path.join(REPO, "bin")
+        sys.path.insert(0, cls.bin_dir)
+        cls.ra = _load("remote_agents_capacity_wiring", CLI)
+        import tendril_capacity
+        import tendril_schedule
+        cls.capmod = tendril_capacity
+        cls.tsmod = tendril_schedule
+
+    @classmethod
+    def tearDownClass(cls):
+        sys.path.remove(cls.bin_dir)
+        sys.modules.pop("tendril_capacity", None)
+        sys.modules.pop("tendril_schedule", None)
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="tendril-capwiring-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.store = os.path.join(self.tmp, "state", "tendril",
+                                  "schedule.json")
+
+    # ----- drivers ------------------------------------------------------
+    def tick(self, tasks=(), bg_raises=None):
+        seq = []
+
+        def launcher_log(task):
+            seq.append("launch")
+            return True, "w15:p9", None
+
+        def bg():
+            seq.append("refresh")
+            if bg_raises is not None:
+                raise bg_raises
+
+        with mock.patch.object(self.tsmod, "store_paths",
+                               return_value=(os.path.dirname(self.store),
+                                             self.store,
+                                             self.store + ".lock")), \
+             mock.patch.object(self.ra, "snapshot",
+                               return_value={"panes": [], "agents": [],
+                                             "workspaces": []}), \
+             mock.patch.object(self.ra, "_schedule_launcher",
+                               return_value=launcher_log), \
+             mock.patch.object(self.ra, "_schedule_notifier",
+                               return_value=None), \
+             mock.patch.object(self.capmod, "background_refresh",
+                               side_effect=bg) as bg_mock:
+            if tasks:
+                os.makedirs(os.path.dirname(self.store), exist_ok=True)
+                with open(self.store, "w") as f:
+                    json.dump({"schema_version": 1,
+                               "tasks": list(tasks)}, f)
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = self.ra._schedule_cmd(["tick"])
+        return rc, out.getvalue(), seq, bg_mock
+
+    def queued_task(self):
+        now = time.time()
+        return {"id": "t-2026-wiring1", "title": "wiring",
+                "prompt": "the secret prompt text",
+                "workspace": "w15", "workspace_label": "research",
+                "harness": "pi", "trigger": {"kind": "at", "at": now - 10},
+                "state": "QUEUED", "created_at": now - 20,
+                "due_at": now - 10, "fingerprint": "fp"}
+
+    def enable(self, reported=False, bg_raises=None, verb="enable",
+               adapter="zai_quota"):
+        calls = []
+
+        def bg():
+            calls.append(adapter)
+            if bg_raises is not None:
+                raise bg_raises
+            return True
+
+        with mock.patch.object(self.capmod, "set_enabled",
+                               return_value=True) as se, \
+             mock.patch.object(self.capmod, "background_refresh",
+                               side_effect=bg), \
+             mock.patch.object(self.capmod, "adapter_reported",
+                               return_value=reported):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                rc = self.ra._capacity_cmd([verb, adapter])
+        return rc, out.getvalue(), calls, se
+
+    # ----- tests --------------------------------------------------------
+    def test_tick_refreshes_after_the_scheduling_work(self):
+        rc, out, seq, bg = self.tick()
+        self.assertEqual(rc, 0)
+        doc = json.loads(out)
+        self.assertTrue(doc["ok"])
+        self.assertEqual(bg.call_count, 1)     # exactly one refresh per tick
+        self.assertEqual(seq, ["refresh"])
+
+    def test_launch_precedes_refresh_and_failure_never_eats_the_tick(self):
+        rc, out, seq, _ = self.tick(tasks=[self.queued_task()],
+                                    bg_raises=RuntimeError("refresh blew up"))
+        self.assertEqual(rc, 0)
+        doc = json.loads(out)
+        self.assertTrue(doc["ok"])                      # tick not failed
+        self.assertEqual(doc["tick"]["launched"], 1)    # launch succeeded
+        self.assertEqual(seq, ["launch", "refresh"])    # launches FIRST
+        with open(self.store) as f:
+            row = json.load(f)["tasks"][0]
+        self.assertEqual(row["state"], "RUNNING")       # persisted RUNNING
+        self.assertEqual(row["pane_id"], "w15:p9")
+        self.assertNotIn("the secret prompt text", out)  # reply stays clean
+
+    def test_tick_survives_a_refresh_that_raises_before_any_launch(self):
+        rc, out, seq, _ = self.tick(bg_raises=OSError("no route to host"))
+        self.assertEqual(rc, 0)
+        self.assertTrue(json.loads(out)["ok"])
+        self.assertEqual(seq, ["refresh"])
+
+    def test_enable_prints_result_first_one_refresh_then_honest_line(self):
+        rc, out, calls, se = self.enable(reported=False)
+        self.assertEqual(rc, 0)                          # enabling succeeded
+        self.assertEqual(calls, ["zai_quota"])           # exactly one refresh
+        self.assertEqual(se.call_args, mock.call("zai_quota", True))
+        lines = [ln for ln in out.splitlines() if ln.strip()]
+        self.assertEqual(lines[0], "zai_quota enabled")  # result FIRST
+        self.assertEqual(lines[1],
+                         "enabled; first sample will arrive within 5 min")
+
+    def test_enable_with_a_landed_sample_prints_nothing_more(self):
+        rc, out, calls, _ = self.enable(reported=True)
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, ["zai_quota"])
+        self.assertEqual(out.splitlines(), ["zai_quota enabled"])
+
+    def test_enable_succeeds_offline_with_the_honest_line(self):
+        rc, out, calls, _ = self.enable(
+            bg_raises=OSError("network is unreachable"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, ["zai_quota"])
+        self.assertIn("zai_quota enabled", out)
+        self.assertIn("first sample will arrive within 5 min", out)
+
+    def test_disable_does_not_refresh(self):
+        rc, out, calls, _ = self.enable(verb="disable")
+        self.assertEqual(rc, 0)
+        self.assertEqual(calls, [])                      # no fetch on disable
+        self.assertEqual(out.splitlines(), ["zai_quota disabled"])
 
 
 if __name__ == "__main__":

@@ -1868,6 +1868,18 @@ def _schedule_cmd(args):
             _schedule_reply({"ok": False, "error": err})
             return 1
         _schedule_reply({"ok": True, "tick": summary["tick"]})
+        # Capacity background refresh on the tick's own timer (contract
+        # §2): runs AFTER the scheduling work and the reply — launches are
+        # already done and the reply is out, so the ≤ 12 s bounded refresh
+        # (a no-op when no adapter is enabled) can never delay a task, a
+        # launch or this tick. Keeps enabled adapters inside their 30 min
+        # staleness bound without a manual `capacity --refresh`. Never
+        # raises; a busy lock (overlapping ticks) is a skip.
+        try:
+            import tendril_capacity
+            tendril_capacity.background_refresh()
+        except Exception:
+            pass
         return 0
     if verb == "list" and (len(args) == 1
                            or (len(args) == 2 and args[1] == "--json")):
@@ -2004,7 +2016,10 @@ def _capacity_cmd(rest):
     never transcript content, never credentials). `capacity status` prints
     the human table instead; `capacity enable|disable <adapter>` opts in or
     out of a network usage adapter (claude_oauth|codex_wham|zai_quota;
-    stored in ~/.config/tendril/capacity.json). Without --refresh the verb
+    stored in ~/.config/tendril/capacity.json); enabling also triggers one
+    immediate bounded refresh and prints one honest line when the first
+    sample did not land (offline-safe: the enable always succeeds first).
+    Without --refresh the verb
     serves the cached/locally-derived section through snapshot_section's
     1 s budget (instant when the cache is fresh) and never touches the
     network; --refresh rescans now and also allows the enabled network
@@ -2052,6 +2067,19 @@ def _capacity_cmd(rest):
         return 2
     print("%s %s" % (pos[1], "enabled" if pos[0] == "enable"
                      else "disabled"))
+    if pos[0] == "enable":
+        # One immediate bounded refresh so the phone stops showing "not
+        # reporting" the moment an adapter is enabled — best effort: the
+        # enable above already succeeded, and a failed fetch (offline, bad
+        # credentials, a concurrent tick refreshing) only means the first
+        # sample arrives with the next tick. One honest line, no secrets,
+        # no raw errors.
+        try:
+            cap.background_refresh()
+        except Exception:
+            pass
+        if not cap.adapter_reported(pos[1]):
+            print("enabled; first sample will arrive within 5 min")
     return 0
 
 
