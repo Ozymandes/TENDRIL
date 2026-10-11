@@ -138,6 +138,186 @@ _BANNED = {
 _GREETING_RE = re.compile(
     r"^(hi+|hello+|hey+|yo+|howdy|greetings|good (morning|afternoon|"
     r"evening|day))\b", re.IGNORECASE)
+
+# ---------------------------------------------------------------- casings
+# Emphasis caps in prose (THE, ONLY, FAST, DISK, DEMO…) are NOT identity.
+# A token keeps its written form only when it is a KNOWN acronym/product
+# token, carries a digit (RC2, GLM-5.3, S21), or is internal-CamelCase
+# (Z.AI, GitHub, iOS). Everything else sentence-cases; when unsure, sentence
+# case. Map is lowercase key → canonical display.
+_ACRONYMS = {
+    "live": "LIVE", "rc2": "RC2", "ui": "UI", "ux": "UX", "api": "API",
+    "ca": "CA", "cli": "CLI", "mcp": "MCP", "pr": "PR", "qa": "QA",
+    "glm": "GLM", "apk": "APK", "s21": "S21", "ntfy": "ntfy",
+    "z.ai": "Z.AI", "pi": "Pi", "herdr": "Herdr", "tendril": "Tendril",
+    "omarchy": "Omarchy", "android": "Android",
+}
+# product/surface words alone are never a title ("Tendril LINK", "Pi")
+_PRODUCT_WORDS = frozenset(
+    "tendril link pi herdr live omarchy android glm z.ai codex claude "
+    "arch linux macos windows ui".split())
+
+def _early_be_clause(clause):
+    """Narration ("Claude opus is the sole reviewer"): a bare is/are within
+    the first few words is a statement, never a topic."""
+    return bool(re.match(r"^[a-zA-Z0-9' .\-]{0,40}\b(is|are|was|were)\b",
+                         clause))
+
+
+def _is_camel(tok):
+    return any(ch.islower() for ch in tok) \
+        and any(ch.isupper() for ch in tok[1:])
+
+def _normalize_word(w, first=False):
+    """One word of a finished candidate: allowlist/digit/CamelCase keep
+    their written form, everything else sentence-cases."""
+    key = w.lower()
+    if key in _ACRONYMS:
+        return _ACRONYMS[key]
+    if any(ch.isdigit() for ch in w) or _is_camel(w):
+        return w
+    if first:
+        return w[:1].upper() + w[1:].lower()
+    return w.lower()
+
+# ------------------------------------------------------------- tail back-off
+# A title never ENDS on a function word, determiner, preposition, auxiliary,
+# dangling adverb/adjective or a bare verb — a 32-char cut that lands there
+# is a dangling clause. Back off to the last noun-like word; fewer than two
+# meaningful words afterwards → fall through (None).
+_TAIL_STOP = frozenset("""
+to of the a an for with and or only is are be been being was were am in on at
+by from into onto over under up down out off about as so that this these
+those it its their our your my his her we they he she i you do does did done
+has have had will would can could should shall may might must not no nor yes
+ok okay run runs ran make makes making build building use uses used using
+get gets getting go goes going work works working act acts act open opens
+opened opening close start starts started stop stops stopped launch launches
+launched configure configures configured install installs installed initialize initializes initialized download implement implements implementing integrate integrates integrated migrate migrated deploy deploys deployed add adds adding remove removes removing update updates
+updating create creates creating delete write writes writing read reads
+reading send send check checking verify verify test tests testing try trying
+move copy keep let know think see look feel seem exist exists existed help
+need needs want take takes give find tell ask say said come comes came
+become becomes became leave leaves put mean means meant stay stays remain
+remains happen happens happened begin begins began begin end ends ended
+continue continues continued finish finishes finished complete completes
+completed fail fails failed latest authoritative current important new own
+same other more most very first last next each every all any some then now
+here there please exactly verbatim yet still also both per via after before
+between during without within across against among around behind below above
+near since until toward towards upon while if because than when what which
+who whom whose where why how least itself themselves myself yourself
+""".split())
+_ADJ_TAIL_RE = re.compile(
+    r"(ive|ful|ous|less|able|ible)$"        # authoritative, meaningful…
+    r"|ed$"                                  # coordinated, integrated…
+    r"|ing$"                                 # containing, running…
+    r"|ly$")                                 # fully, exactly…
+_ED_NOUNS = frozenset({"changed", "field", "content", "ground", "sound",
+                       "thing", "king", "ring", "spring", "warning",
+                       "family", "supply", "july", "ally", "rely"})
+
+def _tail_nounlike(words, allow_ing_tail=False):
+    """True when the LAST word can end a title (noun-like / product token).
+    Summaries allow -ing tails: their gerunds are salient topics
+    ("Herdr flapping"), where an instruction cut's would dangle."""
+    if not words:
+        return False
+    w = words[-1]
+    lw = w.lower().strip(".,;:!?()[]{}\"'")
+    if not lw:
+        return False
+    if lw in _TAIL_STOP:
+        return False
+    if lw in _ED_NOUNS:
+        return True
+    if lw.endswith("-quality"):
+        return False
+    if allow_ing_tail and lw.endswith("ing"):
+        return True
+    if _ADJ_TAIL_RE.search(lw) and len(lw) >= 5:
+        return False
+    return True
+
+# --------------------------------------------------------- boilerplate lines
+# Openers whose line is orchestration/cert/protocol scaffolding, never a
+# topic: those sessions fall through to summary/workspace.
+_SKIP_LINE_RES = (
+    re.compile(r"^this (is|machine|session)\b", re.IGNORECASE),
+    re.compile(r"^we (are|'re|will be)\b", re.IGNORECASE),
+    re.compile(r"^i want this\b", re.IGNORECASE),
+    # meta-statement ("The engine is real") — narration, never a topic
+    re.compile(r"^the [a-z' ]{0,40}\b(is|are|was|were)\b", re.IGNORECASE),
+    re.compile(r"^(wait|sleep)\b", re.IGNORECASE),
+    re.compile(r"^repository root\b", re.IGNORECASE),
+    re.compile(r"^this session exists\b", re.IGNORECASE),
+    re.compile(r"^we (are|'re|will be) now\b", re.IGNORECASE),
+    re.compile(r"^we are now\b", re.IGNORECASE),
+    re.compile(r"^important (current|:|update)\b", re.IGNORECASE),
+    re.compile(r"^use (your|the) (shell|subagent) tool\b", re.IGNORECASE),
+    re.compile(r"^current state\b", re.IGNORECASE),
+    re.compile(r"^preflight only\b", re.IGNORECASE),
+    re.compile(r"^reply (exactly|with exactly)\b", re.IGNORECASE),
+    re.compile(r"^mcp error\b", re.IGNORECASE),
+    re.compile(r"^error\s*:", re.IGNORECASE),
+    re.compile(r"^traceback \(most recent call last\)", re.IGNORECASE),
+    re.compile(r"^read\b.{1,64}\bfirst\b", re.IGNORECASE),
+    # tool-invocation cert prompts ("Call z_ai_vision …",
+    # "Use the zai-mcp-vision tool")
+    re.compile(r"^call [a-z][a-z0-9]*_[a-z0-9_]+\b", re.IGNORECASE),
+    re.compile(r"^use (your|the) [a-z0-9.-]+ tool\b", re.IGNORECASE),
+    re.compile(r"^execute this\b", re.IGNORECASE),
+    # first-person status narration ("Am on Omarchy arch linux")
+    re.compile(r"^(am|i am|i'm)\b", re.IGNORECASE),
+    re.compile(r"^on (omarchy|arch|linux|mac\b|macos)\b", re.IGNORECASE),
+    re.compile(r"^(have|had) around\b", re.IGNORECASE),
+    # "I have around one hour …", "I'm on Omarchy …" — status narration
+    re.compile(r"^(i|you|we) (have|had) (around|about|only)\b", re.IGNORECASE),
+    re.compile(r"^i[\u2019']?m\b", re.IGNORECASE),
+    re.compile(r"^confirm that this\b", re.IGNORECASE),
+    re.compile(r"^call (the )?[a-z0-9._-]+ tool\b", re.IGNORECASE),
+    # bare tool-call cert prompts ("Call summarize …")
+    re.compile(r"^call [a-z_]{3,}\b", re.IGNORECASE),
+    re.compile(r"^current (time|git|state|directory|status|problem)\b",
+               re.IGNORECASE),
+    # orchestrator-brief section headers picked as "titles"
+    re.compile(r"^(the )?(primary goal|outcome|most important (rule|thing)"
+               r"|critical routing rule|system context|project root)\b",
+               re.IGNORECASE),
+)
+# sentinel routing tokens: ALL-CAPS-WITH-DASHES(-OK) — a cert/session token,
+# never a topic. LINE-skip needs >= 3 segments (TENDRIL-D10-LIVE-OK):
+# single-dash heads ("ONE-DAY sprint") are emphasis caps, not sentinels.
+_SENTINEL_RE = re.compile(r"^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$")
+_SENTINEL_LINE_RE = re.compile(r"^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+){2,}$")
+# dates are never salient summary terms: Aug-30, 2026-10-04, 10/04, 2026
+_DATE_TOKEN_RE = re.compile(
+    r"^(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[-._]?[0-9]{1,2}$"
+    r"|^\d{4}-\d{2}-\d{2}$|^\d{1,2}[/.-]\d{1,2}(?:[/.]\d{2,4})?$|^\d{4}$",
+    re.IGNORECASE)
+# verb/protocol words are never summary terms ("<Model> Running",
+# "<sentinel> Reply" are banned shapes)
+# lowercase hyphen/dot compounds with NO digits are role/file labels
+# ("general-purpose", "phase-one-complete"), never topics
+_LABEL_COMPOUND_RE = re.compile(r"^[a-z]+(?:[-._][a-z]+)+$")
+_SUMMARY_STOP = frozenset(
+    "running run runs ran reply replies replied respond responding answer "
+    "answers answered output exactly verbatim please working waits waiting "
+    "wait active idle done fail failed failing error errors start starts "
+    "started starting stop stops stopped summary current state says said "
+    "using use used try trying tried let lets new now things stuff works "
+    "worked keep keeps kept going goes gone make makes made need needs "
+    "wanted want thanks good great nice best better worse bad bash zsh shell tool tools subagent subagents sleep full true false launch launches launching one two return returns image images finish finishes finished taskdone containing including regarding involving project root "
+       "request requests background hello already reference command commands "
+       "task calls call summarize analysis visual through max word urls url "
+       "create created".split())
+# machine role ids a harness assigns sessions: `general-purpose#20894abc`
+_ROLE_ID_RE = re.compile(
+    r"^([A-Za-z][A-Za-z0-9._-]{1,40})#[0-9a-fA-F]{6,8}$")
+# label prefixes that STRIP to their content (label form keeps the topic)
+_LABEL_RE = re.compile(
+    r"^(task|context|role|note|important|current state)\s*:\s*",
+    re.IGNORECASE)
 # a line whose FIRST token is one of these reads as a command, not prose
 _SHELL_WORDS = frozenset(
     "ps ls cd cat grep rm mv cp echo git npm npx pnpm yarn python python3 "
@@ -203,40 +383,17 @@ def _shouty_clause(clause):
         w.isupper() and any(ch.isalpha() for ch in w) for w in words)
 
 
-def _shouty_or_preserve(token):
-    """True when a token keeps its written form (acronym / CamelCase /
-    product name / contains a digit), False when an ALL-CAPS shouty word
-    (>= 5 letters, every hyphen segment >= 5) sentence-cases down."""
-    if any(ch.isdigit() for ch in token):
-        return True
-    if any(ch.islower() for ch in token):
-        # lowercase letters present: preserve only when an uppercase sits
-        # beyond position 0 (CamelCase, Z.AI, macOS) — otherwise it is
-        # ordinary lowercase and sentence case leaves it alone anyway.
-        return True
-    if not any(ch.isupper() for ch in token):
-        return True                         # plain lowercase / digits
-    segments = [s for s in re.split(r"[-/_.]+", token) if s]
-    if not segments:
-        return True
-    if any(len(s) <= 4 for s in segments):  # LIVE, RC2, IT, AI, Z.AI
-        return True
-    return False                            # DESIGN-LANGUAGE, UPLIFT → lower
+def _all_product_words(words):
+    """True when every word is a product/surface name — the product name
+    alone is never a title ("Tendril LINK", "Pi")."""
+    return bool(words) and all(
+        _clean_token(w).lower() in _PRODUCT_WORDS for w in words)
 
 
 def _sentence_case(words):
-    out = []
-    for i, w in enumerate(words):
-        if i == 0:
-            if not _shouty_or_preserve(w):
-                out.append(w[:1].upper() + w.lower()[1:])   # shouty head
-            elif any(ch.isupper() for ch in w[1:]):
-                out.append(w)               # CamelCase / acronym head
-            else:
-                out.append(w[:1].upper() + w[1:])
-        else:
-            out.append(w if _shouty_or_preserve(w) else w.lower())
-    return out
+    """Allowlist/digit/CamelCase keep their written form; emphasis caps in
+    prose (THE, ONLY, FAST, DISK…) and unsure cases sentence-case down."""
+    return [_normalize_word(w, first=(i == 0)) for i, w in enumerate(words)]
 
 
 def _clean_token(tok):
@@ -285,11 +442,23 @@ def _normalize_candidate(text):
         if _BANNER_RE.match(line) or _QUOTE_RE.match(line) \
                 or line.startswith("|"):
             continue
-        if line[:1] in "{" + "[" and line[-1:] in "}" + "]":
-            continue                        # a JSON/protocol line, not prose
+        if line[:1] in "{" + "[":
+            continue        # a JSON/protocol line (paths glue on!), not prose
         # a markdown header IS a title-shaped line: use its text
         line = _HEADER_RE.sub("", line).strip()
         if not line:
+            continue
+        # boilerplate openers (cert prompts, orchestration scaffolding,
+        # error strings, sentinels): the line is never a topic — keep
+        # scanning later lines; a session with none falls through.
+        # Bullet markers strip FIRST ("- The engine is real" is narration).
+        line = _LIST_RE.sub("", line).strip()
+        if not line:
+            continue
+        if _SENTINEL_LINE_RE.match(_clean_token(
+                _TOKEN_SPLIT_RE.split(line, 1)[0])):
+            continue
+        if any(rx.match(line) for rx in _SKIP_LINE_RES):
             continue
         # role preambles: drop the preamble SENTENCES, keep the rest of the
         # line when it continues past them ("You are X. Optimize Y")
@@ -299,6 +468,10 @@ def _normalize_candidate(text):
                 line = parts[1].strip()
             else:
                 line = ""
+        if not line:
+            continue
+        # label prefixes strip to their content ("Task: Herdr recovery fix")
+        line = _LABEL_RE.sub("", line).strip()
         if not line:
             continue
         first = _clean_token(_TOKEN_SPLIT_RE.split(line, 1)[0]).lower()
@@ -319,12 +492,13 @@ def _normalize_candidate(text):
     if not clauses:
         return None
     clause = clauses[0]
-    # a short ALL-CAPS head ("TENDRIL LINK — ...") or a single label word
-    # ("Task: ...") defers to the clause that follows it
-    n_words = len(_meaningful_words(clause.split()))
-    if n_words < 2 and len(clauses) > 1:
-        clause = clauses[1]
-    elif n_words <= 2 and len(clauses) > 1 and _shouty_clause(clause):
+    # the product name alone ("TENDRIL LINK —") and short shouty heads defer
+    # to the next, more specific segment of the title line
+    def _defers(c):
+        words = _meaningful_words(c.split())
+        return len(words) < 2 or (len(words) <= 2 and _shouty_clause(c)) \
+            or _all_product_words(words)
+    if len(clauses) > 1 and _defers(clause):
         clause = clauses[1]
     # iteratively strip leading politeness/filler phrases
     changed = True
@@ -336,15 +510,27 @@ def _normalize_candidate(text):
                 clause = clause[len(f):].lstrip(" ,.:;-—–")
                 changed = True
                 break
+    # scaffolding clauses hide behind fillers ("and execute this as one"):
+    # re-check AFTER the strip
+    if re.match(r"^(execute this|this is|we are|i want this|wait|sleep)\b",
+                clause, re.IGNORECASE) or _early_be_clause(clause):
+        return None                     # scaffolding/narration, never a topic
     return clause or None
 
 
-def _finalize(words, limit):
+def _finalize(words, limit, allow_ing_tail=False):
     words = [w for w in (_clean_token(w) for w in words) if w]
     words = _meaningful_words(words)
     if len(words) < 2:
         return None
     words = _sentence_case(words)
+    # clause-boundary back-off: never END on a function word, determiner,
+    # preposition, auxiliary, dangling adjective or bare verb — back off to
+    # the last noun-like word; too few words afterwards → fall through
+    while words and not _tail_nounlike(words, allow_ing_tail):
+        words.pop()
+    if len(words) < 2:
+        return None
     title = " ".join(words)
     # trailing punctuation debris never survives
     title = title.strip(" \t,;:—–-·")
@@ -353,6 +539,12 @@ def _finalize(words, limit):
         if " " in cut:
             cut = cut[:cut.rfind(" ")]
         title = cut.strip(" \t,;:—–-·")
+        words = title.split(" ")
+        while len(words) >= 2 and not _tail_nounlike(words, allow_ing_tail):
+            words.pop()
+        title = " ".join(words)
+    if len(words) < 2:
+        return None
     # debris guard: letters must dominate, at least 4 letters total
     letters = sum(ch.isalpha() for ch in title)
     if letters < 4 or letters < len(title.replace(" ", "")) / 2:
@@ -362,6 +554,8 @@ def _finalize(words, limit):
     norm = re.sub(r"[^a-z0-9 ]", "", title.lower()).strip()
     if norm in _BANNED or _GREETING_RE.match(norm):
         return None
+    if _all_product_words(title.split(" ")):
+        return None                     # the product name alone
     return title or None
 
 
@@ -380,8 +574,10 @@ def derive_title(text, limit=DERIVE_CAP):
 
 def derive_summary(turns, limit=DERIVE_CAP):
     """§11 level 5: deterministic salient-term extraction across the first
-    user turns (frequency/position/casing scoring). None when nothing
-    salient — the caller falls through."""
+    user turns — a NOUN PHRASE, never "<Model> Running", "<sentinel> Reply"
+    or a date. Sentinel routing tokens, dates and verb/protocol words are
+    never salient terms. None when nothing salient — the caller falls
+    through."""
     if not isinstance(turns, list):
         return None
     turns = [t for t in turns[:3] if isinstance(t, str) and t.strip()]
@@ -395,12 +591,18 @@ def derive_summary(turns, limit=DERIVE_CAP):
             tok = _clean_token(raw)
             if not tok or _is_noise(tok):
                 continue
+            if ":" in tok or "=" in tok:
+                continue                    # config fragments (async:true)
             word = _WORD_RE.match(tok)
             if not word:
                 continue
             key = tok.lower()
-            if key in _STOPWORDS:
+            if key in _STOPWORDS or key in _SUMMARY_STOP:
                 continue
+            if _SENTINEL_RE.match(tok) or _DATE_TOKEN_RE.match(tok):
+                continue                    # routing tokens and dates
+            if _LABEL_COMPOUND_RE.match(tok):
+                continue                    # general-purpose, phase-one…
             if key not in scores:
                 scores[key] = [0, len(order)]
                 order.append(key)
@@ -408,10 +610,10 @@ def derive_summary(turns, limit=DERIVE_CAP):
             if key not in seen_in_turn:
                 entry[0] += 3               # presence per turn
                 seen_in_turn.add(key)
-            if any(ch.isupper() for ch in tok[1:]):
-                entry[0] += 3               # CamelCase / mid-caps
-            elif _shouty_or_preserve(tok) and tok != tok.lower():
-                entry[0] += 3               # acronym-shaped
+            if _is_camel(tok) or (tok == tok.upper()
+                                  and any(ch.isalpha() for ch in tok)
+                                  and key in _ACRONYMS):
+                entry[0] += 3               # CamelCase / known acronym
             if any(ch.isdigit() for ch in tok):
                 entry[0] += 2
             if any(ch in "._+/-" for ch in tok):
@@ -428,17 +630,19 @@ def derive_summary(turns, limit=DERIVE_CAP):
             if tok and tok.lower() in scores and tok.lower() not in cased:
                 cased[tok.lower()] = tok
     words = [cased[k] for k in top]
-    return _finalize(words, limit)
+    return _finalize(words, limit, allow_ing_tail=True)
 
 
 def humanize_role(name):
-    """`researcher_a1b2c3d4` → `Researcher`; `Explore` → `Explore`.
-    The sanitized wire name's trailing `_id8` is the run id, never prose."""
+    """`researcher_a1b2c3d4` → `Researcher`; `backend-scout#2cbfa86a` →
+    `Backend scout`; `Explore` → `Explore`. The id tail (`_id8`, `#id8`)
+    is a machine identifier, never prose."""
     if not isinstance(name, str) or not name.strip():
         return None
     n = name.strip()
-    n = re.sub(r"[_-][0-9a-fA-F]{6,8}$", "", n)     # _<id8> run-id suffix
-    n = re.sub(r"[_\s]+", " ", n).strip(" ._")
+    n = re.sub(r"[#+_-][0-9a-fA-F]{6,8}$", "", n)   # _<id8> / #<id8> tails
+    n = re.sub(r"[#]+", " ", n)
+    n = re.sub(r"[-_\s]+", " ", n).strip(" ._")
     if not n:
         return None
     if n[:1].islower():
@@ -726,13 +930,20 @@ def _store(titles, key, title, source, start, pane=None):
 # resolution
 
 
-def _native_title(agent, key, titles, now):
+def _native_title(agent, key, titles, now, home=None):
     """Level 2: Pi session_info name, else the Herdr agent name when it is
-    not a scheduler routing token (`-<hash>` stripped). (title, source)|None."""
+    not a scheduler routing token (`-<hash>` stripped). A machine-assigned
+    role id (`general-purpose#20894abc`) is NEVER shown raw: it is the
+    child's ROLE — humanized, plus the short task label from the session's
+    own first instruction when one derives. (title, source) | None."""
+    home = home or HOME
     if key and os.path.isabs(key) and key.endswith(".jsonl") \
             and _is_regular(key):
         name = pi_native_name(key)
         if name:
+            role = _ROLE_ID_RE.match(name)
+            if role:
+                return _role_native_title(key, role.group(1), home)
             return name, "native"
     name = agent.get("name")
     if isinstance(name, str) and name.strip() \
@@ -749,6 +960,26 @@ def _native_title(agent, key, titles, now):
             if t:
                 return t, "native"
     return None
+
+
+def _role_native_title(path, role, home):
+    """`<role>#<id8>` natives: `Backend scout · <short task label>` — the
+    humanized role name plus the first instruction's label; `None` for the
+    label keeps the bare humanized role (never the raw hash)."""
+    role_name = humanize_role(role)
+    if not role_name:
+        return None
+    label = None
+    try:
+        turns = first_instructions(path, max_turns=1, window=65536) \
+            if path else []
+        t = derive_title(turns[0]) if turns else None
+        label = sanitize_title(t, CHILD_TASK_CAP) if t else None
+    except Exception:
+        label = None
+    if label:
+        return "%s · %s" % (role_name, label), "instruction"
+    return role_name, "native"
 
 
 def _scheduler_title(pane, schedule_tasks):
@@ -792,7 +1023,7 @@ def resolve_agent(agent, workspace_label, schedule_tasks,
         return cached["title"], cached["source"]
 
     # 2 native
-    nat = _native_title(agent, key, titles, now)
+    nat = _native_title(agent, key, titles, now, home=home)
     if nat:
         return nat
 

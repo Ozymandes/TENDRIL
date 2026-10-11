@@ -225,6 +225,25 @@ class Precedence(TitlesTestBase):
             titles={}, home=self.home)
         self.assertEqual((title, source), ("Focus runner", "native"))
 
+    def test_role_id_native_never_shown_raw(self):
+        """A machine-assigned `<role>#<id8>` session name is a ROLE, never a
+        title: humanized, plus the short task label from the session's own
+        first instruction (review round 2)."""
+        path = self.write_pi("w/--home-x--/role.jsonl", _pi_session(
+            1_800_000_000, "Audit the capacity adapter math"))
+        title, source = tt.resolve_agent(self._agent(path), "tendril", [],
+                                         titles={}, home=self.home)
+        # the transcript carries a session_info name backend-scout#2cbfa86a
+        # in this variant:
+        path2 = self.write_pi("w/--home-x--/role2.jsonl", _pi_session(
+            1_800_000_000, "Audit the capacity adapter math",
+            name="backend-scout#2cbfa86a"))
+        title2, source2 = tt.resolve_agent(self._agent(path2), "tendril", [],
+                                           titles={}, home=self.home)
+        self.assertEqual(title2, "Backend scout · Audit the capacity adapt")
+        self.assertEqual(source2, "instruction")
+        self.assertTrue(title is not None and "#" not in title)
+
     def test_manual_beats_everything(self):
         path = self.write_pi("w/--home-x--/e.jsonl", _pi_session(
             1_800_000_000, "Rewrite the pairing bloom timings",

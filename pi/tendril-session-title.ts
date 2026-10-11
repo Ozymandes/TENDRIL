@@ -41,6 +41,69 @@ const BANNED = new Set([
 ]);
 
 const GREETING_RE = /^(hi+|hello+|hey+|yo+|howdy|greetings|good (morning|afternoon|evening|day))\b/;
+// Emphasis caps in prose (THE, ONLY, FAST, DISK, DEMO...) are NOT identity.
+// A token keeps its written form only when it is a KNOWN acronym/product
+// token, carries a digit (RC2, GLM-5.3, S21), or is internal-CamelCase
+// (Z.AI, GitHub, iOS). Everything else sentence-cases; when unsure,
+// sentence case. Map is lowercase key -> canonical display.
+const ACRONYMS = new Map(Object.entries({
+	live: "LIVE", rc2: "RC2", ui: "UI", ux: "UX", api: "API", ca: "CA",
+	cli: "CLI", mcp: "MCP", pr: "PR", qa: "QA", glm: "GLM", apk: "APK",
+	s21: "S21", ntfy: "ntfy", "z.ai": "Z.AI", pi: "Pi", herdr: "Herdr",
+	tendril: "Tendril", omarchy: "Omarchy", android: "Android",
+}));
+// product/surface words alone are never a title ("Tendril LINK", "Pi")
+const PRODUCT_WORDS = new Set(
+	("tendril link pi herdr live omarchy android glm z.ai codex claude "
+		+ "arch linux macos windows ui").split(" "));
+
+function earlyBeClause(clause) {
+	// narration ("Claude opus is the sole reviewer"): a bare is/are within
+	// the first few words is a statement, never a topic
+	return /^[a-zA-Z0-9' .\-]{0,40}\b(is|are|was|were)\b/i.test(clause);
+}
+
+function isCamel(tok) {
+	return /[a-z]/.test(tok) && /[A-Z]/.test(tok.slice(1));
+}
+
+function normalizeWord(w, first) {
+	const key = w.toLowerCase();
+	if (ACRONYMS.has(key)) return ACRONYMS.get(key);
+	if (/\d/.test(w) || isCamel(w)) return w;
+	if (first) return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+	return w.toLowerCase();
+}
+
+// A title never ENDS on a function word, determiner, preposition, auxiliary,
+// dangling adverb/adjective or a bare verb — a 32-char cut that lands there
+// is a dangling clause. Back off to the last noun-like word.
+const TAIL_STOP = new Set(`
+to of the a an for with and or only is are be been being was were am in on at
+by from into onto over under up down out off about as so that this these
+those it its their our your my his her we they he she i you do does did done
+has have had will would can could should shall may might must not no nor yes
+ok okay run runs ran make makes making build building use uses used using
+get gets getting go goes going work works working act acts act open opens
+opened opening close start starts started stop stops stopped launch launches
+launched add adds adding remove removes removing update updates updating
+create creates creating delete write writes writing read reads reading send
+send check checking verify verify test tests testing try trying move copy
+keep let know think see look feel seem exist exists existed help need needs
+want take takes give find tell ask say said come comes came become becomes
+became leave leaves put mean means meant stay stays remain remains happen
+happens happened begin begins began begin end ends ended continue continues
+continued finish finishes finished complete completes completed fail fails
+failed latest authoritative current important new own same other more most
+very first last next each every all any some then now here there please
+exactly verbatim yet still also both per via after before between during
+without within across against among around behind below above near since
+until toward towards upon while if because than when what which who whom
+whose where why how least itself themselves myself yourself
+`.split(/\s+/));
+const ADJ_TAIL_RE = /(ive|ful|ous|less|able|ible)$|ed$|ing$|ly$/;
+const ED_NOUNS = new Set(["changed", "field", "content", "ground", "sound", "thing", "king", "ring", "spring", "warning", "family", "supply", "july", "ally", "rely"]);
+const DEBRIS_CHARS_RE = /["'{}\[\]<>=|\\`]/;
 const FILLERS = [
 	"please", "pls", "plz", "hey", "hi", "ok", "okay", "so", "then", "now",
 	"also", "and", "but", "can you", "could you", "would you", "will you",
@@ -49,9 +112,79 @@ const FILLERS = [
 	"reply with", "respond with", "answer with",
 	"exactly", "verbatim", "when ready", "asap",
 ];
-// a title is prose: these characters never appear in a kept candidate
-const DEBRIS_CHARS_RE = /["'{}\[\]<>=|\\`]/;
 const PREAMBLE_RE = /^(you are|you're|you will act|you must act|act as|as an? [a-z]|your role|i want you to act|take the role|role:)\b/i;
+// boilerplate openers (cert prompts, orchestration scaffolding, error
+// strings): the line is never a topic — those sessions fall through
+const SKIP_LINE_RES = [
+	/^this (is|machine|session)\b/i,
+	/^we (are|'re|will be)\b/i,
+	/^i want this\b/i,
+	// meta-statement ("The engine is real") — narration, never a topic
+	/^the [a-z' ]{0,40}\b(is|are|was|were)\b/i,
+	/^(wait|sleep)\b/i,
+	/^repository root\b/i,
+	/^this session exists\b/i,
+	/^we (are|'re|will be) now\b/i,
+	/^we are now\b/i,
+	/^important (current|:|update)\b/i,
+	/^use (your|the) (shell|subagent) tool\b/i,
+	/^current state\b/i,
+	/^preflight only\b/i,
+	// tool-invocation cert prompts ("Call z_ai_vision …",
+	// "Use the zai-mcp-vision tool")
+	/^call [a-z][a-z0-9]*_[a-z0-9_]+\b/i,
+	/^use (your|the) [a-z0-9.-]+ tool\b/i,
+	/^execute this\b/i,
+	// first-person status narration ("Am on Omarchy arch linux")
+	/^(am|i am|i'm)\b/i,
+	/^on (omarchy|arch|linux|mac\b|macos)\b/i,
+	/^current (time|git|state|directory|status|problem)\b/i,
+	/^(have|had) around\b/i,
+	// "I have around one hour …", "I'm on Omarchy …" — status narration
+	/^(i|you|we) (have|had) (around|about|only)\b/i,
+	/^i[\u2019']?m\b/i,
+	/^confirm that this\b/i,
+	/^(have|had) around\b/i,
+	// "I have around one hour …", "I'm on Omarchy …" — status narration
+	/^(i|you|we) (have|had) (around|about|only)\b/i,
+	/^i[\u2019']?m\b/i,
+	/^call (the )?[a-z0-9._-]+ tool\b/i,
+	// bare tool-call cert prompts ("Call summarize …")
+	/^call [a-z_]{3,}\b/i,
+	// orchestrator-brief section headers picked as "titles"
+	/^(the )?(primary goal|outcome|most important (rule|thing)|critical routing rule|system context|project root)\b/i,
+	/^reply (exactly|with exactly)\b/i,
+	/^mcp error\b/i,
+	/^error\s*:/i,
+	/^traceback \(most recent call last\)/i,
+	/^read\b.{1,64}\bfirst\b/i,
+];
+// sentinel routing tokens: ALL-CAPS-WITH-DASHES(-OK). LINE-skip needs >= 3
+// segments (TENDRIL-D10-LIVE-OK); single-dash heads ("ONE-DAY sprint") are
+// emphasis caps, not sentinels.
+const SENTINEL_RE = /^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$/;
+const SENTINEL_LINE_RE = /^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+){2,}$/;
+// label prefixes that STRIP to their content ("Task: Herdr recovery fix")
+const LABEL_RE = /^(task|context|role|note|important|current state)\s*:\s*/i;
+// dates are never salient summary terms: Aug-30, 2026-10-04, 10/04, 2026
+const DATE_TOKEN_RE = /^(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*[-._]?[0-9]{1,2}$|^\d{4}-\d{2}-\d{2}$|^\d{1,2}[/.-]\d{1,2}(?:[/.]\d{2,4})?$|^\d{4}$/i;
+// verb/protocol words are never summary terms ("<Model> Running",
+// "<sentinel> Reply" are banned shapes)
+const SUMMARY_STOP = new Set(`
+running run runs ran reply replies replied respond responding answer answers
+answered output exactly verbatim please working waits waiting wait active
+idle done fail failed failing error errors start starts started starting stop
+stops stopped summary current state says said using use used try trying
+tried let lets new now things stuff works worked keep keeps kept going goes
+gone make makes made need needs wanted want thanks good great nice best
+better worse bad bash zsh
+shell tool tools subagent subagents sleep full true false launch launches
+launching one two return returns image images finish finishes finished
+taskdone containing including regarding involving project root
+request requests background hello already reference command commands
+task calls call summarize analysis visual through max word urls url create
+created
+`.split(/\s+/));
 const HEADER_RE = /^#{1,6}\s+/;
 const BANNER_RE = /^([-_=*~·─-╿]{5,})$/;
 const QUOTE_RE = /^>\s?/;
@@ -88,20 +221,28 @@ sure thanks please yeah yup nah maybe stuff things work works keep keeps
 keeping going still
 `.split(/\s+/));
 
-function shoutyOrPreserve(token) {
-	if (/\d/.test(token)) return true;
-	if (/[a-z]/.test(token)) return true;
-	if (!/[A-Z]/.test(token)) return true;
-	const segments = token.split(/[-/_.]+/).filter((s) => s.length > 0);
-	if (segments.length === 0) return true;
-	if (segments.some((s) => s.length <= 4)) return true; // LIVE, RC2, IT, Z.AI
-	return false; // DESIGN-LANGUAGE, UPLIFT → sentence case
-}
-
 function shoutyClause(clause) {
 	const words = clause.split(TOKEN_SPLIT_RE).filter((w) => w.length > 0);
 	return words.length > 0 && words.every(
 		(w) => w === w.toUpperCase() && /[A-Za-z]/.test(w));
+}
+
+function allProductWords(words) {
+	return words.length > 0 && words.every(
+		(w) => PRODUCT_WORDS.has(cleanToken(w).toLowerCase()));
+}
+
+function tailNounLike(words, allowIngTail = false) {
+	if (words.length === 0) return false;
+	const lw = words[words.length - 1].toLowerCase()
+		.replace(/^[.,;:!?()[\]{}"']+|[.,;:!?()[\]{}"']+$/g, "");
+	if (!lw) return false;
+	if (TAIL_STOP.has(lw)) return false;
+	if (lw.endsWith("-quality")) return false;
+	if (ED_NOUNS.has(lw)) return true;
+	if (allowIngTail && lw.endsWith("ing")) return true;
+	if (ADJ_TAIL_RE.test(lw) && lw.length >= 5) return false;
+	return true;
 }
 
 function cleanToken(tok) {
@@ -130,16 +271,7 @@ function meaningfulWords(words) {
 }
 
 function sentenceCase(words) {
-	return words.map((w, i) => {
-		if (i === 0) {
-			if (!shoutyOrPreserve(w)) {
-				return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
-			}
-			if (/[A-Z]/.test(w.slice(1))) return w;
-			return w.charAt(0).toUpperCase() + w.slice(1);
-		}
-		return shoutyOrPreserve(w) ? w : w.toLowerCase();
-	});
+	return words.map((w, i) => normalizeWord(w, i === 0));
 }
 
 function normalizeCandidate(text) {
@@ -157,13 +289,18 @@ function normalizeCandidate(text) {
 		if (BANNER_RE.test(line) || QUOTE_RE.test(line) || line.startsWith("|")) {
 			continue;
 		}
-		if ((line.startsWith("{") || line.startsWith("["))
-			&& (line.endsWith("}") || line.endsWith("]"))) {
-			continue; // a JSON/protocol line, not prose
+		if (line.startsWith("{") || line.startsWith("[")) {
+			continue; // a JSON/protocol line (paths glue on!), not prose
 		}
 		// a markdown header IS a title-shaped line: use its text
 		line = line.replace(HEADER_RE, "").trim();
 		if (!line) continue;
+		// sentinel routing tokens, cert prompts, scaffolding, errors:
+		// never a topic — keep scanning later lines
+		if (SENTINEL_LINE_RE.test(cleanToken(line.split(TOKEN_SPLIT_RE, 1)[0]))) {
+			continue;
+		}
+		if (SKIP_LINE_RES.some((rx) => rx.test(line))) continue;
 		// role preambles: drop the preamble SENTENCES, keep the rest
 		while (line && PREAMBLE_RE.test(line)) {
 			const idx = line.search(/(?<=[.!?])\s/);
@@ -173,6 +310,9 @@ function normalizeCandidate(text) {
 				line = "";
 			}
 		}
+		if (!line) continue;
+		// label prefixes strip to their content ("Task: Herdr recovery fix")
+		line = line.replace(LABEL_RE, "").trim();
 		if (!line) continue;
 		const first = cleanToken(line.split(TOKEN_SPLIT_RE, 1)[0]).toLowerCase();
 		if (SHELL_WORDS.has(first) && SHELL_SHAPE_RE.test(line)) continue;
@@ -188,11 +328,22 @@ function normalizeCandidate(text) {
 		.map((c) => (c || "").trim()).filter((c) => c.length > 0);
 	if (clauses.length === 0) return null;
 	let clause = clauses[0];
-	const nWords = meaningfulWords(clause.split(/\s+/)).length;
-	if (nWords < 2 && clauses.length > 1) {
+	// the product name alone ("TENDRIL LINK —") and short shouty heads defer
+	// to the next, more specific segment of the title line
+	const defers = (c) => {
+		const words = meaningfulWords(c.split(/\s+/));
+		return words.length < 2
+			|| (words.length <= 2 && shoutyClause(c))
+			|| allProductWords(words);
+	};
+	if (clauses.length > 1 && defers(clause)) {
 		clause = clauses[1];
-	} else if (nWords <= 2 && clauses.length > 1 && shoutyClause(clause)) {
-		clause = clauses[1];
+	}
+	// scaffolding clauses hide behind fillers ("and execute this as one"):
+	// re-check AFTER the strip
+	if (/^(execute this|this is|we are|i want this|wait|sleep)\b/i.test(clause)
+		|| earlyBeClause(clause)) {
+		return null; // scaffolding/narration, never a topic
 	}
 	// iteratively strip leading politeness/filler phrases
 	let changed = true;
@@ -210,24 +361,34 @@ function normalizeCandidate(text) {
 	return clause || null;
 }
 
-function finalize(words, limit) {
+function finalize(words, limit, allowIngTail = false) {
 	const cleaned = meaningfulWords(
 		words.map((w) => cleanToken(w)).filter((w) => w.length > 0));
 	if (cleaned.length < 2) return null;
-	let title = sentenceCase(cleaned).join(" ");
+	let parts = sentenceCase(cleaned);
+	// clause-boundary back-off: never END on a function word, determiner,
+	// preposition, auxiliary, dangling adjective or bare verb
+	while (parts.length > 0 && !tailNounLike(parts, allowIngTail)) parts.pop();
+	if (parts.length < 2) return null;
+	let title = parts.join(" ");
 	title = title.replace(/^[\t ,;:—–\-·]+|[\t ,;:—–\-·]+$/g, "");
 	if (title.length > limit) {
 		let cut = title.slice(0, limit);
 		const sp = cut.lastIndexOf(" ");
 		if (sp > 0) cut = cut.slice(0, sp);
 		title = cut.replace(/^[\t ,;:—–\-·]+|[\t ,;:—–\-·]+$/g, "");
+		parts = title.split(" ");
+		while (parts.length >= 2 && !tailNounLike(parts, allowIngTail)) parts.pop();
+		title = parts.join(" ");
 	}
+	if (parts.length < 2) return null;
 	const letters = [...title].filter((c) => /[a-zA-Z\u00c0-\u024f]/.test(c)).length;
 	const body = title.replace(/ /g, "").length;
 	if (letters < 4 || letters < body / 2) return null;
 	if (DEBRIS_CHARS_RE.test(title)) return null; // JSON/protocol debris
 	const norm = title.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
 	if (BANNED.has(norm) || GREETING_RE.test(norm)) return null;
+	if (allProductWords(title.split(" "))) return null; // product name alone
 	return title.length > 0 ? title : null;
 }
 
@@ -250,16 +411,21 @@ export function deriveSummary(turns, limit = DERIVE_CAP) {
 		for (const raw of turn.replace(/\n/g, " ").split(TOKEN_SPLIT_RE)) {
 			const tok = cleanToken(raw);
 			if (!tok || isNoise(tok) || !WORD_RE.test(tok)) continue;
+			if (tok.includes(":") || tok.includes("=")) continue;
 			const key = tok.toLowerCase();
-			if (STOPWORDS.has(key)) continue;
+			if (STOPWORDS.has(key) || SUMMARY_STOP.has(key)) continue;
+			if (SENTINEL_RE.test(tok) || DATE_TOKEN_RE.test(tok)) continue;
 			if (!scores.has(key)) scores.set(key, { score: 0, first: order++ });
 			const entry = scores.get(key);
 			if (!seen.has(key)) {
 				entry.score += 3; // presence per turn
 				seen.add(key);
 			}
-			if (/[A-Z]/.test(tok.slice(1))) entry.score += 3; // CamelCase
-			else if (shoutyOrPreserve(tok) && tok !== tok.toLowerCase()) entry.score += 3;
+			if (isCamel(tok)
+				|| (tok === tok.toUpperCase() && /[A-Za-z]/.test(tok)
+					&& ACRONYMS.has(key))) {
+				entry.score += 3; // CamelCase / known acronym
+			}
 			if (/\d/.test(tok)) entry.score += 2;
 			if (/[._+/-]/.test(tok)) entry.score += 1;
 		}
@@ -282,12 +448,17 @@ export function deriveSummary(turns, limit = DERIVE_CAP) {
 			}
 		}
 	}
-	return finalize(top.map((k) => cased.get(k)), limit);
+	return finalize(top.map((k) => cased.get(k)), limit, true);
 }
 
 export function humanizeRole(name) {
 	if (typeof name !== "string" || !name.trim()) return null;
-	let n = name.trim().replace(/[_-][0-9a-fA-F]{6,8}$/, "").replace(/[_\s]+/g, " ").trim().replace(/^[ ._-]+|[ ._-]+$/g, "");
+	let n = name.trim()
+		.replace(/[#+_\-][0-9a-fA-F]{6,8}$/, "")
+		.replace(/#+/g, " ")
+		.replace(/[-_\s]+/g, " ")
+		.trim()
+		.replace(/^[ ._-]+|[ ._-]+$/g, "");
 	if (!n) return null;
 	if (n.charAt(0) >= "a" && n.charAt(0) <= "z") {
 		n = n.charAt(0).toUpperCase() + n.slice(1);
