@@ -35,9 +35,13 @@ class LauncherSources(unittest.TestCase):
     def test_launcher_has_the_real_connect_logic(self):
         src = read(TENDRIL)
         self.assertIn("# tendril — TENDRIL", src)
-        for needle in ('mosh "$ALIAS" -- sh -lc', 'exec ssh -t "$ALIAS"',
-                       "BatchMode=yes", "attach | resolve | focus | link",
-                       "*[!A-Za-z0-9._:-]*"):
+        for needle in (
+                # RC2 fast path: mosh with the shared ControlMaster bootstrap,
+                # the degraded exec ssh -t, the failure-only key probe:
+                'mosh --ssh="ssh $SESSION_CM_OPTS"',
+                'exec ssh -t $SESSION_CM_OPTS "$ALIAS"',
+                "BatchMode=yes", "attach | resolve | focus | link",
+                "*[!A-Za-z0-9._:-]*"):
             self.assertIn(needle, src)
         self.assertNotIn("compatibility alias", src.splitlines()[1])
 
@@ -196,7 +200,11 @@ class SelfUpgrade(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         with open(self.ssh_log) as f:
             calls = f.read()
-        self.assertIn("-o BatchMode=yes dad@omarchy", calls)
+        # RC2: the upgrade dial carries the shared connection-reuse options
+        # (BatchMode + ControlPersist — the warm master the polling owns).
+        self.assertIn("-o BatchMode=yes", calls)
+        self.assertIn("-o ControlPersist=120", calls)
+        self.assertIn(" dad@omarchy ", calls)
         self.assertIn("remote-agents --phone-script upgrade", calls)
         with open(self.ran_log) as f:               # the download executed
             self.assertEqual(f.read().splitlines(), ["RAN"])

@@ -27,6 +27,10 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI = os.path.join(REPO, "bin", "remote-agents")
 LAUNCHER = os.path.join(REPO, "phone", "tendril")
 
+# RC2 connection reuse (mirrors phone/tendril): see tests/test_phone_verbs.py.
+CM = "-o ControlMaster=auto -o ControlPath=~/.ssh/tendril-cm-%C"
+BATCH_CM = CM + " -o ControlPersist=120 -o ConnectionAttempts=1"
+
 
 def load_cli():
     loader = SourceFileLoader("remote_agents_snapshot", CLI)
@@ -249,7 +253,8 @@ class SnapshotLauncher(unittest.TestCase):
         p = self.run_launcher(["snapshot"])
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(self.calls(), [
-            "ssh -o BatchMode=yes -o ConnectTimeout=6 testhost remote-agents snapshot",
+            "ssh -o BatchMode=yes -o ConnectTimeout=6 " + BATCH_CM
+            + " testhost remote-agents snapshot",
         ])
         self.assertIn("SNAPSHOT-JSON-LINE", p.stdout)
 
@@ -257,7 +262,8 @@ class SnapshotLauncher(unittest.TestCase):
         p = self.run_launcher(["otherhost", "snapshot"], alias="unused")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertEqual(self.calls(), [
-            "ssh -o BatchMode=yes -o ConnectTimeout=6 otherhost remote-agents snapshot",
+            "ssh -o BatchMode=yes -o ConnectTimeout=6 " + BATCH_CM
+            + " otherhost remote-agents snapshot",
         ])
         self.assertNotIn("unused", " ".join(self.calls()))
 

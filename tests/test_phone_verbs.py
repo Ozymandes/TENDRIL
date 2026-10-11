@@ -42,6 +42,16 @@ RA = os.path.join(REPO, "bin", "remote-agents")
 
 GOOD_ID = "t-20261010-a1b2c3d4"
 GOOD_PAYLOAD = "QXJjaGl0ZWN0dXJlLWF1ZGl0LXBsYW5uZWQ"      # base64url chars only
+
+# RC2 connection reuse (phone/tendril builds these from CM_OPTS /
+# BATCH_CM_OPTS / SESSION_CM_OPTS): every launcher ssh multiplexes over
+# one control socket per destination. ControlPersist is BatchMode-only
+# (background verbs own the warm master; interactive sessions never
+# linger), and the interactive/plain set carries the bounded
+# ConnectTimeout the old preflight used to provide.
+CM = "-o ControlMaster=auto -o ControlPath=~/.ssh/tendril-cm-%C"
+BATCH_CM = CM + " -o ControlPersist=120 -o ConnectionAttempts=1"
+SESSION_CM = CM + " -o ConnectionAttempts=1 -o ConnectTimeout=6"
 HINT = ("L opens TENDRIL Link on the phone — "
         "if nothing opened, run: tendril link")
 AM_LINE = "am start -n app.tendril.link/.MainActivity"
@@ -147,7 +157,8 @@ class FixedVerbs(LauncherEnv):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(self.calls(),
                          ["ssh -o BatchMode=yes -o ConnectTimeout=6 "
-                          "testhost remote-agents snapshot"])
+                          + BATCH_CM +
+                          " testhost remote-agents snapshot"])
 
     def test_snapshot_extra_arg_is_refused_without_dialing(self):
         p = self.run_launcher(["snapshot", "--evil"])
@@ -166,7 +177,8 @@ class FixedVerbs(LauncherEnv):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(self.calls(),
                          ["ssh -o BatchMode=yes -o ConnectTimeout=6 "
-                          "testhost remote-agents capacity --json"])
+                          + BATCH_CM +
+                          " testhost remote-agents capacity --json"])
 
     def test_capacity_extra_arg_is_refused_without_dialing(self):
         p = self.run_launcher(["testhost", "capacity", "--json"])
@@ -179,7 +191,7 @@ class FixedVerbs(LauncherEnv):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(self.calls(),
                          ["ssh -o BatchMode=yes -o ConnectTimeout=6 "
-                          "testhost remote-agents schedule show "
+                          + BATCH_CM + " testhost remote-agents schedule show "
                           "'%s'" % GOOD_ID])
 
     def test_schedule_cancel_quotes_the_id_over_batchmode_ssh(self):
@@ -187,7 +199,7 @@ class FixedVerbs(LauncherEnv):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(self.calls(),
                          ["ssh -o BatchMode=yes -o ConnectTimeout=6 "
-                          "testhost remote-agents schedule cancel "
+                          + BATCH_CM + " testhost remote-agents schedule cancel "
                           "'%s'" % GOOD_ID])
 
     def test_schedule_add_quotes_the_payload_over_batchmode_ssh(self):
@@ -195,7 +207,7 @@ class FixedVerbs(LauncherEnv):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(self.calls(),
                          ["ssh -o BatchMode=yes -o ConnectTimeout=6 "
-                          "testhost remote-agents schedule add "
+                          + BATCH_CM + " testhost remote-agents schedule add "
                           "'%s'" % GOOD_PAYLOAD])
 
     # ---- §7.3: strict target schema on the launcher side ------------
@@ -372,13 +384,13 @@ class LinkVerb(LauncherEnv):
         p = self.run_launcher(["testhost", "link", "w3"])
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(self.calls(),
-                         ["ssh testhost remote-agents link 'w3'"])
+                         ["ssh " + SESSION_CM + " testhost remote-agents link 'w3'"])
 
     def test_link_with_id_via_default_alias(self):
         p = self.run_launcher(["link", "w3"], TENDRIL_ALIAS="testhost")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(self.calls(),
-                         ["ssh testhost remote-agents link 'w3'"])
+                         ["ssh " + SESSION_CM + " testhost remote-agents link 'w3'"])
 
     def test_link_bad_id_is_refused_locally(self):
         for bad in ("bad id", "", "x;y", "$(id)", "`id`", "'",
@@ -439,7 +451,9 @@ class SelectorLKey(LauncherEnv):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("mosh failed - falling back to ssh", p.stdout)
         self.assertTrue(any(c.startswith("mosh ") for c in self.calls()))
-        self.assertIn("ssh -t testhost remote-agents", self.calls())
+        # the probe ran (its rc 0: key auth fine) and only THEN the fallback
+        self.assertIn("ssh -t " + SESSION_CM + " testhost remote-agents",
+                      self.calls())
         self.assertEqual(self.am_calls(), [])
 
     def test_selector_l_on_the_host_prints_the_hint_and_exits_75(self):

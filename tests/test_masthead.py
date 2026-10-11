@@ -427,7 +427,9 @@ class Launcher(unittest.TestCase):
 
     def test_tendril_alias_wins_over_legacy_agent_alias(self):
         _, calls, _ = self.launch("tendril", TENDRIL_ALIAS="new", AGENT_ALIAS="old")
-        self.assertIn("mosh new", calls)
+        # RC2: the mosh dial carries the shared ControlMaster bootstrap
+        self.assertIn("mosh --ssh=", calls)
+        self.assertIn(" new -- sh -lc ", calls)
         self.assertNotIn("old", calls)
 
     def test_missing_alias_prints_usage(self):

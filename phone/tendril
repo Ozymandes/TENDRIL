@@ -60,6 +60,78 @@
 # own one-line hint instead (LINK-CONTRACT-0.2 §4).
 LINK_OPEN_STATUS=75
 
+# ---------- RC2 perf: launch trace + SSH connection reuse ----------------
+# Both switches are zero-cost when off: one env test and one stat, then
+# the trace helper returns before touching anything.
+#
+# TRACE: TENDRIL_TRACE=1 or the existence of ~/.config/tendril/trace
+# appends one line per stage to ~/.cache/tendril/launch.log:
+#     <epoch_ms> <stage> [rc]
+# (start, args-validated, preflight-start/-end, transport-chosen-*,
+# mosh-exec, ssh-exec, fallback). Verb names only — never a hostname,
+# argument or prompt text. The HOST writes the same file name on its own
+# side (remote-agents), so both wall-clock logs interleave into one
+# timeline (docs/LATENCY.md). 0600, rotated at 64 KB (one .old
+# generation). %s%3N is the Termux/GNU ms clock; shells whose date lacks
+# %N fall back to plain seconds *1000.
+#
+# CONNECTION REUSE: every launcher ssh — background verbs AND the
+# interactive path, including mosh's bootstrap — multiplexes over one
+# control socket per destination (ControlPath ~/, %C is the per-host
+# hash; ssh expands the ~ itself, so the option string stays one token
+# for `mosh --ssh`). While the Link app polls (snapshot/health, BatchMode
+# + ControlPersist=120) a warm master stays up and the next interactive
+# open skips the TCP+SSH handshake entirely — measured on OpenSSH 10:
+# reuse answers in single-digit ms vs a 160-260 ms handshake, and a
+# STALE socket (host rebooted, port changed) is not fatal: with
+# ControlMaster=auto the client falls back to a direct connection.
+# Interactive sessions REUSE a master but never linger: no ControlPersist,
+# so nothing keeps running after the selector closes. ControlPersist
+# stays BatchMode-only on purpose — background polling is exactly the
+# 'handoff is imminent' signal, and it owns the warm socket.
+_t_trace=""
+if [ "${TENDRIL_TRACE:-}" = "1" ] || [ -e "$HOME/.config/tendril/trace" ]; then
+    _t_trace=1
+fi
+
+_t_log() {
+    # _t_log <stage> [rc] — one line, best effort, never fatal.
+    [ -n "${_t_trace:-}" ] || return 0
+    _t_d="$HOME/.cache/tendril"
+    _t_f="$_t_d/launch.log"
+    if [ ! -d "$_t_d" ]; then
+        (umask 077 && mkdir -p "$_t_d") || return 0
+    fi
+    if [ ! -f "$_t_f" ]; then
+        (umask 077 && : > "$_t_f") || return 0
+        chmod 0600 "$_t_f" 2>/dev/null
+    elif [ "$(wc -c <"$_t_f" 2>/dev/null || echo 0)" -ge 65536 ]; then
+        mv -f "$_t_f" "$_t_f.old" 2>/dev/null
+    fi
+    _t_ms=$(date +%s%3N 2>/dev/null)
+    case "${_t_ms:-}" in
+        "" | *[!0-9]*) _t_ms="$(date +%s 2>/dev/null)000" ;;
+    esac
+    printf '%s %s%s\n' "${_t_ms:-0}" "$1" "${2:+ $2}" >> "$_t_f" 2>/dev/null
+}
+_t_log start
+
+# $HOME/.ssh must exist for the control socket (0700 if WE create it; an
+# existing directory is never touched, and the user's ~/.ssh/config is
+# never read or edited by any of this).
+CM_OPTS=""
+if [ -d "$HOME/.ssh" ] || { (umask 077 && mkdir -p "$HOME/.ssh") 2>/dev/null; }; then
+    CM_OPTS="-o ControlMaster=auto -o ControlPath=~/.ssh/tendril-cm-%C"
+fi
+# BatchMode verbs (snapshot/schedule/capacity/health/herdr/upgrade/probe):
+# reuse masters AND leave one warm for 120 s.
+BATCH_CM_OPTS="$CM_OPTS -o ControlPersist=120 -o ConnectionAttempts=1"
+# Interactive/plain verbs: reuse a warm master, create none that lingers.
+# ConnectionAttempts=1 + ConnectTimeout=6 keep failure detection bounded
+# on the transport itself (the old preflight's job, moved onto the one
+# handshake we actually make) without stacking a second handshake.
+SESSION_CM_OPTS="$CM_OPTS -o ConnectionAttempts=1 -o ConnectTimeout=6"
+
 # open_link_app - launch TENDRIL Link on THIS device. Fixed component from
 # the contract; no input ever reaches the intent (LINK-CONTRACT-0.2 §4).
 open_link_app() {
@@ -154,7 +226,9 @@ case "${1:-}" in
         fi
         trap 'rm -f "$UP_TMP"' EXIT HUP INT TERM
         # download fully, THEN run: never pipe a partial stream into sh
-        if ssh -o BatchMode=yes "$ALIAS" "remote-agents --phone-script upgrade" > "$UP_TMP" \
+        # (BatchMode + connection reuse: same warm master as the polling)
+        if ssh -o BatchMode=yes $BATCH_CM_OPTS "$ALIAS" \
+            "remote-agents --phone-script upgrade" > "$UP_TMP" \
            && [ -s "$UP_TMP" ]; then
             sh "$UP_TMP"
             rc=$?
@@ -311,29 +385,55 @@ if [ -z "$ALIAS" ]; then
     no_alias_help
     exit 1
 fi
+_t_log args-validated
 
 # resolve/focus/link print a result and exit: one plain SSH round trip.
 # snapshot/schedule/capacity are the same shape, but strictly non-interactive:
 # BatchMode (never a password prompt mid-probe), a short connect timeout,
 # no TTY, no Mosh — the Link app's probe must end in a result, not a
-# hanging session.
+# hanging session. Connection reuse keeps every poll's handshake off the
+# critical path (see the RC2 perf block at the top).
 case "$MODE" in
-    resolve | focus | link) exec ssh "$ALIAS" "$REMOTE_CMD" ;;
+    resolve | focus | link)
+        _t_log transport-chosen-ssh
+        _t_log ssh-exec
+        exec ssh $SESSION_CM_OPTS "$ALIAS" "$REMOTE_CMD" ;;
     snapshot | schedule | capacity | health | herdr)
-        exec ssh -o BatchMode=yes -o ConnectTimeout=6 "$ALIAS" "$REMOTE_CMD" ;;
+        _t_log transport-chosen-ssh
+        _t_log ssh-exec
+        exec ssh -o BatchMode=yes -o ConnectTimeout=6 $BATCH_CM_OPTS \
+            "$ALIAS" "$REMOTE_CMD" ;;
 esac
 
-if ! ssh -o ConnectTimeout=5 -o BatchMode=yes "$ALIAS" true 2>/dev/null; then
+# ---------- interactive: healthy fast path first -------------------------
+# ONE transport invocation before the first byte (RC2 perf): the old
+# synchronous `ssh … true` preflight is GONE from the healthy path — it
+# was a full second serial handshake (measured 160-260 ms warm, and
+# ConnectTimeout=5 turned one dead resolved address into a ~5 s stall).
+# The key-auth probe now runs ONLY after a transport failure, and its
+# guidance + degraded `exec ssh -t` behavior is preserved: when key auth
+# is not set up (detected via the FAILED attempt, never a pre-check) the
+# user still gets the first-time hints and a password-capable session
+# whose rc propagates (the selector's L key ends the session here; the
+# host selector's one-line hint still explains L).
+_PROBED=0
+key_probe() {
+    _t_log preflight-start
+    # NOTE: no `if ssh …` here — an `if` with no else branch reports 0
+    # when its condition fails, which would swallow the probe's rc.
+    ssh -o ConnectTimeout=5 -o BatchMode=yes $BATCH_CM_OPTS \
+        "$ALIAS" true 2>/dev/null
+    _rc_p=$?
+    _t_log preflight-end "$_rc_p"
+    return "$_rc_p"
+}
+key_auth_guidance() {
     echo "[tendril] key-auth check failed for '$ALIAS'."
     echo "  - is Tailscale connected on this device?"
     echo "  - first time? run: ssh $ALIAS   (accept host key, password once)"
     echo "  - then: ssh-copy-id $ALIAS"
     echo "[tendril] attempting interactive SSH anyway..."
-    # degraded path (no key auth yet): exec straight into ssh so its rc
-    # propagates; the selector's L key just ends the session here (the
-    # host selector's one-line hint still tells the user what L does).
-    exec ssh -t "$ALIAS" "$REMOTE_CMD"
-fi
+}
 
 if [ -z "$FORCE_SSH" ] && command -v mosh >/dev/null 2>&1; then
     # mosh-client does NOT propagate the remote exit status (verified on
@@ -341,9 +441,39 @@ if [ -z "$FORCE_SSH" ] && command -v mosh >/dev/null 2>&1; then
     # selector's L key (LINK_OPEN_STATUS) cannot reach finish_interactive
     # over mosh — the host selector prints its own one-line hint in-band
     # instead. A non-zero status HERE is mosh's own failure (client or
-    # connection refused), which falls back to ssh below.
-    mosh "$ALIAS" -- sh -lc "exec $REMOTE_CMD" && exit 0
+    # connection refused), which runs the diagnostic probe once and then
+    # falls back to ssh below. The bootstrap reuses a warm master via
+    # --ssh (same ControlPath as every other launcher ssh).
+    _t_log transport-chosen-mosh
+    _t_log mosh-exec
+    if mosh --ssh="ssh $SESSION_CM_OPTS" "$ALIAS" \
+        -- sh -lc "exec $REMOTE_CMD"; then
+        exit 0
+    fi
+    _t_log fallback
+    _PROBED=1
+    if ! key_probe; then
+        key_auth_guidance
+        exec ssh -t $SESSION_CM_OPTS "$ALIAS" "$REMOTE_CMD"
+    fi
     echo "[tendril] mosh failed - falling back to ssh"
 fi
-ssh -t "$ALIAS" "$REMOTE_CMD"
-finish_interactive $?
+_t_log transport-chosen-ssh
+_t_log ssh-exec
+ssh -t $SESSION_CM_OPTS "$ALIAS" "$REMOTE_CMD"
+_rc=$?
+if [ "$_rc" -eq 0 ]; then
+    finish_interactive 0
+fi
+# ssh's OWN failure (255: refused, unreachable, auth): one diagnostic
+# probe, and the degraded path when key auth is missing. A remote
+# command status (anything else, incl. the L key's 75) passes through
+# untouched. At most ONE probe per launch.
+if [ "$_rc" -eq 255 ] && [ "$_PROBED" -eq 0 ]; then
+    if ! key_probe; then
+        key_auth_guidance
+        exec ssh -t $SESSION_CM_OPTS "$ALIAS" "$REMOTE_CMD"
+    fi
+fi
+finish_interactive "$_rc"
+

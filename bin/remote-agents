@@ -20,6 +20,37 @@ import sys
 import time
 import unicodedata
 
+# ---------- RC2 perf: launch trace ---------------------------------------
+# phone/tendril writes the SAME file name on the device, so both wall-clock
+# epoch_ms logs interleave into one merged timeline (docs/LATENCY.md).
+# ZERO cost when off: one env lookup + one stat at import, then an early
+# return per stage. Stages only — never hostnames, tokens or prompt text.
+_TRACE_ON = (os.environ.get("TENDRIL_TRACE") == "1"
+             or os.path.isfile(os.path.expanduser(
+                 "~/.config/remote-agents/trace")))
+
+
+def _trace(stage):
+    """Append `<epoch_ms> <stage>` to ~/.cache/tendril/launch.log (0600)."""
+    if not _TRACE_ON:
+        return
+    try:
+        d = os.path.expanduser("~/.cache/tendril")
+        os.makedirs(d, exist_ok=True)
+        fd = os.open(os.path.join(d, "launch.log"),
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.write(fd, ("%d %s\n" % (int(time.time() * 1000), stage))
+                    .encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+_trace("process-start")          # before the heavy imports below
+
 # ---------- portable configuration ----------
 CONFIG_SEARCH = [
     os.environ.get("REMOTE_AGENTS_CONFIG"),
@@ -139,6 +170,7 @@ else:                            # stale install without the resolver module
         "detected" if HERDR else "missing")
     HERDR_CLIENT_VERSION = None
     HERDR_STALE = HERDR_PROVENANCE == "detected" and bool(CONFIG.get("HERDR_BIN"))
+_trace("resolve-done")           # the §7.4 herdr resolver finished
 SESSION = "default"
 CACHE_DIR = os.path.expanduser("~/.cache/remote-agents")
 EXTRA_PATH = ":".join([
@@ -348,6 +380,7 @@ def collect(snap=None):
             "rank": best,
         })
     rows.sort(key=lambda r: (r["rank"], not r["focused"], r["number"]))
+    _trace("rows-done")
     return rows
 
 
@@ -412,7 +445,11 @@ def chip_parts(row, max_plain=40):
     return plain.rstrip(), colored.rstrip()
 
 
+_selector_painted = False        # first-paint trace fires once per process
+
+
 def render(rows, note="", selected=None):
+    global _selector_painted
     w = box_width()
     inner = w - 2
 
@@ -515,6 +552,9 @@ def render(rows, note="", selected=None):
     lines.append(bot)
     if note:
         lines.append(f"{C_GRAY}{fit(note, w)}{C_RESET}")
+    if not _selector_painted:
+        _selector_painted = True
+        _trace("selector-first-paint")
     print("\033[H\033[2J" + "\n".join(masthead(w, len(lines)) + lines), flush=True)
 
 
@@ -561,9 +601,11 @@ def attach(row, pane=None):
             return False
     else:
         run([HERDR, "workspace", "focus", row["id"]], 6)
+        _trace("focus-done")
     if os.environ.get("HERDR_ENV") == "1":
         input(f"already inside Herdr — workspace '{row['label']}' focused. Enter...")
         return True
+    _trace("attach-exec")
     if _bridge_enabled():
         print(f"{C_GRAY}attaching {row['label']} \u2014 detach: Ctrl+Home \u00b7 Alt+D \u00b7 Ctrl+B d - menu returns here{C_RESET}",
               flush=True)
@@ -1327,11 +1369,15 @@ def _pane_lookup(token):
         return None
     snap = snapshot()
     if not snap:
+        _trace("pane-lookup-done")
         return None
+    pane = None
     for p in snap.get("panes", []):
         if p.get("pane_id") == token:
-            return p
-    return None
+            pane = p
+            break
+    _trace("pane-lookup-done")
+    return pane
 
 
 def _focus_pane(pane):
@@ -1350,7 +1396,9 @@ def _focus_pane(pane):
         run([HERDR, "tab", "focus", tab_id], 6)
     run([HERDR, "agent", "focus", pane_id], 6)
     snap = snapshot()
-    return bool(snap) and snap.get("focused_pane_id") == pane_id
+    ok = bool(snap) and snap.get("focused_pane_id") == pane_id
+    _trace("focus-done")
+    return ok
 
 
 def _selector_after(rows, note="", preferred_id=None):

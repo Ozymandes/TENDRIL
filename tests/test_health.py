@@ -46,6 +46,10 @@ HOST = os.path.join(REPO, "bin", "tendril_host.py")
 CLI = os.path.join(REPO, "bin", "remote-agents")
 LAUNCHER = os.path.join(REPO, "phone", "tendril")
 
+# RC2 connection reuse (mirrors phone/tendril): see tests/test_phone_verbs.py.
+CM = "-o ControlMaster=auto -o ControlPath=~/.ssh/tendril-cm-%C"
+BATCH_CM = CM + " -o ControlPersist=120 -o ConnectionAttempts=1"
+
 
 def load_mod(name, path):
     loader = SourceFileLoader(name, path)
@@ -1054,25 +1058,29 @@ class PhoneVerbTests(Base):
         rc, lines = self.dial("health")
         self.assertEqual(rc, 0)
         self.assertEqual(lines, ["ssh -o BatchMode=yes -o ConnectTimeout=6 "
-                                 "omarchy remote-agents health --json"])
+                                 + BATCH_CM +
+                                 " omarchy remote-agents health --json"])
 
     def test_health_with_explicit_alias(self):
         rc, lines = self.dial("myhost", "health")
         self.assertEqual(rc, 0)
         self.assertEqual(lines, ["ssh -o BatchMode=yes -o ConnectTimeout=6 "
-                                 "myhost remote-agents health --json"])
+                                 + BATCH_CM +
+                                 " myhost remote-agents health --json"])
 
     def test_herdr_restart_fixed_remote_command(self):
         rc, lines = self.dial("herdr", "restart")
         self.assertEqual(rc, 0)
         self.assertEqual(lines, ["ssh -o BatchMode=yes -o ConnectTimeout=6 "
-                                 "omarchy remote-agents herdr restart"])
+                                 + BATCH_CM +
+                                 " omarchy remote-agents herdr restart"])
 
     def test_herdr_restart_with_explicit_alias(self):
         rc, lines = self.dial("myhost", "herdr", "restart")
         self.assertEqual(rc, 0)
         self.assertEqual(lines, ["ssh -o BatchMode=yes -o ConnectTimeout=6 "
-                                 "myhost remote-agents herdr restart"])
+                                 + BATCH_CM +
+                                 " myhost remote-agents herdr restart"])
 
     def test_refusals_never_dial(self):
         for argv in (("health", "extra"),
