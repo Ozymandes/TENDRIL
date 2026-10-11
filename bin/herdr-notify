@@ -83,9 +83,13 @@ else:
     HERDR = _stale_herdr()
 ENV_FILE = (os.environ.get("NOTIFY_ENV")
             or os.path.expanduser("~/.config/remote-agents/notify.env"))
-POLL_SECONDS = 2   # D11 freshness: parent-state changes must reach the
-                   # phone's SYNC invalidation within ~1–3 s (herdr api
-                   # snapshot is ~6 ms; the poll cost is negligible)
+POLL_SECONDS = 2   # D11: faster LOCAL detection (herdr api snapshot is a
+                   # local socket call, ~6 ms — no network traffic). Real
+                   # alerts (needs input / finished / nudge) are detected
+                   # within ≤ 2 s instead of ≤ 8 s; publish VOLUME is
+                   # unchanged (transition-driven, MIN_REPEAT still 90 s).
+                   # NTFY_SYNC=1 pushes ride this too, but SYNC is opt-in
+                   # (self-hosted ntfy only — never for public ntfy.sh).
 MIN_REPEAT = 90  # min seconds between pushes for the same pane
 SYNC_MIN_INTERVAL = 4  # min seconds between TENDRIL · SYNC pushes
 NUDGE_DEFAULT_MINUTES = 45  # "still working" nudge threshold (0 disables)
@@ -379,18 +383,21 @@ def push(state, pid, agent, cls, workspaces, cfg, allow_push, now,
 # ---------- D11 freshness: the TENDRIL · SYNC invalidation event ----------
 
 # Parent-level state changes (working/idle/done/blocked, agents appearing
-# or vanishing) are the host's push-visible signal for "the snapshot just
-# changed". A SYNC is a MIN-priority ntfy message the phone never surfaces:
-# its receiver answers with one debounced snapshot refresh (§7.6). It is
-# gated behind the TENDRIL event prefix so only paired phones react.
-# Child-level changes have no host-side event source (children are derived
-# from transcripts at snapshot time) and ride the app's fast foreground
-# cadence instead.
+# or vanishing) CAN be pushed as a MIN-priority ntfy message the phone
+# never surfaces: its receiver answers with one debounced snapshot refresh
+# (§7.6). OFF BY DEFAULT: this host typically publishes to the public
+# ntfy.sh, whose anonymous per-visitor daily quota (~250 msgs) a busy
+# workspace's state flaps would exhaust within the hour — 429-rejecting
+# the REAL needs-you/finished alerts. The app's fast 2 s foreground
+# cadence already covers LIVE freshness without any publish. Only enable
+# SYNC deliberately, and ONLY against a SELF-HOSTED ntfy server
+# (NTFY_URL=https://<your-ntfy> in notify.env + NTFY_SYNC=1).
 
 def sync_enabled(cfg):
-    """NTFY_SYNC=0/false/no/off opts a host out of SYNC events (default on)."""
-    return str(cfg.get("NTFY_SYNC", "1")).strip().lower() not in (
-        "0", "false", "no", "off")
+    """SYNC is opt-in: NTFY_SYNC=1 (or true/yes/on) enables it. Default
+    OFF — the public ntfy.sh quota is reserved for the real alerts."""
+    return str(cfg.get("NTFY_SYNC", "0")).strip().lower() in (
+        "1", "true", "yes", "on")
 
 
 def sync_digest(snap):
@@ -417,9 +424,11 @@ def send_sync(cfg, now, sync):
 
 
 def maybe_sync(sig, cfg, allow_push, now, sync):
-    """Track the digest across polls and push at most one SYNC per
-    [SYNC_MIN_INTERVAL]; a change inside the window is remembered and
-    flushed at the boundary (burst coalescing). Never raises."""
+    """Track the digest across polls; push at most one SYNC per
+    [SYNC_MIN_INTERVAL] — and ONLY when the host explicitly opted in
+    (NTFY_SYNC=1, self-hosted ntfy). With the default config this is a
+    pure no-op: a burst of parent-state changes produces ZERO publishes
+    beyond the pre-existing finished/input/nudge alert set. Never raises."""
     if not (allow_push and configured(cfg) and sync_enabled(cfg)):
         sync["sig"] = sig
         sync["pending"] = False

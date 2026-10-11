@@ -15,9 +15,10 @@ Worktree branches (never merged/pushed by the worker):
    # install the APK on the phone (adb install -r or the usual side-load)
    ```
    The new app is a no-op against the old host: it sends no `--if-none-match`
-   (capability-gated), and `TENDRIL · SYNC` simply never arrives. The 2 s
-   LIVE cadence and the moderate 10 s foreground cadence take effect
-   immediately; the `behind` freshness word appears in the LIVE header.
+   (capability-gated), and `TENDRIL · SYNC` is opt-in on the host so the
+   topic stays quiet. The 2 s LIVE cadence and the moderate 10 s foreground
+   cadence take effect immediately; the `behind` freshness word appears in
+   the LIVE header. Nothing else about notifications changes.
 
 2. **Host second** (new code already verified from the worktree; this makes
    it the installed runtime):
@@ -26,10 +27,19 @@ Worktree branches (never merged/pushed by the worker):
    tendril service restart                          # restarts herdr-notify (reads notify.env once)
    ```
    What changes on the host:
-   - `bin/herdr-notify`: 2 s poll + `TENDRIL · SYNC` pushes (opt out with
-     `NTFY_SYNC=0` in `~/.config/remote-agents/notify.env`; see
-     `config/notify.env.example`). SYNC pings are MIN-priority and the
+   - `bin/herdr-notify`: 2 s LOCAL poll (herdr api snapshot is a local
+     socket call — no network traffic; real alerts are detected sooner,
+     publish VOLUME unchanged). `TENDRIL · SYNC` pushes are **OFF BY
+     DEFAULT** and are for **SELF-HOSTED ntfy servers ONLY**: public
+     ntfy.sh's anonymous daily quota (~250 msgs/visitor) is reserved for
+     the real needs-you/finished alerts. Do NOT enable SYNC against
+     ntfy.sh. To enable it deliberately against your own instance, set
+     both in `~/.config/remote-agents/notify.env`:
+     `NTFY_URL=https://<your-ntfy-server>` AND `NTFY_SYNC=1`
+     (see `config/notify.env.example`). SYNC pings are MIN-priority; the
      updated app never surfaces them — they only trigger the refresh.
+     With the default config the watcher publishes EXACTLY the
+     pre-D11 set (needs input / finished / nudge / schedule / health).
    - `bin/tendril_telemetry.py`: a child's explicit terminal stop is `done`
      the moment it is scanned (was: ≥ 20 s quiet gate).
    - `bin/remote-agents`: `snapshot` documents carry `etag`; the verb
@@ -53,8 +63,9 @@ python3 tests/certify_freshness.py     # one full subagent lifecycle, per-stage 
 
 With LIVE open on the phone, run `tests/certify_freshness.py` on the host
 and watch the map: the child row should appear within ~1 poll of the host
-table's stage C, the parent state word within ~1–2 s of stage B (SYNC event
-or the 2 s cadence), and `done` within ~1–2 s of stage C-done. The phone's
+table's stage C, the parent state word within ~1–3 s of stage B (the 2 s
+cadence; a SYNC event only if you deliberately enabled it against a
+self-hosted ntfy), and `done` within ~1–2 s of stage C-done. The phone's
 `~/.cache/tendril/launch.log` (LATENCY.md) adds the RUN_COMMAND + SSH stage
 times for the refresh flights; expected worst-case change-to-pixel ≈ 2.7 s
-(2 s cadence + ~0.7 s flight), ~1.5–2 s on a SYNC event.
+(2 s cadence + ~0.7 s flight).
