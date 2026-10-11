@@ -42,7 +42,11 @@
     {"id": "single-long-word", "input": "internationalizationlocalizationframeworkconfiguration", "expect": null},
     {"id": "capacity-adapter-audit", "input": "Capacity adapter audit — verify the 5h window math", "expect": "Capacity adapter audit"},
     {"id": "debris-majority", "input": "!!! ??? ### ***", "expect": null},
-    {"id": "leading-list-marker", "input": "- Fix the snapshot reconcile lock", "expect": "Fix the snapshot reconcile lock"}
+    {"id": "leading-list-marker", "input": "- Fix the snapshot reconcile lock", "expect": "Fix the snapshot reconcile lock"},
+    {"id": "protocol-bootstrap", "input": "Reply with exactly OK when ready", "expect": null},
+    {"id": "mcp-json-debris", "input": "{\"method\":\"initialize\",\"params\":{\"capabilities\":{}}}", "expect": null},
+    {"id": "protocol-label-colon", "input": "Reply with:RC2 existing-session verdicts", "expect": "RC2 existing-session verdicts"},
+    {"id": "json-line-first", "input": "{\"method\":\"initialize\",\"params\":{}}\nFix the real bug later", "expect": "Fix the real bug later"}
   ],
   "summary": [
     {"id": "two-turns-technical", "input": ["the CA field density drops near the meter cells", "render the density as a heat map"], "expect": "CA density"},

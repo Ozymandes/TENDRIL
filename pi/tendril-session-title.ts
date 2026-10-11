@@ -46,7 +46,11 @@ const FILLERS = [
 	"also", "and", "but", "can you", "could you", "would you", "will you",
 	"i want you to", "i need you to", "i'd like you to", "lets", "let's",
 	"let us", "we need to", "we should", "help me", "try to", "kindly",
+	"reply with", "respond with", "answer with",
+	"exactly", "verbatim", "when ready", "asap",
 ];
+// a title is prose: these characters never appear in a kept candidate
+const DEBRIS_CHARS_RE = /["'{}\[\]<>=|\\`]/;
 const PREAMBLE_RE = /^(you are|you're|you will act|you must act|act as|as an? [a-z]|your role|i want you to act|take the role|role:)\b/i;
 const HEADER_RE = /^#{1,6}\s+/;
 const BANNER_RE = /^([-_=*~·─-╿]{5,})$/;
@@ -153,6 +157,10 @@ function normalizeCandidate(text) {
 		if (BANNER_RE.test(line) || QUOTE_RE.test(line) || line.startsWith("|")) {
 			continue;
 		}
+		if ((line.startsWith("{") || line.startsWith("["))
+			&& (line.endsWith("}") || line.endsWith("]"))) {
+			continue; // a JSON/protocol line, not prose
+		}
 		// a markdown header IS a title-shaped line: use its text
 		line = line.replace(HEADER_RE, "").trim();
 		if (!line) continue;
@@ -192,7 +200,7 @@ function normalizeCandidate(text) {
 		changed = false;
 		const low = clause.toLowerCase();
 		for (const f of FILLERS) {
-			if (low.startsWith(f + " ") || low === f) {
+			if (low.startsWith(f + " ") || low.startsWith(f + ":") || low === f) {
 				clause = clause.slice(f.length).replace(/^[ ,.:;\-—–]+/, "");
 				changed = true;
 				break;
@@ -217,6 +225,7 @@ function finalize(words, limit) {
 	const letters = [...title].filter((c) => /[a-zA-Z\u00c0-\u024f]/.test(c)).length;
 	const body = title.replace(/ /g, "").length;
 	if (letters < 4 || letters < body / 2) return null;
+	if (DEBRIS_CHARS_RE.test(title)) return null; // JSON/protocol debris
 	const norm = title.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim();
 	if (BANNED.has(norm) || GREETING_RE.test(norm)) return null;
 	return title.length > 0 ? title : null;

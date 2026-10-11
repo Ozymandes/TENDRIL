@@ -1996,8 +1996,10 @@ def _rename_session_cmd(args):
         print(json.dumps({"ok": False, "error": phrase},
                          separators=(",", ":")))
         return 1
-    print(json.dumps({"ok": True, "pane_id": pane, "title": phrase},
-                     separators=(",", ":")))
+    reply = {"ok": True, "pane_id": pane}
+    if phrase is not None:
+        reply["title"] = phrase             # --clear echoes no title
+    print(json.dumps(reply, separators=(",", ":")))
     return 0
 
 

@@ -152,7 +152,11 @@ _FILLERS = (
     "also", "and", "but", "can you", "could you", "would you", "will you",
     "i want you to", "i need you to", "i'd like you to", "lets", "let's",
     "let us", "we need to", "we should", "help me", "try to", "kindly",
+    "reply with", "respond with", "answer with",
+    "exactly", "verbatim", "when ready", "asap",
 )
+# a title is prose: these characters never appear in a kept candidate
+_DEBRIS_CHARS_RE = re.compile(r'["\'{}\[\]<>=|\\`]')
 _PREAMBLE_RE = re.compile(
     r"^(you are|you're|you will act|you must act|act as|as an? [a-z]|"
     r"your role|i want you to act|take the role|role:)\b", re.IGNORECASE)
@@ -281,6 +285,8 @@ def _normalize_candidate(text):
         if _BANNER_RE.match(line) or _QUOTE_RE.match(line) \
                 or line.startswith("|"):
             continue
+        if line[:1] in "{" + "[" and line[-1:] in "}" + "]":
+            continue                        # a JSON/protocol line, not prose
         # a markdown header IS a title-shaped line: use its text
         line = _HEADER_RE.sub("", line).strip()
         if not line:
@@ -326,7 +332,7 @@ def _normalize_candidate(text):
         changed = False
         low = clause.lower()
         for f in _FILLERS:
-            if low.startswith(f + " ") or low == f:
+            if low.startswith(f + " ") or low.startswith(f + ":") or low == f:
                 clause = clause[len(f):].lstrip(" ,.:;-—–")
                 changed = True
                 break
@@ -351,6 +357,8 @@ def _finalize(words, limit):
     letters = sum(ch.isalpha() for ch in title)
     if letters < 4 or letters < len(title.replace(" ", "")) / 2:
         return None
+    if _DEBRIS_CHARS_RE.search(title):
+        return None                     # JSON/protocol debris, never prose
     norm = re.sub(r"[^a-z0-9 ]", "", title.lower()).strip()
     if norm in _BANNED or _GREETING_RE.match(norm):
         return None
@@ -778,14 +786,10 @@ def resolve_agent(agent, workspace_label, schedule_tasks,
 
     cached = titles.get(key) if key else None
     if _cache_valid(cached, start):
+        # levels 1-5 all persist: a valid entry IS the answer — manual
+        # overrides, natively named sessions and stored 3-5 titles never
+        # recompute (§11 stability)
         return cached["title"], cached["source"]
-
-    # 1 manual is itself stored in the cache: a manual entry survives the
-    # guard above only while the session is the same, so a stale manual
-    # label dies with its session. Fall through only when no valid entry.
-    if cached and cached.get("source") == "manual" \
-            and _cache_valid(cached, start):
-        return cached["title"], "manual"
 
     # 2 native
     nat = _native_title(agent, key, titles, now)
@@ -991,7 +995,7 @@ def rename_session(pane_id, title, agent=None, home=None, now=None):
         if key in titles and titles[key].get("source") == "manual":
             del titles[key]
             _save_cache(titles)
-        return True, "cleared"
+        return True, None
     t = sanitize_title(title)
     if not t:
         return False, "empty title"
