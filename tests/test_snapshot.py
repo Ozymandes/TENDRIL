@@ -77,7 +77,8 @@ DOC_KEYS = {"version", "host", "generated_at", "focused_workspace",
             "focused_pane", "workspaces", "capabilities", "health"}
 WS_KEYS = {"id", "label", "number", "focused", "agents"}
 AGENT_KEYS = {"pane_id", "tab_id", "agent", "status", "focused",
-              "harness", "prompt_ready"}
+              "harness", "prompt_ready",
+              "title", "title_source"}  # §11 session titles (additive)
 
 
 class SnapshotCommand(unittest.TestCase):
@@ -157,17 +158,23 @@ class SnapshotCommand(unittest.TestCase):
         self.assertEqual(agents, [
             {"pane_id": "w15:p1", "tab_id": "w15:t1", "agent": "pi",
              "status": "working", "focused": True, "harness": "pi",
-             "prompt_ready": False},
+             "prompt_ready": False,
+             "title": "tendril \u00b7 Pi", "title_source": "workspace"},
             {"pane_id": "w15:p2", "tab_id": "w15:t2", "agent": "claude",
              "status": "unknown", "focused": False, "harness": "claude",
-             "prompt_ready": False},
+             "prompt_ready": False,
+             "title": "tendril \u00b7 Claude", "title_source": "workspace"},
         ])
 
     def test_never_leaks_cwd_titles_or_sessions(self):
         self.assertEqual(self.main(["snapshot"]), 0)
         text = self.out.getvalue()
+        # §11: a resolved session title is AUTHORED/locally-derived wire
+        # data (CONTRACT-0.2.md §8); everything else here stays banned —
+        # cwd, TERMINAL titles (content-derived), the agent_session mapping,
+        # home paths and any secret.
         for needle in ("cwd", "terminal_title", "agent_session",
-                       "/home/u", "secret", "title"):
+                       "/home/u", "secret"):
             self.assertNotIn(needle, text)
 
     def test_workspaces_in_selector_order(self):
@@ -440,7 +447,8 @@ class OptionalSections(unittest.TestCase):
         self.assertEqual(doc["schedule"], {"available": True, "tasks": []})
         self.assertEqual(doc["health"], {"available": True})
         self.assertEqual(doc["capabilities"],
-                         ["subagents", "capacity", "schedule", "health"])
+                         ["subagents", "capacity", "schedule", "health",
+                          "titles"])
         self.assertLessEqual(ra._doc_bytes(doc), ra._SNAPSHOT_MAX_BYTES)
 
     def test_hook_failure_omits_the_section_from_the_doc(self):
@@ -464,7 +472,7 @@ class OptionalSections(unittest.TestCase):
         self.assertNotIn("capacity", doc)
         self.assertNotIn("schedule", doc)
         self.assertNotIn("health", doc)
-        self.assertEqual(doc["capabilities"], ["subagents"])
+        self.assertEqual(doc["capabilities"], ["subagents", "titles"])
 
 
 if __name__ == "__main__":
