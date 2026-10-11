@@ -3,6 +3,7 @@ Description=TENDRIL herdr guardian tick (contract §6, user-level oneshot)
 After=network-online.target
 
 [Service]
+EnvironmentFile=-%h/.config/remote-agents/service.env
 Type=oneshot
 ExecStart=/usr/bin/python3 %h/.local/bin/remote-agents health tick
 # Hardening: NoNewPrivileges — the tick never needs setuid helpers.

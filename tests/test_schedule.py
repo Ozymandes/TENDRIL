@@ -169,9 +169,10 @@ class Base(unittest.TestCase):
             return json.loads(f.read().decode("utf-8"))
 
     def tick(self, snap=None, capacity=None, launcher=None, notifier=None,
-             now=NOW):
+             now=NOW, started_at_of=None):
         store = self.load()
-        return ts.tick(store, now, snap, capacity, launcher, notifier)
+        return ts.tick(store, now, snap, capacity, launcher, notifier,
+                       started_at_of=started_at_of)
 
     def with_timer(self):
         d = os.path.join(self.home, ".config", "systemd", "user")
@@ -1069,6 +1070,41 @@ exit 0
                          {"ok": False, "error": "invalid task id"})
         self.assertEqual(bad.returncode, 1)
 
+    def test_cli_existing_target_dispatches_agent_prompt_only(self):
+        # the snapshot the fake herdr serves must contain the pane the
+        # task targets (add-time lookup) and its agent idle
+        with open(self.snap_file, "w") as f:
+            json.dump({"result": {"snapshot": {
+                "workspaces": [{"workspace_id": "w15", "label": "r",
+                                "number": 15, "focused": False}],
+                "panes": [pane("w15:p5", "idle")],
+                "agents": [pane("w15:p5", "idle")]}}}, f)
+        doc = payload(harness=None,
+                      target={"kind": "existing", "pane": "w15:p5",
+                              "harness": "pi",
+                              "agent_started_at": AT_PAST},
+                      trigger={"kind": "at", "at": AT_PAST})
+        doc.pop("harness", None)
+        added = json.loads(self.cli("add", b64(doc)).stdout)
+        self.assertTrue(added["ok"], added)
+        self.assertEqual(added["task"]["target"], "existing")
+        self.assertEqual(added["task"]["state"], "QUEUED")
+        r = self.cli("tick")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["tick"]["launched"], 1)
+        with open(self.herdr_log) as f:      # skip the --version probe
+            calls = [ln.rstrip("\n").rstrip("\t").split("\t")
+                     for ln in f if ln.startswith(("tab\t", "agent\t"))]
+        # §7.3: the herdr agent-prompt argv ONLY — never a new pane,
+        # never agent start
+        self.assertEqual(calls,
+                         [["agent", "prompt", "w15:p5",
+                           "Audit the architecture and report findings",
+                           "--wait", "--timeout", "15000"]])
+        disk = self.ondisk()["tasks"][0]
+        self.assertEqual(disk["state"], "RUNNING")
+        self.assertEqual(disk["pane_id"], "w15:p5")
+
     def test_cli_tick_launches_through_full_herdr_argv_sequence(self):
         added = json.loads(
             self.cli("add", b64(payload(trigger={"kind": "at",
@@ -1179,7 +1215,9 @@ class UnitInstallTests(Base):
         self.assertEqual(self.calls,
                          [["systemctl", "--user", "daemon-reload"],
                           ["systemctl", "--user", "enable", "--now",
-                           th.SCHEDULE_TIMER]])
+                           th.SCHEDULE_TIMER],
+                          ["systemctl", "--user", "is-active",
+                           th.SCHEDULE_TIMER]])   # state report (§7.4)
         self.calls = []
         rc, out = self.refresh()
         self.assertEqual(rc, 0)
@@ -1206,6 +1244,8 @@ class UnitInstallTests(Base):
         self.assertEqual(self.calls,
                          [["systemctl", "--user", "daemon-reload"],
                           ["systemctl", "--user", "enable", "--now",
+                           th.SCHEDULE_TIMER],
+                          ["systemctl", "--user", "is-active",
                            th.SCHEDULE_TIMER]])
 
     def test_inactive_timer_reenabled_without_change(self):
@@ -1218,6 +1258,8 @@ class UnitInstallTests(Base):
                          [["systemctl", "--user", "is-active",
                            th.SCHEDULE_TIMER],
                           ["systemctl", "--user", "enable", "--now",
+                           th.SCHEDULE_TIMER],
+                          ["systemctl", "--user", "is-active",
                            th.SCHEDULE_TIMER]])
         self.assertIn("was inactive", out)
 
@@ -1299,6 +1341,272 @@ class UnitFileTests(unittest.TestCase):
         # is /tmp; the tick's writes go to ~/.cache + ~/.local/state)
         self.assertIn("NoNewPrivileges=true", body)
         self.assertIn("PrivateTmp=true", body)
+
+
+class ExistingTargetTests(Base):
+    """§7.3: target existing{pane, harness, agent_started_at?} — strict
+    schema at add, pane/harness/started_at re-validation at launch, the
+    busy/blocked retry bound, and pane-reuse detection."""
+
+    PANE = "w15:p5"
+    STARTED = NOW - 3600
+
+    def lookup_of(self, row=None):
+        rows = {self.PANE: row} if row is not None else {}
+        def lookup(pane):
+            return rows.get(pane)
+        return lookup
+
+    def live_row(self, status="idle", agent="pi", started=None):
+        return {"pane_id": self.PANE, "agent": agent,
+                "agent_status": status, "workspace_id": "w15",
+                "started_at": self.STARTED if started is None else started}
+
+    def target(self, **over):
+        t = {"kind": "existing", "pane": self.PANE, "harness": "pi",
+             "agent_started_at": self.STARTED}
+        t.update(over)
+        return t
+
+    def add_existing(self, target=None, lookup=None, **over):
+        doc = payload(harness=None, target=self.target() if target is None
+                      else target, **over)
+        doc.pop("harness", None)               # §7.3: harness rides on target
+        task, err = ts.decode_add(b64(doc), NOW, capacity=cap_of(),
+                                  which=lambda k: True, home=self.home,
+                                  lookup=self.lookup_of(self.live_row())
+                                  if lookup is None else lookup)
+        return task, err
+
+    def test_existing_target_happy_path_launches_into_the_pane(self):
+        task, err = self.add_existing()
+        self.assertIsNone(err)
+        self.assertEqual(task["target"], self.target())
+        saved, err = ts.add_task(self.store, task, NOW)
+        self.assertIsNone(err)
+        log = []
+        ev = self.tick(snap=snap_of([self.live_row()]),
+                       launcher=rec_launcher(pane=self.PANE, log=log))
+        row = self.row(saved)
+        self.assertEqual(row["state"], ts.RUNNING)
+        self.assertEqual(row["pane_id"], self.PANE)
+        self.assertEqual(log, [row["id"]])     # dispatched, not re-created
+        self.assertNotIn("target_wait_since", row)
+
+    def test_target_kind_is_echoed_and_prompt_never_leaks(self):
+        task, _ = self.add_existing()
+        saved, _ = ts.add_task(self.store, task, NOW)
+        doc = ts.project(self.row(saved))
+        self.assertEqual(doc["target"], "existing")
+        self.assertNotIn("prompt", doc)
+        self.assertNotIn("pane", doc["target"] if "target" in doc
+                         else doc)
+        plain, _ = ts.decode_add(b64(payload()), NOW, which=lambda k: True,
+                                 home=self.home)
+        self.assertEqual(ts.project(plain)["target"], "new")
+
+    def test_busy_defers_then_fails_session_busy_after_bound(self):
+        task, _ = self.add_existing()
+        saved, _ = ts.add_task(self.store, task, NOW)
+        log = []
+        ev = self.tick(snap=snap_of([self.live_row("working")]),
+                       launcher=rec_launcher(pane=self.PANE, log=log))
+        row = self.row(saved)
+        self.assertEqual(row["state"], ts.READY)   # stays READY, no launch
+        self.assertEqual(log, [])
+        self.assertEqual(row["target_wait_since"], int(NOW))
+        # retried each tick within the bound
+        self.tick(snap=snap_of([self.live_row("working")]), now=NOW + 600,
+                  launcher=rec_launcher(pane=self.PANE, log=log))
+        self.assertEqual(self.row(saved)["state"], ts.READY)
+        self.assertEqual(log, [])
+        # past 15 min still working → FAILED session busy
+        self.tick(snap=snap_of([self.live_row("working")]), now=NOW + 901,
+                  launcher=rec_launcher(pane=self.PANE, log=log))
+        row = self.row(saved)
+        self.assertEqual(row["state"], ts.FAILED)
+        self.assertEqual(row["failure"], "session busy")
+
+    def test_blocked_never_dispatches_then_fails_session_needs_input(self):
+        task, _ = self.add_existing()
+        saved, _ = ts.add_task(self.store, task, NOW)
+        log = []
+        self.tick(snap=snap_of([self.live_row("blocked")]),
+                  launcher=rec_launcher(pane=self.PANE, log=log))
+        self.assertEqual(self.row(saved)["state"], ts.READY)
+        self.tick(snap=snap_of([self.live_row("blocked")]), now=NOW + 901,
+                  launcher=rec_launcher(pane=self.PANE, log=log))
+        row = self.row(saved)
+        self.assertEqual(row["state"], ts.FAILED)
+        self.assertEqual(row["failure"], "session needs input")
+        self.assertEqual(log, [])
+
+    def test_pane_reuse_started_at_guard_fails_session_changed(self):
+        task, _ = self.add_existing()
+        saved, _ = ts.add_task(self.store, task, NOW)
+        # the pane now hosts a NEWER agent (pane id reused)
+        self.tick(snap=snap_of([self.live_row("idle",
+                                              started=self.STARTED + 5)]),
+                  launcher=rec_launcher(pane=self.PANE),
+                  started_at_of=lambda row: row.get("started_at"))
+        row = self.row(saved)
+        self.assertEqual(row["state"], ts.FAILED)
+        self.assertEqual(row["failure"], "session changed")
+
+    def test_pane_gone_fails_session_changed(self):
+        task, _ = self.add_existing()
+        saved, _ = ts.add_task(self.store, task, NOW)
+        self.tick(snap=snap_of([]), launcher=rec_launcher(pane=self.PANE))
+        row = self.row(saved)
+        self.assertEqual(row["state"], ts.FAILED)
+        self.assertEqual(row["failure"], "session changed")
+
+    def test_harness_change_at_launch_fails_session_changed(self):
+        task, _ = self.add_existing()
+        saved, _ = ts.add_task(self.store, task, NOW)
+        self.tick(snap=snap_of([self.live_row("idle", agent="claude")]),
+                  launcher=rec_launcher(pane=self.PANE))
+        self.assertEqual(self.row(saved)["state"], ts.FAILED)
+        self.assertEqual(self.row(saved)["failure"], "session changed")
+
+    def test_malformed_targets_rejected(self):
+        bad = ["no", 17, {}, {"kind": "other"},
+               {"kind": "new", "pane": "w15:p5"},
+               {"kind": "existing", "pane": "p5", "harness": "pi"},
+               {"kind": "existing", "pane": "w15:p5; rm", "harness": "pi"},
+               {"kind": "existing", "pane": "w15:p5", "harness": "tcsh"},
+               {"kind": "existing", "pane": "w15:p5", "harness": "pi",
+                "agent_started_at": 12},
+               {"kind": "existing", "pane": "w15:p5", "harness": "pi",
+                "agent_started_at": True},
+               {"kind": "existing", "pane": "w15:p5", "harness": "pi",
+                "extra": 1},
+               ]
+        for t in bad:
+            _, err = self.add_existing(target=t)
+            self.assertEqual(err, ts.E_TARGET, t)
+        # a launchable harness that the pane does not host: schema-valid,
+        # refused by the live lookup
+        _, err = self.add_existing(
+            target={"kind": "existing", "pane": self.PANE,
+                    "harness": "codex"})
+        self.assertEqual(err, ts.E_HARNESS_MISMATCH)
+        # a top-level harness that contradicts the target harness
+        doc = payload(harness="pi", target=self.target(harness="claude"))
+        _, err = ts.decode_add(b64(doc), NOW, which=lambda k: True,
+                               home=self.home,
+                               lookup=self.lookup_of(self.live_row()))
+        self.assertEqual(err, ts.E_TARGET)
+
+    def test_add_time_validation_needs_a_live_lookup(self):
+        _, err = self.add_existing(lookup=self.lookup_of(None))
+        self.assertEqual(err, ts.E_PANE)
+        _, err = self.add_existing(
+            lookup=self.lookup_of(self.live_row(agent="claude")))
+        self.assertEqual(err, ts.E_HARNESS_MISMATCH)
+        other_ws = self.live_row()
+        other_ws["workspace_id"] = "w16"
+        _, err = self.add_existing(lookup=self.lookup_of(other_ws))
+        self.assertEqual(err, ts.E_PANE)
+        _, err = self.add_existing(
+            lookup=self.lookup_of(self.live_row(started=self.STARTED + 1)))
+        self.assertEqual(err, ts.E_SESSION_CHANGED)
+        # no lookup injected at all: nothing verifiable → refused
+        doc = payload(target=self.target())
+        doc.pop("harness", None)
+        _, err = ts.decode_add(b64(doc), NOW, which=lambda k: True,
+                               home=self.home, lookup=None)
+        self.assertEqual(err, ts.E_PANE)
+
+    def test_duplicate_fingerprint_distinguishes_targets(self):
+        task, _ = self.add_existing()
+        plain, _ = ts.decode_add(b64(payload()), NOW, which=lambda k: True,
+                                 home=self.home)
+        self.assertNotEqual(task["fingerprint"], plain["fingerprint"])
+
+
+class ReconcileTests(Base):
+    """§7.3 snapshot-side reconcile: RUNNING → DONE on idle/done after
+    dispatch or pane gone; non-blocking flock skips when the tick holds
+    it; never launches, never fails."""
+
+    def add(self, now=NOW, **over):
+        """add with a permissive live lookup (the pane is believed to
+        exist; guards are exercised in ExistingTargetTests)."""
+        doc = payload(**over)
+
+        def lookup(p):
+            return {"agent": doc.get("harness") or "pi",
+                    "workspace_id": doc.get("workspace", "w15"),
+                    "status": "idle", "started_at": None}
+        task, err = ts.decode_add(b64(doc), now, capacity=cap_of(),
+                                  which=lambda k: True, home=self.home,
+                                  lookup=lookup)
+        self.assertIsNone(err)
+        saved, err = ts.add_task(self.store, task, now)
+        self.assertIsNone(err)
+        return saved
+
+    def test_running_done_when_pane_idle_and_when_gone(self):
+        self.with_timer()
+        saved = self.add(target={"kind": "existing", "pane": "w15:p5",
+                                 "harness": "pi"})
+        self.tick(snap=snap_of([pane("w15:p5", "idle")]),
+                  launcher=rec_launcher(pane="w15:p5"))
+        self.assertEqual(self.row(saved)["state"], ts.RUNNING)
+        n = ts.reconcile(self.store, NOW + 30,
+                         snap_of([pane("w15:p5", "idle")]))
+        self.assertEqual(n, 1)
+        row = self.row(saved)
+        self.assertEqual(row["state"], ts.DONE)
+        self.assertIsNone(row.get("failure"))
+        # pane gone after a fresh dispatch → DONE session ended
+        saved2 = self.add(now=NOW + 60,
+                          target={"kind": "existing", "pane": "w15:p6",
+                                  "harness": "pi"})
+        self.tick(snap=snap_of([pane("w15:p6", "idle")]), now=NOW + 60,
+                  launcher=rec_launcher(pane="w15:p6"))
+        self.assertEqual(self.row(saved2)["state"], ts.RUNNING)
+        n = ts.reconcile(self.store, NOW + 90, snap_of([]))
+        self.assertEqual(n, 1)
+        row = self.row(saved2)
+        self.assertEqual(row["state"], ts.DONE)
+        self.assertEqual(row["failure"], "session ended")
+
+    def test_never_launched_running_is_left_for_the_tick(self):
+        self.with_timer()
+        saved = Base.add(self)
+        self.mark(saved, state=ts.RUNNING, pane_id=None)   # crash window
+        n = ts.reconcile(self.store, NOW + 30, snap_of([]))
+        self.assertEqual(n, 0)
+        self.assertEqual(self.row(saved)["state"], ts.RUNNING)
+
+    def test_lock_busy_skips_whole(self):
+        self.with_timer()
+        saved = self.add(target={"kind": "existing", "pane": "w15:p5",
+                                 "harness": "pi"})
+        self.tick(snap=snap_of([pane("w15:p5", "idle")]),
+                  launcher=rec_launcher(pane="w15:p5"))
+        with ts._locked(self.store + ".lock"):     # the tick holds it
+            n = ts.reconcile(self.store, NOW + 30,
+                             snap_of([pane("w15:p5", "idle")]))
+        self.assertEqual(n, 0)
+        self.assertEqual(self.row(saved)["state"], ts.RUNNING)
+
+    def test_snapshot_section_reconciles_when_given_snap(self):
+        self.with_timer()
+        saved = self.add(target={"kind": "existing", "pane": "w15:p5",
+                                 "harness": "pi"})
+        self.tick(snap=snap_of([pane("w15:p5", "idle")]),
+                  launcher=rec_launcher(pane="w15:p5"))
+        sec, cap = ts.snapshot_section(now=NOW + 30, home=self.home,
+                                       snap=snap_of([pane("w15:p5",
+                                                          "idle")]))
+        self.assertEqual(cap, "schedule")
+        row = self.row(saved)
+        self.assertEqual(row["state"], ts.DONE)
+        done = [t for t in sec["tasks"] if t["id"] == row["id"]]
+        self.assertEqual(done[0]["state"], ts.DONE)
 
 
 if __name__ == "__main__":

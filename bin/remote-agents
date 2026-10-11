@@ -78,6 +78,10 @@ try:
     import tendril_telemetry     # schema v2 per-agent telemetry (read-only)
 except ImportError:              # stale install: v2 shape, no telemetry
     tendril_telemetry = None
+try:
+    import tendril_herdr         # the ONE §7.4 herdr binary resolver
+except ImportError:              # stale install: the selector keeps working
+    tendril_herdr = None
 
 # Canonical host identity (binding contract): config TENDRIL_HOST -> legacy
 # TAILSCALE_HOST (lowercased) -> short hostname, HOST_RE-gated, sanitized —
@@ -92,89 +96,49 @@ NOTIFY_ENV = (os.environ.get("NOTIFY_ENV")
               or os.path.expanduser("~/.config/remote-agents/notify.env"))
 
 
-# ---------- Herdr client detection (protocol-verified, newest-compatible) ----------
+# ---------- Herdr client resolution (ONE resolver, LINK-CONTRACT §7.4) ----------
+# Resolution order: recorded config HERDR_BIN → $HERDR_BIN → protocol-verified
+# newest-compatible detection (PATH, ~/.local/bin, mise, asdf, brew, /usr).
+# "First on PATH wins" is gone: that is how a stale /usr/bin/herdr ended up
+# driving a newer mise server. Services get the recorded path via the
+# installer-written service.env (see systemd/*.service + ./install).
 HERDR_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
 
-
-def _herdr_candidates():
-    out = []
-    override = CONFIG.get("HERDR_BIN") or os.environ.get("HERDR_BIN")
-    if override:
-        out.append(os.path.expanduser(override))
-    found = shutil.which("herdr")
-    if found:
-        out.append(found)
-    # install.sh (~/.local/bin) and Homebrew locations: SSH/launchd PATHs omit them
-    for d in HERDR_DIRS:
-        p = os.path.join(os.path.expanduser(d), "herdr")
-        if os.path.isfile(p):
-            out.append(p)
-    mise = os.path.expanduser("~/.local/share/mise/installs/herdr")
-    latest = os.path.join(mise, "latest", "herdr")
-    if os.path.isfile(latest):
-        out.append(latest)
-    if os.path.isdir(mise):
-        versions = []
-        for name in os.listdir(mise):
-            p = os.path.join(mise, name, "herdr")
-            if os.path.isfile(p):
-                versions.append((name, p))
-        versions.sort(key=lambda t: [int(x) if x.isdigit() else 0
-                                     for x in t[0].split(".")], reverse=True)
-        out += [p for _, p in versions]
-    seen, uniq = set(), []
-    for cand in out:
-        real = os.path.realpath(cand)
-        if real not in seen:
-            seen.add(real)
-            uniq.append(cand)
-    return uniq
-
-
-HERDR_VERDICTS = []
-
-
-def herdr_probe(path):
-    """(compatible, detail): client must match the running server's protocol."""
+if tendril_herdr is not None:
     try:
-        v = subprocess.run([path, "--version"], capture_output=True,
-                           text=True, timeout=6)
-        version = (v.stdout or v.stderr).strip() or "(no version output)"
-    except subprocess.TimeoutExpired:
-        return False, "no answer to --version (timeout)"
-    except OSError as e:
-        return False, f"not runnable: {e}"
-    try:
-        s = subprocess.run([path, "status"], capture_output=True,
-                           text=True, timeout=8)
-        txt = (s.stdout or "") + (s.stderr or "")
-    except subprocess.TimeoutExpired:
-        return False, f"{version}; status timed out"
-    except OSError as e:
-        return False, f"{version}; status failed: {e}"
-    running = re.search(r"status:\s*running", txt)
-    compatible = (re.search(r"endpoint_compatible:\s*yes", txt)
-                  or re.search(r"private_protocol_compatible:\s*yes", txt))
-    if running and compatible:
-        return True, f"{version} (protocol-compatible with running server)"
-    if running:
-        return False, f"{version} (INCOMPATIBLE with running server)"
-    return True, f"{version} (no running server detected)"
-
-
-def detect_herdr():
-    """First verified-protocol-compatible candidate wins."""
-    picked = None
-    for cand in _herdr_candidates():
-        ok, detail = herdr_probe(cand)
-        HERDR_VERDICTS.append((cand, ok, detail))
-        if ok:
-            picked = cand
-            break
-    return picked
-
-
-HERDR = detect_herdr()
+        _HERDR_RESOLVED = tendril_herdr.resolve(config=CONFIG,
+                                                env=os.environ)
+    except Exception:              # the selector must never die on resolve
+        _HERDR_RESOLVED = {"bin": None, "provenance": "missing",
+                           "version": None, "verdicts": [], "stale": False,
+                           "realpath": None}
+    HERDR = _HERDR_RESOLVED["bin"]
+    HERDR_VERDICTS = _HERDR_RESOLVED["verdicts"]
+    HERDR_PROVENANCE = _HERDR_RESOLVED["provenance"]  # recorded|detected|missing
+    HERDR_CLIENT_VERSION = _HERDR_RESOLVED["version"]  # resolved binary's own
+    # §7.4: a recorded value existed but was superseded (vanished path, or
+    # a newer running server) — health shows tendril degraded + hint.
+    HERDR_STALE = bool(_HERDR_RESOLVED.get("stale"))
+else:                            # stale install without the resolver module
+    def _stale_herdr():          # recorded → PATH → fixed dirs, first runnable
+        for cand in (CONFIG.get("HERDR_BIN"), os.environ.get("HERDR_BIN")):
+            cand = os.path.expanduser(cand or "")
+            if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+        found = shutil.which("herdr")
+        if found:
+            return found
+        for d in HERDR_DIRS:
+            p = os.path.join(os.path.expanduser(d), "herdr")
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+        return None
+    HERDR = _stale_herdr()
+    HERDR_VERDICTS = []
+    HERDR_PROVENANCE = "recorded" if CONFIG.get("HERDR_BIN") else (
+        "detected" if HERDR else "missing")
+    HERDR_CLIENT_VERSION = None
+    HERDR_STALE = HERDR_PROVENANCE == "detected" and bool(CONFIG.get("HERDR_BIN"))
 SESSION = "default"
 CACHE_DIR = os.path.expanduser("~/.cache/remote-agents")
 EXTRA_PATH = ":".join([
@@ -299,6 +263,10 @@ def masthead(width, body):
 
 
 def run(args, timeout=6):
+    if not args or args[0] is None:
+        # §7.4/§3: a None argv[0] means Herdr is unavailable — report it as
+        # the not-found rc instead of raising TypeError out of a tick.
+        return 127, "", "herdr unavailable"
     try:
         p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
         return p.returncode, p.stdout, p.stderr
@@ -326,6 +294,8 @@ def find_key(obj, key):
 
 
 def snapshot():
+    if not HERDR:
+        return None                  # Herdr unavailable: callers treat as down
     rc, out, _ = run([HERDR, "api", "snapshot"], 8)
     if rc != 0:
         return None
@@ -1441,6 +1411,20 @@ _LIVE_STATUS = ("working", "blocked", "done", "idle")
 _SNAPSHOT_MAX_BYTES = 64 * 1024     # contract §0: the whole wire document
 
 
+def _prompt_ready(status, harness):
+    """§7.3: the host could dispatch a prompt into this agent — a
+    launchable harness, an agent present, idle or done. The phone uses
+    it to enable schedule rows (Busy · Needs input · Not supported are
+    derived from status on the phone)."""
+    if status not in ("idle", "done"):
+        return False
+    try:
+        import tendril_schedule
+        return harness in tendril_schedule.HARNESSES
+    except Exception:
+        return False
+
+
 def _snapshot_agent(a, tele=None):
     """One LIVE MAP agent row: the five schema-v1 contract fields plus the
     `harness` tag and, when tendril_telemetry could derive them, the
@@ -1451,26 +1435,30 @@ def _snapshot_agent(a, tele=None):
     st = a.get("agent_status")
     tab = a.get("tab_id")
     agent = a.get("agent") or "agent"
+    harness = str(agent).lower()
     out = {
         "pane_id": a.get("pane_id") or "",
         "tab_id": tab if tab else None,
         "agent": agent,
         "status": st if st in _LIVE_STATUS else "unknown",
         "focused": bool(a.get("focused")),
-        "harness": str(agent).lower(),
+        "harness": harness,
     }
+    out["prompt_ready"] = _prompt_ready(out["status"], harness)
     if tele:
         out.update(tele)
     return out
 
 
-def _optional_sections():
+def _optional_sections(snap=None):
     """(extra top-level sections, extra capability strings) contributed by
     sibling host modules when they are installed (contract §1/§4). Each hook
     returns (section_dict | None, capability_string) — a bare section dict is
     tolerated. Best-effort: absence or failure omits its section AND its
     capability string, and a present-but-EMPTY section registers nothing —
-    the phone renders the designed degraded state."""
+    the phone renders the designed degraded state. The herdr snapshot the
+    assembler already fetched rides along for the schedule section's
+    §7.3 latency reconcile."""
     extra, caps = {}, []
 
     def take(verb, result):
@@ -1494,7 +1482,7 @@ def _optional_sections():
         pass
     try:
         import tendril_schedule
-        take("schedule", tendril_schedule.snapshot_section())
+        take("schedule", tendril_schedule.snapshot_section(snap=snap))
     except Exception:
         pass
     try:
@@ -1596,7 +1584,7 @@ def _snapshot_doc():
         "capabilities": ["subagents"],
     }
     try:
-        extra, caps = _optional_sections()
+        extra, caps = _optional_sections(snap)
         doc.update(extra)
         doc["capabilities"] += [c for c in caps
                                 if c not in doc["capabilities"]]
@@ -1693,14 +1681,27 @@ def _schedule_notifier():
 
 def _schedule_launcher():
     """launcher(task) → (ok, pane_id, safe phrase). Argv lists only, one
-    `herdr` call per step (contract §3): a new tab INSIDE the target
-    workspace → `agent start` in that pane → `agent prompt <pane> --wait`
-    (TARGET takes a pane id: verified live via `herdr agent get <pane>`;
-    the harnesses also accept a positional initial prompt as fallback).
-    Failure phrases are exactly the contract's three."""
+    `herdr` call per step (contract §3): a NEW target runs tab create →
+    `agent start` in that pane → `agent prompt <pane> --wait`; an §7.3
+    EXISTING target dispatches through the herdr agent-prompt argv ONLY
+    into the pane chosen at add — never a new pane, never typed into a
+    terminal. TARGET takes a pane id (verified live via
+    `herdr agent get <pane>`). Failure phrases are exactly the
+    contract's three."""
     def launch(task):
         if not HERDR:
             return False, None, "launch refused"
+        target = task.get("target")
+        if isinstance(target, dict) and target.get("kind") == "existing":
+            pane = target.get("pane")
+            if not isinstance(pane, str) or not PANE_RE.match(pane):
+                return False, None, "launch refused"
+            rc, out, err = run([HERDR, "agent", "prompt", pane,
+                                task.get("prompt") or "", "--wait",
+                                "--timeout", "15000"], 25)
+            if rc != 0:
+                return False, None, "prompt rejected"
+            return True, pane, None
         name = "tendril-" + str(task.get("id", "")).split("-")[-1]
         if not re.match(r"^[A-Za-z0-9._-]{1,32}$", name):
             return False, None, "launch refused"
@@ -1730,6 +1731,51 @@ def _schedule_launcher():
     return launch
 
 
+def _schedule_lookup():
+    """pane → agent row for §7.3 add-time target validation, built lazily:
+    a plain new-pane add never pays a herdr call. started_at comes from
+    the agent's own transcript via tendril_telemetry (bounded, cached);
+    a pane with no derivable started_at simply cannot pin the guard."""
+    state = {}
+
+    def lookup(pane):
+        if "rows" not in state:
+            snap = snapshot()
+            state["rows"] = {a.get("pane_id"): a
+                             for a in (snap or {}).get("agents", [])
+                             if isinstance(a, dict) and a.get("pane_id")}
+        row = state["rows"].get(pane)
+        if not isinstance(row, dict):
+            return None
+        out = {"agent": row.get("agent"),
+               "workspace_id": row.get("workspace_id"),
+               "status": row.get("agent_status"),
+               "started_at": None}
+        try:
+            import tendril_telemetry
+            tele = tendril_telemetry.for_agents([row], budget=0.5)
+            if isinstance(tele, list) and isinstance(tele[0], dict):
+                out["started_at"] = tele[0].get("started_at")
+        except Exception:
+            pass
+        return out
+    return lookup
+
+
+def _schedule_started_at_of(row):
+    """started_at for one live agent row (§7.3 launch guard), from the
+    agent's own transcript; None when it cannot be derived (the guard is
+    then unverifiable and never guessed)."""
+    try:
+        import tendril_telemetry
+        tele = tendril_telemetry.for_agents([row], budget=0.5)
+        if isinstance(tele, list) and isinstance(tele[0], dict):
+            return tele[0].get("started_at")
+    except Exception:
+        pass
+    return None
+
+
 def _schedule_reply(doc):
     print(json.dumps(doc, separators=(",", ":")))
 
@@ -1748,6 +1794,17 @@ def _schedule_cmd(args):
     ts = tendril_schedule
     _, store_path, _ = ts.store_paths()
     if verb == "tick" and len(args) == 1:
+        snap = snapshot()
+        if snap is None:
+            # RC2 fix: Herdr down (or no client resolved) used to feed
+            # snap=None into the tick and crash the timer with TypeError
+            # (run([None, "api", "snapshot"])) or fail due tasks with
+            # "launch refused". A tick without Herdr is a no-op: ok reply,
+            # zero launches — due tasks simply wait for a healthy tick.
+            _schedule_reply({"ok": True, "tick": {
+                "at": int(time.time()), "launched": 0,
+                "transitions": 0}, "herdr": "unavailable"})
+            return 0
         def capacity(pid):
             try:
                 import tendril_capacity
@@ -1755,9 +1812,10 @@ def _schedule_cmd(args):
             except Exception:
                 return None
         summary, err = ts.run_tick(store_path, now=time.time(),
-                                   snap=snapshot(), capacity=capacity,
+                                   snap=snap, capacity=capacity,
                                    launcher=_schedule_launcher(),
-                                   notifier=_schedule_notifier())
+                                   notifier=_schedule_notifier(),
+                                   started_at_of=_schedule_started_at_of)
         if summary is None:
             _schedule_reply({"ok": False, "error": err})
             return 1
@@ -1786,7 +1844,7 @@ def _schedule_cmd(args):
         return 0
     if verb == "add" and len(args) == 2:
         now = time.time()
-        task, err = ts.decode_add(args[1], now)
+        task, err = ts.decode_add(args[1], now, lookup=_schedule_lookup())
         if err is None:
             task, err = ts.add_task(store_path, task, now)
         if err is not None:
@@ -1853,7 +1911,10 @@ def _health_cmd(args):
         return 1
     if verb == "--json" and len(args) == 1:
         doc = tendril_health.health_doc(host=HOST_LABEL, herdr=HERDR,
-                                        run=run)
+                                        run=run,
+                                        binary=HERDR_PROVENANCE,
+                                        client_version=HERDR_CLIENT_VERSION,
+                                        stale_record=HERDR_STALE)
         print(json.dumps(doc, separators=(",", ":")))
         return 0
     if verb == "tick" and len(args) == 1:

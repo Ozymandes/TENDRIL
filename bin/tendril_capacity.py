@@ -94,7 +94,7 @@ PRESSURE_PCT, CRITICAL_PCT, EXHAUSTED_PCT = 70.0, 90.0, 98.0
 # bumped whenever token accounting or window semantics change (the cache
 # holds per-file accumulators; a definition change must not be mixed with
 # numbers accumulated under the old definition)
-ACC_VERSION = 2
+ACC_VERSION = 3               # 3: §7.1 route attribution in pi scans
 
 # fixed provider ids (contract §1) + the pi providers seen on this host that
 # are not zai become their own provider ids (tokens only, state unknown
@@ -523,6 +523,26 @@ _RE_PI_MS_TS = re.compile(rb'"timestamp":(\d{10,16})')
 _RE_ISO_TS = re.compile(rb'"timestamp":"([0-9T:.+\-Z]{10,40})"')
 
 
+_PI_PID_OF = {
+    # §7.1: a bridge/route name is NEVER a provider. Pi-local usage is
+    # attributed to the upstream provider's capacity entry, so its
+    # adapters (claude_oauth, codex_wham, zai_quota) answer for it. A
+    # gateway route with no upstream of its own (optollm) maps to None:
+    # those tokens are attributed nowhere rather than becoming a fake
+    # provider with reason feature_missing.
+    "claude-bridge": "claude",
+    "openai-codex": "codex",
+    "optollm": None,
+}
+
+
+def _capacity_pid(pid):
+    """Canonical capacity provider id for a pi transcript provider token
+    (already sanitized). Bridges/routes fold into the upstream provider;
+    unknown tokens stay themselves (zai, google, …)."""
+    return _PI_PID_OF.get(pid, pid)
+
+
 def _pi_prov_new(entry, pid):
     prov = entry["prov"]
     agg = prov.get(pid)
@@ -547,8 +567,8 @@ def _pi_line(raw, entry, now):
             if total:
                 pm = _RE_PI_PROV.search(raw[:HEAD_BYTES])
                 mm = _RE_PI_MODEL.search(raw[:HEAD_BYTES])
-                pid = _sanitize_id(pm.group(1).decode("utf-8", "replace")) \
-                    if pm else None
+                pid = _capacity_pid(_sanitize_id(
+                    pm.group(1).decode("utf-8", "replace"))) if pm else None
                 if pid:
                     agg = _pi_prov_new(entry, pid)
                     entry["last_ts"] = max(entry.get("last_ts") or 0,
@@ -576,6 +596,9 @@ def _pi_line(raw, entry, now):
                                                         str) else None
     if pid is None:
         return
+    pid = _capacity_pid(pid)
+    if pid is None:
+        return                              # route without a provider: skip
     ts = _any_ts(m.get("timestamp")) or _any_ts(d.get("timestamp"))
     parts = [_num(u.get("input")), _num(u.get("output")),
              _num(u.get("cacheWrite"))]     # input + output + cacheWrite
@@ -1170,11 +1193,17 @@ def _state_for(windows, r429, now):
     return "ready", worst
 
 
-def _assemble(cache, now):
+def _assemble(cache, now, enabled=None):
     today = _local_date(now)
     groups = {}
     entries = cache.get("files") or {}
-    for rp, e in entries.items():
+    # fixed-kind files (claude/codex rollouts) seed their groups first so
+    # the harness of a shared provider id (pi usage folded into it) is
+    # deterministic — and so the "claude" group exists even when the
+    # ONLY claude data is pi-via-bridge usage.
+    for rp, e in sorted(entries.items(),
+                        key=lambda kv: kv[1].get("kind") == "pi"
+                        if isinstance(kv[1], dict) else False):
         if not isinstance(e, dict):
             continue
         kind = e.get("kind")
@@ -1182,9 +1211,12 @@ def _assemble(cache, now):
             provs = e.get("prov")
             if not isinstance(provs, dict):
                 continue
-            for pid, agg in provs.items():
+            for raw_pid, agg in provs.items():
                 if not isinstance(agg, dict):
                     continue
+                pid = _capacity_pid(raw_pid)
+                if pid is None:
+                    continue                  # route without a provider
                 g = groups.setdefault(pid, _group_new(pid, "pi"))
                 _merge_group_days(g, agg)
                 g["last_ts"] = max(g["last_ts"], e.get("last_ts") or 0)
@@ -1311,11 +1343,44 @@ def _assemble(cache, now):
             rec["by_model"] = models[:5]
         if g["cost_known"]:
             cost = float(g["days"].get(today, {}).get("cost", 0.0))
-            rec["cost_today_usd"] = round(cost, 4)
+            # §7.1 billing: a zero total is a provider-managed (or unknown)
+            # route, never a metered charge — omit instead of emitting 0.0.
+            if cost > 0:
+                rec["cost_today_usd"] = round(cost, 4)
         if g["plan"]:
             rec["plan"] = g["plan"]
+        if state == "unknown":
+            # §7.5: say WHY the state is unknown, and hand the user the
+            # exact adapter id when enabling it would fix it.
+            reason, enable = _unknown_reason(pid, cache.get("net"), enabled)
+            rec["reason"] = reason
+            if enable:
+                rec["enable"] = enable
         providers.append(rec)
     return {"generated_at": int(now), "providers": providers}
+
+
+_ADAPTER_OF = {"claude": "claude_oauth", "codex": "codex_wham",
+              "zai": "zai_quota"}
+
+
+def _unknown_reason(pid, net, enabled):
+    """(reason, enable|None) for a provider whose state is unknown
+    (§7.5): a disabled adapter → adapter_disabled + the id to enable; an
+    enabled adapter's recorded 401 → auth_error; network failures →
+    network_error; an adapter with no usable sample → no_data; a
+    provider with no measurement path on this host → feature_missing."""
+    aid = _ADAPTER_OF.get(pid)
+    if aid is None:
+        return "feature_missing", None
+    if aid not in (enabled or []):
+        return "adapter_disabled", aid
+    fail = ((net or {}).get(aid) or {}).get("fail")
+    if fail == "auth":
+        return "auth_error", None
+    if fail == "net":
+        return "network_error", None
+    return "no_data", None
 
 
 # ---------- cache ----------
@@ -1403,7 +1468,7 @@ def collect(refresh=False, budget_s=None, now=None, home=None,
             _net_phase(cache, now, allow_network, home)
         except Exception:
             pass
-    section = _assemble(cache, now)
+    section = _assemble(cache, now, enabled=enabled_ids(home))
     cache["section"] = section
     cache["built_at"] = now
     _save_cache(cache, cache_path)
@@ -1426,6 +1491,39 @@ def snapshot_section(budget_s=BUDGET_S, now=None, home=None,
                        cache_path=cache_path), "capacity"
     except Exception:
         return None, "capacity"
+
+
+def health_section(now=None, home=None, cache_path=None):
+    """Read-only capacity summary for the health module (contract 0.2
+    §7.4): {"state": "available|adapters_disabled|error|absent",
+    "enabled": [<network adapter ids>]}. Signature (h1 calls this):
+    health_section(now=None, home=None, cache_path=None) → dict; NEVER
+    raises, NEVER scans transcripts, NEVER touches the network, NEVER
+    writes: it serves the cached section only, so a bounded health probe
+    stays bounded. States: absent = no cached section (capacity has not
+    reported yet); adapters_disabled = a section exists but every
+    provider is unknown while no network adapter is enabled (the phone's
+    'enable secure host reporting' state); available = usable data (or
+    at least one adapter enabled); error = the cache could not be read."""
+    try:
+        enabled = enabled_ids(home)
+        path = cache_path or (CACHE_FILE if home is None else
+                              os.path.join(home, ".cache", "tendril",
+                                           "capacity.json"))
+        cache = _load_cache(path)
+        section = cache.get("section") \
+            if cache.get("acc_ver") == ACC_VERSION else None
+        providers = section.get("providers") \
+            if isinstance(section, dict) else None
+        if not isinstance(providers, list) or not providers:
+            return {"state": "absent", "enabled": enabled}
+        if not enabled and all(
+                isinstance(p, dict) and p.get("state") == "unknown"
+                for p in providers):
+            return {"state": "adapters_disabled", "enabled": enabled}
+        return {"state": "available", "enabled": enabled}
+    except Exception:
+        return {"state": "error", "enabled": []}
 
 
 def provider_state(provider_id, budget_s=NET_BUDGET_MIN_S, now=None,

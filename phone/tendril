@@ -260,6 +260,30 @@ elif [ "$MODE" = "schedule" ]; then
                 echo "usage: tendril [<alias>] schedule add <payload>   (1..16384 base64url chars: A-Z a-z 0-9 _ -)"
                 exit 2
             fi
+            # LINK-CONTRACT-0.2 §7.3: a payload that carries a `target`
+            # must match the exact allowed forms BEFORE anything is
+            # dialed (pane ids are w<alnum>:p<alnum> — real hosts use
+            # base-36-ish suffixes like w9:pB). Decode is best-effort:
+            # no base64 on the phone → the host validates alone.
+            DECODED=$(printf '%s' "$SCHED_ARG" | tr '_-' '/+' \
+                | base64 -d 2>/dev/null) || DECODED=""
+            if [ -n "$DECODED" ] \
+                    && printf '%s' "$DECODED" | grep -q '"target"'; then
+                TOBJ=$(printf '%s' "$DECODED" \
+                    | grep -oE '"target"[[:space:]]*:[[:space:]]*\{[^}]*\}' \
+                    | head -n 1)
+                case "$TOBJ" in
+                    "" ) BAD_TARGET=1 ;;
+                    * ) 
+                        printf '%s' "$TOBJ" | grep -qE \
+'"target"[[:space:]]*:[[:space:]]*\{[[:space:]]*"kind"[[:space:]]*:[[:space:]]*"new"[[:space:]]*\}|"target"[[:space:]]*:[[:space:]]*\{[[:space:]]*"kind"[[:space:]]*:[[:space:]]*"existing"[[:space:]]*,[[:space:]]*"pane"[[:space:]]*:[[:space:]]*"w[0-9A-Za-z]+:p[0-9A-Za-z]+"[[:space:]]*,[[:space:]]*"harness"[[:space:]]*:[[:space:]]*"[a-z][a-z0-9]*"([[:space:]]*,[[:space:]]*"agent_started_at"[[:space:]]*:[[:space:]]*[0-9]{1,13})?[[:space:]]*\}' \
+                            || BAD_TARGET=1 ;;
+                esac
+                if [ "${BAD_TARGET:-0}" = "1" ]; then
+                    echo "usage: tendril [<alias>] schedule add <payload>   (target: new | existing{pane w*:p*, harness, agent_started_at?})"
+                    exit 2
+                fi
+            fi
             REMOTE_CMD="$REMOTE_BIN schedule add '$SCHED_ARG'" ;;
         *)
             echo "usage: tendril [<alias>] schedule show|add|cancel <arg>"

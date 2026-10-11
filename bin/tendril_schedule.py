@@ -108,6 +108,17 @@ E_RUNNING = "running — open the session to stop it"
 E_ID = "invalid task id"
 E_CORRUPT = "schedule store corrupt - quarantined; refusing to tick"
 
+# §7.3 existing-session targets
+TARGET_NEW = "new"
+TARGET_EXISTING = "existing"
+E_TARGET = "invalid target"
+E_PANE = "pane not found"
+E_HARNESS_MISMATCH = "harness mismatch"
+E_SESSION_CHANGED = "session changed"
+E_SESSION_BUSY = "session busy"
+E_SESSION_INPUT = "session needs input"
+EXISTING_WAIT_MAX_S = 15 * 60     # §7.3: busy/blocked retry bound
+
 # FAILED phrases (contract §3) — everything else collapses to the generic one
 LAUNCH_PHRASES = ("launch refused", "workspace missing", "prompt rejected")
 
@@ -223,7 +234,7 @@ def load_store(path, now=None, quarantine=True):
 
 
 @contextlib.contextmanager
-def _locked(lock_path):
+def _locked(lock_path, blocking=True):
     d = os.path.dirname(lock_path)
     os.makedirs(d, exist_ok=True)
     # Symlink refusal before chmod/open: a symlinked state dir or lock
@@ -243,7 +254,8 @@ def _locked(lock_path):
                  | os.O_NONBLOCK, 0o600)
     try:
         os.set_blocking(fd, True)
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        fcntl.flock(fd, fcntl.LOCK_EX
+                    | (0 if blocking else fcntl.LOCK_NB))
         try:
             yield
         finally:
@@ -294,8 +306,75 @@ def _valid_trigger(raw):
     return out, None
 
 
-def fingerprint_of(title, prompt, workspace, harness, trigger):
-    canon = json.dumps([title, prompt, workspace, harness, trigger],
+def _valid_target(raw, harness=None):
+    """Strict §7.3 target schema: absent or {"kind":"new"} → a new pane;
+    {"kind":"existing","pane","harness"[,"agent_started_at"]} → an
+    existing session (pane id shape = the herdr wire format, e.g.
+    w16:p5 or w9:pB — pane/tab suffixes are base-36-ish alphanumerics on
+    real hosts). A top-level harness, when present, must agree. Nothing
+    else is accepted; a malformed target rejects the whole add."""
+    if raw is None:
+        return {"kind": TARGET_NEW}, None
+    if not isinstance(raw, dict):
+        return None, E_TARGET
+    if set(raw) - {"kind", "pane", "harness", "agent_started_at"}:
+        return None, E_TARGET
+    kind = raw.get("kind")
+    if kind == TARGET_NEW:
+        if set(raw) != {"kind"}:
+            return None, E_TARGET
+        return {"kind": TARGET_NEW}, None
+    if kind != TARGET_EXISTING:
+        return None, E_TARGET
+    pane = raw.get("pane")
+    if not isinstance(pane, str) or not PANE_RE.match(pane):
+        return None, E_TARGET
+    th = raw.get("harness")
+    if not isinstance(th, str) or th not in HARNESSES:
+        return None, E_TARGET
+    if isinstance(harness, str) and harness and harness != th:
+        return None, E_TARGET
+    out = {"kind": TARGET_EXISTING, "pane": pane, "harness": th}
+    if "agent_started_at" in raw:
+        v = raw["agent_started_at"]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) \
+                or not 10 ** 8 <= v <= 4 * 10 ** 9:
+            return None, E_TARGET
+        out["agent_started_at"] = int(v)
+    return out, None
+
+
+def _existing_ok(target, workspace, lookup):
+    """Add-time §7.3 validation through the host-injected lookup(pane) →
+    row|None: the pane must exist in the task's workspace and host an
+    agent of that harness; a pinned agent_started_at must still match the
+    live agent (pane-reuse guard). Without a lookup nothing can be
+    verified — refused (never guessed)."""
+    if lookup is None:
+        return E_PANE
+    try:
+        row = lookup(target["pane"])
+    except Exception:
+        return E_PANE
+    if not isinstance(row, dict):
+        return E_PANE
+    ws = row.get("workspace_id")
+    if ws is not None and ws != workspace:
+        return E_PANE
+    if str(row.get("agent") or "").lower() != target["harness"]:
+        return E_HARNESS_MISMATCH
+    pinned = target.get("agent_started_at")
+    started = row.get("started_at")
+    if isinstance(pinned, int) and isinstance(started, (int, float)) \
+            and int(started) != pinned:
+        return E_SESSION_CHANGED
+    return None
+
+
+def fingerprint_of(title, prompt, workspace, harness, trigger,
+                   target_kind=TARGET_NEW):
+    canon = json.dumps([title, prompt, workspace, harness, trigger,
+                        target_kind],
                        sort_keys=True, ensure_ascii=True)
     return hashlib.sha256(canon.encode("utf-8")).hexdigest()
 
@@ -307,10 +386,13 @@ def new_id(fingerprint, now):
     return "t-%s-%s" % (day, digest)
 
 
-def decode_add(payload, now, capacity=None, which=None, home=None):
+def decode_add(payload, now, capacity=None, which=None, home=None,
+               lookup=None):
     """(task|None, error|None). Validates the b64url regex BEFORE decoding,
-    then strict JSON fields (contract §4). `capacity` (provider_id →
-    provider_state|None) resolves a known resets_at for on_reset adds."""
+    then strict JSON fields (contract §4, plus the §7.3 optional target).
+    `capacity` (provider_id → provider_state|None) resolves a known
+    resets_at for on_reset adds; `lookup` (pane → agent row|None)
+    validates an existing-session target against the live map at add."""
     if not isinstance(payload, str) or not PAYLOAD_RE.match(payload):
         return None, E_MALFORMED
     try:
@@ -324,7 +406,8 @@ def decode_add(payload, now, capacity=None, which=None, home=None):
         return None, E_JSON
     if not isinstance(doc, dict):
         return None, E_OBJECT
-    if set(doc) - {"title", "prompt", "workspace", "harness", "trigger"}:
+    if set(doc) - {"title", "prompt", "workspace", "harness", "trigger",
+                   "target"}:
         return None, E_FIELDS
     title = doc.get("title")
     if not isinstance(title, str) or not 1 <= len(title) <= TITLE_MAX:
@@ -336,16 +419,28 @@ def decode_add(payload, now, capacity=None, which=None, home=None):
     workspace = doc.get("workspace")
     if not isinstance(workspace, str) or not WORKSPACE_RE.match(workspace):
         return None, E_WORKSPACE
-    harness = doc.get("harness")
-    if not isinstance(harness, str) or harness not in HARNESSES:
-        return None, E_HARNESS
-    if not _installed(harness, which=which, home=home):
-        return None, E_INSTALLED
+    target, err = _valid_target(doc.get("target"), doc.get("harness"))
+    if err:
+        return None, err
+    if target["kind"] == TARGET_NEW:
+        harness = doc.get("harness")
+        if not isinstance(harness, str) or harness not in HARNESSES:
+            return None, E_HARNESS
+        if not _installed(harness, which=which, home=home):
+            return None, E_INSTALLED
+    else:
+        # an existing session already runs this harness (the pane proves
+        # the executable exists — the install check would only false-fail)
+        harness = target["harness"]
+        err = _existing_ok(target, workspace, lookup)
+        if err:
+            return None, err
     trigger, err = _valid_trigger(doc.get("trigger"))
     if err:
         return None, err
 
-    fp = fingerprint_of(title, prompt, workspace, harness, trigger)
+    fp = fingerprint_of(title, prompt, workspace, harness, trigger,
+                        target["kind"])
     task = {
         "id": new_id(fp, now),
         "title": title,
@@ -354,6 +449,7 @@ def decode_add(payload, now, capacity=None, which=None, home=None):
         "workspace_label": "",
         "harness": harness,
         "trigger": trigger,
+        "target": target,
         "state": None,
         "due_at": None,
         "created_at": int(now),
@@ -583,7 +679,101 @@ def _running_tick(task, now, snap):
     return _transition(task, task["state"], FAILED, now, failure="interrupted")
 
 
-def tick(store, now, snap, capacity, launcher, notifier):
+def _pane_row(snap, pane_id):
+    """The herdr snapshot row for one pane id (its agent facts ride on
+    the pane rows), or None."""
+    if not isinstance(snap, dict) or not pane_id:
+        return None
+    for rows in (snap.get("panes"), snap.get("agents")):
+        for p in rows or []:
+            if isinstance(p, dict) and p.get("pane_id") == pane_id:
+                return p
+    return None
+
+
+def _target_of(task):
+    t = task.get("target")
+    return t if isinstance(t, dict) and t.get("kind") == TARGET_EXISTING \
+        else None
+
+
+def _existing_gate(task, now, snap, started_at_of=None):
+    """§7.3 launch gate for an existing-session target. Returns "go",
+    "defer", or a FAILED phrase. The pane must still exist in the task's
+    workspace hosting that harness, and (when the add pinned
+    agent_started_at) the same agent must still sit there — pane-id reuse
+    ⇒ `session changed`. The agent must be idle/done to dispatch:
+    working ⇒ the task stays READY and is retried each tick for ≤ 15 min
+    then `session busy`; herdr blocked ⇒ never dispatched, same bound,
+    then `session needs input`."""
+    target = _target_of(task)
+    row = _pane_row(snap, target.get("pane"))
+    if row is None or str(row.get("agent") or "").lower() \
+            != target.get("harness"):
+        return E_SESSION_CHANGED
+    ws = row.get("workspace_id")
+    if ws is not None and ws != task.get("workspace"):
+        return E_SESSION_CHANGED
+    pinned = target.get("agent_started_at")
+    if isinstance(pinned, int) and started_at_of is not None:
+        try:
+            cur = started_at_of(row)
+        except Exception:
+            cur = None
+        if isinstance(cur, (int, float)) and int(cur) != pinned:
+            return E_SESSION_CHANGED
+    st = row.get("agent_status")
+    if st in ("idle", "done"):
+        return "go"
+    since = task.get("target_wait_since")
+    if not isinstance(since, (int, float)):
+        task["target_wait_since"] = int(now)
+        return "defer"
+    if now - since < EXISTING_WAIT_MAX_S:
+        return "defer"
+    return E_SESSION_INPUT if st == "blocked" else E_SESSION_BUSY
+
+
+def reconcile(path, now, snap):
+    """§7.3 snapshot-side latency reconcile for RUNNING tasks: pane gone
+    ⇒ DONE `session ended`; the pane's agent idle/done after the task's
+    dispatch (started_at set) ⇒ DONE. Persisted under a NON-blocking
+    flock — when the tick holds the lock the reconcile is skipped whole
+    (the 30 s tick stays authoritative). Never launches, never fails a
+    task, never raises. Returns the number of transitions."""
+    n = 0
+    if not isinstance(snap, dict):
+        return n
+    try:
+        with _locked(path + ".lock", blocking=False):
+            store, err = load_store(path, now=now)
+            if err:
+                return 0
+            for task in store["tasks"]:
+                if not isinstance(task, dict):
+                    continue
+                if task.get("state") != RUNNING or not task.get("pane_id") \
+                        or not task.get("started_at"):
+                    continue                    # tick owns every other call
+                row = _pane_row(snap, task["pane_id"])
+                if row is None:
+                    _transition(task, RUNNING, DONE, now,
+                                failure="session ended")
+                    n += 1
+                elif row.get("agent_status") in ("done", "idle"):
+                    _transition(task, RUNNING, DONE, now)
+                    n += 1
+            if n:
+                save_store(store)
+    except (BlockingIOError, OSError):
+        pass                                    # lock busy (or locked dir):
+    except Exception:
+        pass                                    # never fail a snapshot
+    return n
+
+
+def tick(store, now, snap, capacity, launcher, notifier,
+         started_at_of=None):
     """One scheduler pass over the loaded store. Transitions first, then a
     single atomic persist (READY tasks go to disk as RUNNING + launch_token
     — contract's fsync-before-launch point), and only then the launches.
@@ -617,6 +807,20 @@ def tick(store, now, snap, capacity, launcher, notifier):
                 _notify(notifier, task, "waiting")
         if task.get("state") == READY:
             task.pop("reason", None)          # no longer stuck on capacity
+            if _target_of(task) is not None:
+                verdict = _existing_gate(task, now, snap, started_at_of)
+                if verdict == "defer":
+                    continue
+                if verdict != "go":            # a FAILED phrase (§7.3)
+                    task["state"] = FAILED
+                    task["failure"] = verdict
+                    task["finished_at"] = int(now)
+                    events.append({"id": task["id"], "from": READY,
+                                   "to": FAILED, "at": int(now),
+                                   "failure": verdict})
+                    _notify(notifier, task, "failed")
+                    continue
+                task.pop("target_wait_since", None)
             task["launch_token"] = uuid.uuid4().hex
             events.append(_transition(task, READY, RUNNING, now))
             launches.append(task)
@@ -655,7 +859,7 @@ def _launch_one(launcher, task):
 
 
 def run_tick(path, now=None, snap=None, capacity=None, launcher=None,
-             notifier=None):
+             notifier=None, started_at_of=None):
     """The flock-serialized entry point (one tick at a time per host).
     (summary|None, error|None); a corrupt/quarantined store refuses here."""
     now = time.time() if now is None else now
@@ -663,7 +867,8 @@ def run_tick(path, now=None, snap=None, capacity=None, launcher=None,
         store, err = load_store(path, now=now)
         if err:
             return None, err
-        events = tick(store, now, snap, capacity, launcher, notifier)
+        events = tick(store, now, snap, capacity, launcher, notifier,
+                      started_at_of=started_at_of)
     return {"tick": {"at": int(now), "launched": sum(
         1 for e in events if e["to"] == RUNNING), "transitions": len(events)},
         "events": events}, None
@@ -683,6 +888,10 @@ def project(task):
         if v is None:
             continue
         out[k] = copy.deepcopy(v) if isinstance(v, dict) else v
+    t = task.get("target")                    # §7.3: the kind word only
+    if isinstance(t, dict) and t.get("kind") in (TARGET_NEW,
+                                                 TARGET_EXISTING):
+        out["target"] = t["kind"]
     if task.get("state") == WAITING_FOR_CAPACITY and task.get("reason"):
         out["reason"] = task["reason"]
     return out
@@ -702,13 +911,19 @@ def _section_tasks(tasks):
     return out
 
 
-def snapshot_section(now=None, home=None):
+def snapshot_section(now=None, home=None, snap=None):
     """(section|None, "schedule") for the snapshot assembler — never
     raises, never contains prompt text. available is False when the tick
-    driver (the user timer) is missing or the store refuses."""
+    driver (the user timer) is missing or the store refuses. When the
+    caller passes the herdr snapshot it already fetched (snap=), RUNNING
+    tasks are reconciled first under a non-blocking flock (§7.3 latency:
+    DONE when the pane is idle/done after dispatch or gone) — the
+    snapshot never launches and never blocks on the tick's lock."""
     try:
         now = time.time() if now is None else now
         _, path, _ = store_paths(home)
+        if snap is not None:
+            reconcile(path, now, snap)
         tasks, err = [], None
         if os.path.isfile(path):
             store, err = load_store(path, now=now, quarantine=False)

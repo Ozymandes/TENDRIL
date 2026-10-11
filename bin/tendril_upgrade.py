@@ -37,6 +37,11 @@ import time
 DEFAULT_VERSION = "0.2.0-dev"
 INSTALLER = "install"
 PHONE_FILES = ("tendril", "termux-url-opener", "agent")
+# Config keys ./install --upgrade may update (LINK-CONTRACT-0.2 §7.4: the
+# installer re-records the resolved Herdr entry path, its version and the
+# target realpath). Every OTHER config line must stay byte-identical;
+# notify.env must stay byte-identical.
+HERDR_CONFIG_KEYS = ("HERDR_BIN", "HERDR_VERSION", "HERDR_REALPATH")
 USAGE = ("usage: tendril_upgrade.py [--verbose]\n"
          "       tendril_upgrade.py record-provenance --pkg DIR\n"
          "       tendril_upgrade.py version")
@@ -396,20 +401,18 @@ def host_helper(repo=None):
 
 
 def find_herdr():
-    cands = []
-    for override in (os.environ.get("HERDR_BIN"),
-                     parse_env_file(config_path()).get("HERDR_BIN")):
-        if override:
-            cands.append(os.path.expanduser(override))
-    found = shutil.which("herdr")
-    if found:
-        cands.append(found)
-    for d in ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"):
-        cands.append(os.path.join(os.path.expanduser(d), "herdr"))
-    for cand in cands:
-        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
-            return cand
-    return None
+    """The ONE §7.4 resolver (tendril_herdr): recorded config value first,
+    then $HERDR_BIN, then protocol-verified newest-compatible detection.
+    Never "first on PATH wins" — that is how a stale /usr/bin/herdr won."""
+    try:
+        import tendril_herdr
+    except ImportError:
+        return None
+    try:
+        return tendril_herdr.resolve(
+            config=tendril_herdr.parse_env_file(config_path()))["bin"]
+    except Exception:                       # health checks never crash
+        return None
 
 
 def service_state(repo=None):
@@ -541,9 +544,39 @@ def print_summary(ver, old_short, new_short, host, watcher, herdr, android):
 
 
 # ---------------------------------------------------------------- upgrade
+def config_without_herdr_lines(text):
+    """Config text minus the HERDR_BIN/HERDR_VERSION lines — the only
+    lines ./install --upgrade is allowed to change (§7.4 record)."""
+    return [ln for ln in text.splitlines()
+            if not ln.startswith(tuple(k + "=" for k in HERDR_CONFIG_KEYS))]
+
+
 def byte_snapshot():
-    return {config_path(): sha256(config_path()),
+    """What must survive the upgrade: notify.env byte-identical; config
+    byte-identical EXCEPT the recorded HERDR_BIN/HERDR_VERSION lines."""
+    return {config_path(): read_text(config_path()),
             notify_path(): sha256(notify_path())}
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8", errors="surrogateescape") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def drift_violations(before):
+    """Paths whose after-state breaks the preservation contract."""
+    bad = []
+    after_notify = sha256(notify_path())
+    if before.get(notify_path()) != after_notify:
+        bad.append(notify_path())
+    old, new = before.get(config_path()), read_text(config_path())
+    if old != new and config_without_herdr_lines(old or "") != \
+            config_without_herdr_lines(new or ""):
+        bad.append(config_path())
+    return bad
 
 
 def run_installer(repo, verbose):
@@ -593,11 +626,16 @@ def upgrade_main(verbose=False):
         head = head_sha(repo) or head
 
     after = byte_snapshot()
-    changed_paths = [p for p, h in before.items() if h != after[p]]
+    changed_paths = drift_violations(before)
     if changed_paths:
         for p in changed_paths:
-            warn("ABORT: %s changed during the upgrade - it must stay "
-                 "byte-identical" % p)
+            if p == config_path():
+                warn("ABORT: %s changed beyond the recorded HERDR_BIN/"
+                     "HERDR_VERSION lines - other lines must stay "
+                     "byte-identical" % p)
+            else:
+                warn("ABORT: %s changed during the upgrade - it must stay "
+                     "byte-identical" % p)
         warn("backups live next to the files (*.bak.<epoch>); restore and "
              "re-run ./install by hand")
         return 1

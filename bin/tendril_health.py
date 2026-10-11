@@ -100,11 +100,19 @@ STATES = ("running", "down", "stopped", "unknown")
 _UNIT_SPECS = (("notify", "herdr-notify.service"),
                ("scheduler", "tendril-schedule.timer"),
                ("guardian", "tendril-guardian.timer"))
+# §7.4 timer semantics need the paired oneshot services too: the timer is
+# only "waiting/running" between ticks — last-tick evidence lives on the
+# service (Result / ExecMainStatus / ExecMainExitTimestampUSec).
+_SERVICE_OF = {"tendril-schedule.timer": "tendril-schedule.service",
+               "tendril-guardian.timer": "tendril-guardian.service"}
+_SHOW_PROPS = ("Id", "ActiveState", "SubState", "Result", "ExecMainStatus",
+               "ExecMainExitTimestampUSec")
 
 _VERSION_RE = re.compile(r"^[0-9][0-9A-Za-z.+-]{0,23}$")
 
 E_GUARD = "Stopped on purpose — start it on the host"
 E_RUNNING = "Herdr is already running"
+E_MISMATCH = "Another Herdr version is running"
 E_SLOW = "Rate limited; wait %d s"
 E_NOUP = "Herdr did not come up"
 E_START = "could not start Herdr"
@@ -227,6 +235,10 @@ def load_state(path, now=None):
     streak = doc.get("down_streak")
     if isinstance(streak, int) and 0 <= streak <= 100000:
         out["down_streak"] = streak
+    if doc.get("started_by") == "tendril":
+        out["started_by"] = "tendril"          # §7.4 restart ownership
+    if isinstance(doc.get("started_at"), int) and 0 < doc["started_at"]:
+        out["started_at"] = doc["started_at"]
     return out, None
 
 
@@ -248,34 +260,53 @@ def run_bounded(args, timeout):
 
 
 def _parse_status(out):
-    """(running|None, version|None) from `herdr status server --json`."""
+    """(running|None, version|None, compatible|None) from
+    `herdr status server --json` — compatible is the server's own
+    protocol verdict for this client (None when it does not say)."""
     try:
         doc = json.loads(out)
     except ValueError:
-        return None, None
+        return None, None, None
     if not isinstance(doc, dict):
-        return None, None
+        return None, None, None
     running = doc.get("running")
     running = True if running is True else False if running is False else None
     version = doc.get("version")
     if not (isinstance(version, str) and _VERSION_RE.match(version)):
         version = None
-    return running, version
+    compat = doc.get("compatible")
+    if compat is None:
+        compat = doc.get("endpoint_compatible")
+    compat = True if compat is True else False if compat is False else None
+    return running, version, compat
+
+
+def probe_herdr_full(run, herdr, timeout=PROBE_TIMEOUT_S):
+    """(state, server_version, protocol_ok): the §7.4 probe. state is
+    running|down|unknown; protocol_ok is True/False/None straight from the
+    server's own compatibility report (False = the server says this client
+    speaks the wrong protocol — the `herdr api` protocol-error case).
+    Version strings are sanitized or dropped; never blocks past timeout."""
+    if not herdr:
+        return "unknown", None, None
+    rc, out, _err = run([herdr, "status", "server", "--json"], timeout)
+    if rc == 124 or rc == 127:
+        return "unknown", None, None
+    running, version, compat = _parse_status(out)
+    if running is None:
+        return "unknown", version, compat
+    return ("running" if running else "down"), version, compat
 
 
 def probe_herdr(run, herdr, timeout=PROBE_TIMEOUT_S):
     """(state, version): "running"/"down" from the status JSON's own
     `running` boolean; anything else (timeout, garbage, no client) is
-    honestly "unknown" with no version. Never blocks past `timeout`."""
-    if not herdr:
-        return "unknown", None
-    rc, out, _err = run([herdr, "status", "server", "--json"], timeout)
-    if rc == 124 or rc == 127:
-        return "unknown", None
-    running, version = _parse_status(out)
-    if running is None:
-        return "unknown", version
-    return ("running" if running else "down"), version
+    honestly "unknown" with no version. Guardian semantics (§6.2): a
+    protocol-mismatched server is still RUNNING — it answers, so no
+    OFFLINE incident; the mismatch is health --json's business. Never
+    blocks past `timeout`."""
+    state, version, _compat = probe_herdr_full(run, herdr, timeout)
+    return state, version
 
 
 def api_alive(run, herdr, timeout=API_TIMEOUT_S):
@@ -286,45 +317,147 @@ def api_alive(run, herdr, timeout=API_TIMEOUT_S):
     return rc == 0
 
 
+def client_version_of(run, herdr, timeout=0.8):
+    """Sanitized `--version` of the resolved/recorded binary (the
+    §7.4 client_version). None when unparseable — never fabricated."""
+    if not herdr:
+        return None
+    rc, out, err = run([herdr, "--version"], timeout)
+    if rc in (124, 127):
+        return None
+    m = re.search(r"\d+(?:\.\d+)+", (out or "") + (err or ""))
+    word = m.group(0) if m else None
+    return word if word and _VERSION_RE.match(word) else None
+
+
 # ------------------------------------------------- systemd unit states
 def _run_default(args, timeout):
     return run_bounded(args, timeout)
 
 
-def unit_states(run=None, home=None):
-    """{notify|scheduler|guardian: active|inactive|failed|absent}. A unit
-    file that is not installed is "absent" (no subprocess); installed
-    units are read from ONE bounded `systemctl --user is-active` call.
-    Without a systemctl binary (launchd hosts) everything fileless is
-    "absent" and installed units read "inactive" (no manager to run them);
-    a systemctl timeout degrades installed units to "inactive" rather than
-    inventing an active state."""
+def _show_units(present, run):
+    """{unit: {prop: word}} from ONE bounded `systemctl --user show` call
+    (Id/ActiveState/SubState/Result/ExecMainStatus/ExecMainExitTimestampUSec
+    per unit). rc 127 (no systemctl) → {} — callers degrade to their
+    file-based defaults. A unit the manager does not know still prints a
+    property block (ActiveState=unknown), so every asked unit gets a row."""
+    argv = ["systemctl", "--user", "show"]
+    for prop in _SHOW_PROPS:
+        argv += ["-p", prop]
+    argv += ["--"] + [u for _k, u in present]
+    rc, stdout, _err = run(argv, UNIT_PROBE_TIMEOUT_S)
+    if rc == 127:
+        return {}
+    out = {}
+    cur = None
+    for ln in stdout.splitlines():
+        if "=" not in ln:
+            continue
+        key, _, val = ln.partition("=")
+        if key == "Id":
+            cur = out.setdefault(val.strip(), {})
+            continue
+        if cur is not None:
+            cur[key] = val.strip()
+    return out
+
+
+def _word(facts, prop):
+    val = (facts or {}).get(prop, "")
+    if not val or val in ("n/a",):
+        return None
+    return val
+
+
+def _timer_word(facts):
+    """waiting|running|inactive|failed (§7.4) from ActiveState/SubState."""
+    active = _word(facts, "ActiveState")
+    if active == "active":
+        sub = _word(facts, "SubState")
+        return sub if sub in ("waiting", "running") else "waiting"
+    if active == "failed":
+        return "failed"
+    return "inactive"
+
+
+def _last_tick(facts):
+    """(last_tick, last_tick_at) from the paired oneshot service, only on
+    real evidence (an exit timestamp): ("ok"|"failed", epoch|None) or
+    (None, None) when this manager has never run the service."""
+    try:
+        usec = int((_word(facts, "ExecMainExitTimestampUSec") or "0")
+                   .split(".")[0])
+    except ValueError:
+        usec = 0
+    if usec <= 0:
+        return None, None
+    status = _word(facts, "ExecMainStatus")
+    result = _word(facts, "Result")
+    try:
+        status_ok = int(status) == 0
+    except (TypeError, ValueError):
+        status_ok = status is None
+    ok = status_ok and result in (None, "success")
+    return ("ok" if ok else "failed"), usec // 1000000
+
+
+def unit_facts(run=None, home=None):
+    """(states, timers) from ONE bounded show call.
+    states: {notify|scheduler|guardian: active|inactive|failed|absent} —
+    the §6.1 words (a unit file not installed is "absent"; without a
+    systemctl binary everything fileless is "absent" and installed units
+    read "inactive"; a timeout degrades installed units to "inactive").
+    timers: §7.4 blocks for scheduler/guardian: state active|degraded|
+    inactive|absent + timer waiting|running|inactive|failed + last_tick
+    ok|failed + last_tick_at (epoch) — degraded when the last service run
+    failed (or the timer unit itself failed); active when the timer is
+    waiting/running and the last tick was ok. Truth comes from the
+    manager, so there is no second last-tick state file to go stale."""
     run = run or _run_default
     base = home or os.path.expanduser("~")
     unit_dir = os.path.join(base, ".config", "systemd", "user")
-    out = {}
+    states = {}
     present = []
     for key, unit in _UNIT_SPECS:
         if not os.path.isfile(os.path.join(unit_dir, unit)):
-            out[key] = "absent"
+            states[key] = "absent"
         else:
-            out[key] = "inactive"          # corrected below when active
+            states[key] = "inactive"       # corrected below when active
             present.append((key, unit))
+    timers = {k: {"state": states[k]} for k in ("scheduler", "guardian")
+              if states[k] == "absent"}
     if not present:
-        return out
-    rc, stdout, _err = run(["systemctl", "--user", "is-active"]
-                           + [u for _k, u in present],
-                           UNIT_PROBE_TIMEOUT_S)
-    if rc == 127:                           # no systemctl at all
-        return out
-    lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
-    for (key, _unit), word in zip(present, lines):
-        if word in ("active", "failed"):
-            out[key] = word
-        elif word == "inactive" or word == "":
-            out[key] = "inactive"
+        return states, timers
+    facts = _show_units(present, run)
+    for key, unit in present:
+        f = facts.get(unit, {})
+        active = _word(f, "ActiveState")
+        if active in ("active", "failed"):
+            states[key] = active
         # any other surprising word keeps the conservative "inactive"
-    return out
+        if key not in ("scheduler", "guardian"):
+            continue
+        word = _timer_word(f)
+        last, last_at = _last_tick(facts.get(_SERVICE_OF.get(unit, ""), {}))
+        if states[key] == "failed" or word == "failed" or last == "failed":
+            state = "degraded"
+        elif states[key] == "active":
+            state = "active"
+        else:
+            state = "inactive"
+        block = {"state": state, "timer": word}
+        if last:
+            block["last_tick"] = last
+        if last_at:
+            block["last_tick_at"] = last_at
+        timers[key] = block
+    return states, timers
+
+
+def unit_states(run=None, home=None):
+    """{notify|scheduler|guardian: active|inactive|failed|absent} — the
+    §6.1 words; unit_facts' states (same single bounded show call)."""
+    return unit_facts(run, home)[0]
 
 
 # ------------------------------------------------------------ tendril
@@ -345,41 +478,109 @@ def install_state(here=None):
     return "healthy"
 
 
+def capacity_health(mod=None, home=None):
+    """§7.4 capacity block — delegates to tendril_capacity.health_section
+    (the read-only helper h2 added for exactly this; never scans, never
+    touches the network). A missing module is "absent"."""
+    try:
+        if mod is None:
+            import tendril_capacity as mod
+        return mod.health_section(home=home)
+    except Exception:
+        return {"state": "absent"}
+
+
 # --------------------------------------------------------- health doc
+def _mismatch(state, server_version, protocol_ok, client_version):
+    """§7.4: a running server whose protocol verdict is negative, or whose
+    version differs from the recorded client's, is `mismatch`."""
+    if state != "running":
+        return state
+    if protocol_ok is False:
+        return "mismatch"
+    if client_version and server_version and client_version != server_version:
+        return "mismatch"
+    return state
+
+
 def health_doc(host=None, herdr=None, run=None, home=None, now=None,
-               probe=None, units=None, install=None):
-    """The contract §6.1 `health --json` document (one line, no secrets,
-    no paths, no pids). Bounded: probe ≤ 1.5 s + unit probe ≤ 1.2 s.
-    Reachability of the HOST is deliberately absent — that is the phone's
-    classification (§6.3); this doc only describes what the host knows."""
+               probe=None, units=None, install=None, binary=None,
+               client_version=None, capacity=None, timers=None,
+               stale_record=None):
+    """The contract §6.1/§7.4 `health --json` document (one line, no
+    secrets, no paths, no pids). Bounded: probe ≤ 1.5 s + ONE systemctl
+    show ≤ 1.2 s (units + timers together). Reachability of the HOST is
+    deliberately absent — that is the phone's classification (§6.3).
+
+    §7.4 additions: herdr.binary (recorded|detected|missing),
+    herdr.client_version / herdr.server_version, herdr.state mismatch
+    (running server ≠ recorded client version or a protocol error),
+    scheduler/guardian timer semantics (timer/last_tick/last_tick_at),
+    and the capacity block. `probe` injects (state, server_version,
+    protocol_ok); `units` injects the §6.1 flat states and skips the
+    systemctl call (then `timers` injects the §7.4 blocks verbatim);
+    `stale_record` marks a superseded recorded Herdr binary (vanished
+    path or a newer running server) — tendril reads degraded with the
+    hint "re-run tendril --upgrade"."""
     run = run or _run_default
     now = time.time() if now is None else now
     p = paths(home)
     guard = os.path.isfile(p["guard"])
     if probe is not None:
-        state, version = probe()
+        state, server_version, protocol_ok = probe()
     else:
-        state, version = probe_herdr(run, herdr)
+        state, server_version, protocol_ok = probe_herdr_full(run, herdr)
     if guard:
         state = "stopped"                   # intentional stop wins (§6.1)
-    herdr_doc = {"state": state}
+    state = _mismatch(state, server_version, protocol_ok, client_version)
+    client = client_version
+    if client is None and herdr:
+        # remote-agents passes the resolver's version; measure (bounded)
+        # only when health runs without it (manual module use, tests).
+        client = client_version_of(run, herdr)
+    herdr_doc = {"state": state,
+                 "binary": binary or ("detected" if herdr else "missing")}
     st, _err = load_state(p["state"], now)
     for key in ("last_healthy_at", "since"):
         if isinstance(st.get(key), int):
             herdr_doc[key] = st[key]
-    if version:
-        herdr_doc["version"] = version
-    units_doc = units or unit_states(run, home)
+    if client:
+        herdr_doc["client_version"] = client
+    if server_version:
+        herdr_doc["server_version"] = server_version
+        herdr_doc["version"] = server_version   # §6.1 compat key
+    # §7.4: a superseded recorded binary (vanished path, or a newer
+    # running server the resolver had to re-detect around) is an honest
+    # degradation with the fix in the hint — never a path in output.
+    install_word = install if install is not None else install_state()
+    if stale_record or install_word == "degraded":
+        tendril_doc = {"state": "degraded"}
+        if stale_record:
+            tendril_doc["hint"] = "re-run tendril --upgrade"
+    else:
+        tendril_doc = {"state": install_word}
+    if units is not None:
+        units_doc = units
+        timers_doc = timers or {}
+    else:
+        units_doc, timers_doc = unit_facts(run, home)
+    sched = timers_doc.get("scheduler") or {"state": units_doc.get(
+        "scheduler", "absent")}
+    guard_ = timers_doc.get("guardian") or {"state": units_doc.get(
+        "guardian", "absent")}
     doc = {"version": SCHEMA_VERSION,
            "host": host,
            "generated_at": int(now),
            "herdr": herdr_doc,
-           "tendril": {"state": (install if install is not None
-                                 else install_state())},
+           "tendril": tendril_doc,
            # §6.1: every component is an OBJECT {"state": ...}
            "notify": {"state": units_doc.get("notify", "absent")},
-           "scheduler": {"state": units_doc.get("scheduler", "absent")},
-           "guardian": {"state": units_doc.get("guardian", "absent")}}
+           "scheduler": sched,
+           "guardian": guard_}
+    if capacity is not None:
+        doc["capacity"] = capacity
+    else:
+        doc["capacity"] = capacity_health(home=home)
     return doc
 
 
@@ -465,6 +666,30 @@ def run_tick(host=None, herdr=None, run=None, home=None, now=None,
 
 
 # ------------------------------------------------- guarded lifecycle
+def _note_owner(p, epoch):
+    """Record that the RUNNING server was started by TENDRIL (§7.4: a
+    mismatched instance may be stopped first only when we own it)."""
+    with _locked(p["lock"]):
+        doc, _err = load_state(p["state"])
+        doc["started_by"] = "tendril"
+        doc["started_at"] = int(epoch())
+        save_state(p["state"], doc)
+
+
+def _clear_owner(p):
+    with _locked(p["lock"]):
+        doc, _err = load_state(p["state"])
+        if "started_by" in doc or "started_at" in doc:
+            doc.pop("started_by", None)
+            doc.pop("started_at", None)
+            save_state(p["state"], doc)
+
+
+def _tendril_owned(p):
+    doc, _err = load_state(p["state"])
+    return doc.get("started_by") == "tendril"
+
+
 def make_starter(herdr, run=None, which=None, popen=None):
     """starter() → (ok, phrase). systemd transient user unit first (ties
     the server to the user session), detached child as fallback. Argv
@@ -505,16 +730,26 @@ def make_stopper(herdr, run=None):
 
 def herdr_verb(verb, host=None, herdr=None, run=None, home=None,
                probe=None, api=None, starter=None, stopper=None,
-               epoch=None, mono=None, sleep=time.sleep):
-    """`restart|stop|start` (contract §6.1) — returns the reply dict.
+               epoch=None, mono=None, sleep=time.sleep, client_version=None):
+    """`restart|stop|start` (contract §6.1/§7.4) — returns the reply dict.
 
-    restart: guard-set ⇒ refused; already running+answering ⇒ refused;
-    rate limited to one attempt per 30 s (flock + timestamp); starts via
-    the supported lifecycle and VERIFIES (status running AND
-    `herdr api snapshot` answering, ≤ 10 s total). Never touches the guard.
-    stop: writes the stop guard FIRST, then stops the server.
+    restart: guard-set ⇒ refused; running + matching protocol + answering
+    ⇒ refused ("already running"); running but MISMATCHED (server says
+    this client is protocol-incompatible, or server version ≠ recorded
+    client version) ⇒ stop it first ONLY when TENDRIL started it (the
+    state file's started_by), otherwise refuse "Another Herdr version is
+    running" — never two servers. Rate limited to one attempt per 30 s
+    (flock + timestamp); starts the resolved/recorded binary via the
+    supported lifecycle and VERIFIES (status running, server version ==
+    client version when both known, AND `herdr api snapshot` answering,
+    ≤ 10 s total). Never touches the guard.
+    stop: writes the stop guard FIRST, then stops the server (ownership
+    cleared — the next server is not ours until TENDRIL starts it).
     start: clears the guard, then starts + verifies (no rate limit — it is
-    the host user's explicit recovery)."""
+    the host user's explicit recovery). A verified TENDRIL start records
+    started_by=tendril in the state file.
+    `probe` injects (state, version[, protocol_ok]) observations; `run`
+    measures the client's own --version only when client_version is None."""
     run = run or _run_default
     epoch = epoch or time.time
     mono = mono or time.monotonic
@@ -522,19 +757,60 @@ def herdr_verb(verb, host=None, herdr=None, run=None, home=None,
     starter = starter or make_starter(herdr, run)
     stopper = stopper or make_stopper(herdr, run)
 
-    def probe_api(deadline):
-        """status running AND api snapshot answering, within `deadline`
-        (a mono() timestamp); every call is bounded by what's left."""
+    def probe3(timeout=None):
+        """(state, server_version, protocol_ok) — tolerates the legacy
+        two-tuple probe injection (protocol unknown)."""
+        if probe is not None:
+            got = probe()
+            if len(got) == 2:
+                return got[0], got[1], None
+            return got
+        bound = min(PROBE_TIMEOUT_S, timeout) if timeout else PROBE_TIMEOUT_S
+        return probe_herdr_full(run, herdr, bound)
+
+    def mismatch_now():
+        """(mismatch, client) — a running server this client cannot drive."""
+        state, sver, compat = probe3()
+        client = client_version
+        if client is None and herdr:
+            client = client_version_of(run, herdr)
+        bad = (state == "running"
+               and (compat is False
+                    or (client and sver and client != sver)))
+        return state, bad, client
+
+    def stop_mismatched():
+        """§7.4: stop a TENDRIL-owned mismatched server and verify it is
+        really gone (never two servers). None on success; otherwise the
+        refusal reply (foreign server, stop failed, or would not die)."""
+        if not _tendril_owned(p):
+            return {"ok": False, "error": E_MISMATCH}
+        if not stopper():
+            return {"ok": False, "error": E_STOP}
+        _clear_owner(p)
+        deadline = mono() + 5.0
+        while True:
+            st, _v, _c = probe3()
+            if st != "running":
+                break
+            if mono() >= deadline:
+                return {"ok": False, "error": E_MISMATCH}
+            sleep(min(0.5, max(0.0, deadline - mono())))
+        return None
+
+    def probe_api(deadline, client):
+        """status running (compatible, right version when known) AND api
+        snapshot answering, within `deadline` (a mono() timestamp); every
+        call is bounded by what's left."""
         while True:
             left = deadline - mono()
             if left <= 0:
                 return False
-            if probe is not None:
-                state = probe()[0]
-            else:
-                state, _v = probe_herdr(run, herdr, min(PROBE_TIMEOUT_S,
-                                                        left))
-            if state != "running":
+            state, sver, compat = probe3(min(left, PROBE_TIMEOUT_S))
+            right = (state == "running"
+                     and compat is not False
+                     and not (client and sver and client != sver))
+            if not right:
                 if mono() >= deadline:
                     return False
                 sleep(min(0.5, max(0.0, deadline - mono())))
@@ -549,14 +825,18 @@ def herdr_verb(verb, host=None, herdr=None, run=None, home=None,
     if verb == "restart":
         if os.path.isfile(p["guard"]):
             return {"ok": False, "error": E_GUARD}
-        if probe is not None:
-            state = probe()[0]
-        else:
-            state, _v = probe_herdr(run, herdr)
+        state, mismatch, client = mismatch_now()
         if state == "running":
-            alive = api() if api is not None else api_alive(run, herdr)
-            if alive:
-                return {"ok": False, "error": E_RUNNING}
+            if mismatch:
+                # §7.4: a TENDRIL-started stale/mismatched instance is
+                # stopped first; a foreign one is never touched.
+                refused = stop_mismatched()
+                if refused:
+                    return refused
+            else:
+                alive = api() if api is not None else api_alive(run, herdr)
+                if alive:
+                    return {"ok": False, "error": E_RUNNING}
         with _locked(p["lock"]):
             # a concurrent `herdr stop` can land between the up-front
             # check and this lock — re-check under the same flock the
@@ -580,25 +860,29 @@ def herdr_verb(verb, host=None, herdr=None, run=None, home=None,
         ok, phrase = starter()
         if not ok:
             return {"ok": False, "error": phrase or E_NOUP}
-        if probe_api(mono() + VERIFY_BUDGET_S):
+        _note_owner(p, epoch)
+        if probe_api(mono() + VERIFY_BUDGET_S, client):
             return {"ok": True, "herdr": {"state": "running"}}
         return {"ok": False, "error": E_NOUP}
 
     if verb == "start":
         with contextlib.suppress(OSError):
             os.unlink(p["guard"])       # clear the guard FIRST (§6.1)
-        if probe is not None:
-            state = probe()[0]
-        else:
-            state, _v = probe_herdr(run, herdr)
+        state, mismatch, client = mismatch_now()
         if state == "running":
-            alive = api() if api is not None else api_alive(run, herdr)
-            if alive:
-                return {"ok": True, "herdr": {"state": "running"}}
+            if mismatch:
+                refused = stop_mismatched()      # same ownership rule
+                if refused:
+                    return refused
+            else:
+                alive = api() if api is not None else api_alive(run, herdr)
+                if alive:
+                    return {"ok": True, "herdr": {"state": "running"}}
         ok, phrase = starter()
         if not ok:
             return {"ok": False, "error": phrase or E_NOUP}
-        if probe_api(mono() + VERIFY_BUDGET_S):
+        _note_owner(p, epoch)
+        if probe_api(mono() + VERIFY_BUDGET_S, client):
             return {"ok": True, "herdr": {"state": "running"}}
         return {"ok": False, "error": E_NOUP}
 
@@ -610,6 +894,7 @@ def herdr_verb(verb, host=None, herdr=None, run=None, home=None,
         with _locked(p["lock"]):
             _atomic_write(p["guard"], b"intentional stop\n")
         if stopper():
+            _clear_owner(p)
             return {"ok": True, "herdr": {"state": "stopped"}}
         return {"ok": False, "error": E_STOP}
 

@@ -306,7 +306,12 @@ class ClaudeSession(Base):
                          {"kind": "reply", "at": NOW - 1300})
         self.assertEqual(res["trail"], "PTR")
         self.assertEqual(res["activity"], "Thinking")
-        self.assertNotIn("provider", res)                # not recorded: omitted
+        # §7.1: the vendor is canonical from the harness (Claude Code's
+        # only upstream), billing metered (no OAuth credential in the
+        # temp home) — a real totalCostUSD exists.
+        self.assertEqual(res["provider"], "anthropic")
+        self.assertEqual(res["billing"], "metered")
+        self.assertNotIn("adapter", res)
 
     def test_error_tool_result_trails_E(self):
         _d, path = cl_session_dir(self.home, UUID_OK2)
@@ -1055,11 +1060,13 @@ class ChildStatusMapping(ChildBase):
                          [{"type": "text", "text": "x"}])])
         self.assertEqual(thinking["status"], "thinking")
 
-    def test_quiet_without_terminal_stop_is_unknown(self):
+    def test_quiet_without_terminal_evidence_is_stale(self):
+        """§7.2: quiet past the active window with no terminal evidence is
+        `stale` — never failed by inference, never `unknown`."""
         k = self.scenario([
             pi_session_header(NOW - 1000, id="x"),
             pi_user(NOW - 1000, "child prompt")])
-        self.assertEqual(k["status"], "unknown")
+        self.assertEqual(k["status"], "stale")
         self.assertNotIn("ended_at", k)
 
     def test_terminal_stop_then_quiet_is_done(self):
@@ -1078,6 +1085,137 @@ class ChildStatusMapping(ChildBase):
             pi_tool_result(NOW - 100, "t1", "edit", error=True)])
         self.assertEqual(k["status"], "failed")
         self.assertEqual(k["ended_at"], NOW - 100)
+
+
+class ChildStatusEdges72(ChildBase):
+    """§7.2 edge cases on REAL transcript shapes: an error followed by
+    recovery is never failed; quiet history is stale or done; failed
+    needs explicit evidence (exitCode, error stop, error-as-final)."""
+
+    SEQ = [0]
+
+    def scenario(self, lines, meta=None):
+        ChildStatusEdges72.SEQ[0] += 1
+        n = ChildStatusEdges72.SEQ[0]
+        parent = self.parent("e%d.jsonl" % n, [
+            pi_session_line(NOW - 1000), pi_user(NOW - 1000, "go")])
+        rid = "e000000%d-1111-4222-8333-444455556666" % (n % 10)
+        child = self.run_child(parent, rid, lines)
+        if meta is not None:
+            self.meta(child, rid, meta)
+        res = self.run_tele([self.pi_agent(parent)])[0]
+        self.assertEqual(len(res["children"]), 1)
+        return res["children"][0]
+
+    def test_tool_error_then_recovery_then_quiet_is_stale(self):
+        k = self.scenario([
+            pi_session_header(NOW - 2000, id="x"),
+            pi_user(NOW - 2000, "child prompt"),
+            pi_assistant(NOW - 1900, pi_usage(1, 1, 0, 0, 0.0),
+                         [pi_tool_call("t1", "edit", NOW - 1900)]),
+            pi_tool_result(NOW - 1800, "t1", "edit", error=True),
+            pi_assistant(NOW - 1700, pi_usage(1, 1, 0, 0, 0.0),
+                         [{"type": "text", "text": "recovered"}])])
+        self.assertEqual(k["status"], "stale")   # never failed by inference
+
+    def test_error_then_recovery_then_terminal_stop_is_done(self):
+        k = self.scenario([
+            pi_session_header(NOW - 2000, id="x"),
+            pi_user(NOW - 2000, "child prompt"),
+            pi_assistant(NOW - 1900, pi_usage(1, 1, 0, 0, 0.0),
+                         [pi_tool_call("t1", "edit", NOW - 1900)]),
+            pi_tool_result(NOW - 1800, "t1", "edit", error=True),
+            pi_assistant_stop(NOW - 1700, pi_usage(1, 1, 0, 0, 0.0))])
+        self.assertEqual(k["status"], "done")
+        self.assertEqual(k["ended_at"], NOW - 1700)
+
+    def test_error_then_new_open_tool_is_not_failed(self):
+        """A tool opened AFTER the error is later work: the child is
+        active, never failed."""
+        k = self.scenario([
+            pi_session_header(NOW - 300, id="x"),
+            pi_user(NOW - 250, "child prompt"),
+            pi_assistant(NOW - 240, pi_usage(1, 1, 0, 0, 0.0),
+                         [pi_tool_call("t1", "bash", NOW - 240)]),
+            pi_tool_result(NOW - 200, "t1", "bash", error=True),
+            pi_assistant(NOW - 60, pi_usage(1, 1, 0, 0, 0.0),
+                         [pi_tool_call("t2", "read", NOW - 60)])])
+        self.assertEqual(k["status"], "tool")
+
+    def test_recent_error_within_quiet_grace_is_not_failed_yet(self):
+        """The harness may still react in the first CHILD_QUIET_S seconds."""
+        k = self.scenario([
+            pi_session_header(NOW - 60, id="x"),
+            pi_user(NOW - 40, "child prompt"),
+            pi_assistant(NOW - 30, pi_usage(1, 1, 0, 0, 0.0),
+                         [pi_tool_call("t1", "edit", NOW - 30)]),
+            pi_tool_result(NOW - 10, "t1", "edit", error=True)])
+        self.assertEqual(k["status"], "working")
+
+    def test_explicit_error_stop_reason_is_failed(self):
+        k = self.scenario([
+            pi_session_header(NOW - 100, id="x"),
+            pi_user(NOW - 90, "child prompt"),
+            pi_assistant_stop(NOW - 80, pi_usage(1, 1, 0, 0, 0.0),
+                              stop="error")])
+        self.assertEqual(k["status"], "failed")
+
+    def test_historical_child_days_old_is_stale(self):
+        days = 3 * 86400
+        k = self.scenario([
+            pi_session_header(NOW - days, id="x"),
+            pi_user(NOW - days, "child prompt"),
+            pi_assistant(NOW - days + 60, pi_usage(1, 1, 0, 0, 0.0),
+                         [{"type": "text", "text": "x"}])])
+        self.assertEqual(k["status"], "stale")
+        self.assertNotIn("ended_at", k)
+
+    def test_truncated_transcript_is_never_failed(self):
+        parent = self.parent("trunc.jsonl", [
+            pi_session_line(NOW - 1000), pi_user(NOW - 1000, "go")])
+        rid = "f0000001-1111-4222-8333-444455556666"
+        child = self.run_child(parent, rid, [
+            pi_session_header(NOW - 900, id="x"),
+            pi_user(NOW - 800, "child prompt"),
+            pi_assistant(NOW - 700, pi_usage(1, 1, 0, 0, 0.0),
+                         [pi_tool_call("t1", "edit", NOW - 700)]),
+            pi_tool_result(NOW - 600, "t1", "edit", error=True)])
+        agent = [self.pi_agent(parent)]
+        k = self.run_tele(agent)[0]["children"][0]
+        self.assertEqual(k["status"], "failed")   # error is final: evidence
+        with open(child, "r+") as f:               # the writer lost its tail
+            f.truncate(os.path.getsize(child) // 2)
+        k = self.run_tele(agent)[0]["children"][0]
+        self.assertIn(k["status"], ("working", "thinking", "stale",
+                                    "unknown"))
+        self.assertNotEqual(k["status"], "failed")
+
+    def test_claude_historical_child_done_or_stale_never_failed(self):
+        day = 3 * 86400
+        _d, path = cl_session_dir(self.home, UUID_OK)
+        self.write_jsonl(path, [cl_user_prompt(NOW - day)])
+        sub = os.path.join(os.path.dirname(path), UUID_OK, "subagents")
+        self.write_jsonl(os.path.join(sub, "agent-aaa1aaaa.jsonl"), [
+            cl_user_prompt(NOW - day),
+            cl_assistant(NOW - day + 60, content=[{"type": "text",
+                                                   "text": "x"}])])
+        self.write_jsonl(os.path.join(sub, "agent-bbb2bbbb.jsonl"), [
+            cl_user_prompt(NOW - day),
+            cl_tool_use(NOW - day + 30, "toolu_s", "Edit", {"path": "x.kt"}),
+            cl_user_tool_result(NOW - day + 40, "toolu_s", error=True),
+            cl_assistant(NOW - day + 50, content=[{"type": "text",
+                                                   "text": "recovered"}])])
+        # quiet-window assertions need transcript-age mtimes, not "now"
+        for n in ("agent-aaa1aaaa.jsonl", "agent-bbb2bbbb.jsonl"):
+            p = os.path.join(sub, n)
+            os.utime(p, (NOW - day + 120, NOW - day + 120))
+        res = self.run_tele([self.agent("claude", self.agent_sess())])[0]
+        by_id = {k["id"]: k for k in res["children"]}
+        self.assertEqual(by_id["aaa1aaaa"]["status"], "stale")
+        self.assertEqual(by_id["aaa1aaaa"].get("harness"), "claude")
+        self.assertEqual(by_id["bbb2bbbb"]["status"], "stale")
+        for k in res["children"]:              # recovery is never failure
+            self.assertNotEqual(k["status"], "failed")
 
 
 class ChildCap(ChildBase):
@@ -1192,7 +1330,7 @@ class ChildIncremental(ChildBase):
         (entry,) = self.cache_entry(parent)["children"].values()
         self.assertEqual(entry["offset"], size)
         self.assertEqual(res2["children"][0]["output_tokens"], n)
-        self.assertEqual(res2["children"][0]["status"], "unknown")
+        self.assertEqual(res2["children"][0]["status"], "stale")
 
 
 class ChildSafety(ChildBase):
@@ -1351,11 +1489,13 @@ class PhaseAndEvents(Base):
             ts += 2
         lines.append(pi_assistant(NOW - 60, pi_usage(1, 1, 0, 0, 0.0),
                                   [pi_tool_call("d1", "subagent_worker",
-                                                NOW - 60)]))
+                                                NOW - 60,
+                                                {"agent": "Explore"})]))
         lines.append(pi_assistant(NOW - 50, pi_usage(1, 1, 0, 0, 0.0),
                                   [pi_tool_call("t1", "bash", NOW - 50,
                                                 {"command": "SECRET-CMD"})]))
-        lines.append(pi_tool_result(NOW - 40, "t1", "bash", error=True))
+        lines.append(pi_tool_result(NOW - 45, "t1", "bash"))
+        lines.append(pi_tool_result(NOW - 40, "t1b", "bash", error=True))
         lines.append(pi_assistant(NOW - 30, pi_usage(1, 1, 0, 0, 0.0),
                                   [{"type": "text", "text": "x"}]))
         path = self.write_jsonl(os.path.join(
@@ -1366,7 +1506,10 @@ class PhaseAndEvents(Base):
         self.assertEqual(len(events), 12)
         valid = {"prompt", "reply", "tool", "error", "subagent"}
         for e in events:
-            self.assertTrue(set(e) <= {"kind", "tool", "at"})
+            # §7.2: subagent events may carry name/status; tool events are
+            # COMPLETIONS (the open above emits no wire event).
+            self.assertTrue(set(e) <= {"kind", "tool", "at", "name",
+                                       "status"})
             self.assertIn(e["kind"], valid)
             self.assertIsInstance(e["at"], int)
         ats = [e["at"] for e in events]
@@ -1375,8 +1518,204 @@ class PhaseAndEvents(Base):
         kinds = {e["kind"] for e in events}
         self.assertTrue({"prompt", "reply", "tool", "error",
                          "subagent"} <= kinds)
+        self.assertIn({"kind": "tool", "tool": "bash", "at": NOW - 45},
+                      events)                  # a completion, not the open
+        self.assertIn({"kind": "error", "tool": "bash", "at": NOW - 40},
+                      events)
+        self.assertIn({"kind": "subagent", "tool": "subagent_worker",
+                       "name": "Explore", "at": NOW - 60}, events)
         self.assertNotIn("SECRET-CMD", json.dumps(res))
 
+
+
+class Provenance71(ChildBase):
+    """§7.1 provider/adapter/billing/context_window — bridges are never
+    providers, bridges are never metered, cost_usd exists only for
+    metered billing, and context windows come only from explicit local
+    registries (models-store / installed bridge policy), never a table."""
+
+    MODELS_TS = '''// fixture mirroring the installed bridge policy shape
+const TWO_HUNDRED_K_CONTEXT = 200_000;
+const ONE_M_CONTEXT = 1_000_000;
+const MEASURED_ONE_M = new Set([
+\t"claude-opus-5-5",
+\t"claude-sonnet-5-5",
+]);
+const PLAN_GATED_ONE_M: Record<string, (settings: LongContextSettings) => boolean> = {
+\t"claude-opus-4-6": (settings) => settings.plan === "max" || settings.longContextExtraUsage,
+\t"claude-sonnet-4-6": (settings) => settings.longContextExtraUsage,
+};
+'''
+
+    def setUp(self):
+        super().setUp()
+        tt._REG_CACHE.clear()
+        self.addCleanup(tt._REG_CACHE.clear)
+        self.base = self.proj
+
+    def write(self, rel, text):
+        p = os.path.join(self.home, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(text)
+        return p
+
+    SEQ = [0]
+
+    def session(self, provider, model="glm-test-5", total=0.0):
+        # a fresh file per session: production transcripts are append-only,
+        # so a rewrite that GROWS in place would only have its tail scanned.
+        Provenance71.SEQ[0] += 1
+        self.last_path = os.path.join(self.base, "p%d.jsonl"
+                                      % Provenance71.SEQ[0])
+        return self.write_jsonl(self.last_path, [
+            pi_session_line(NOW - 60),
+            pi_model_change(NOW - 60, model=model, provider=provider),
+            pi_user(NOW - 50, "go"),
+            pi_assistant(NOW - 40, pi_usage(10, 5, 0, 0, total),
+                         [{"type": "text", "text": "x"}],
+                         model=model, provider=provider)])
+
+    def run_one(self):
+        return self.run_tele([{ "agent": "pi", "agent_status": "working",
+                                "agent_session": {
+                                    "agent": "pi", "kind": "path",
+                                    "source": "herdr:pi",
+                                    "value": self.last_path}}])[0]
+
+    def test_claude_bridge_is_anthropic_via_bridge_never_metered(self):
+        self.session("claude-bridge", model="claude-opus-5-5")
+        res = self.run_one()
+        self.assertEqual(res["provider"], "anthropic")
+        self.assertEqual(res["adapter"], "claude-bridge")
+        self.assertEqual(res["billing"], "provider_managed")
+        self.assertNotIn("cost_usd", res)      # NEVER a bridge cost
+
+    def test_pi_metered_positive_cost_and_unknown_zero_cost(self):
+        self.session("zai", total=0.0054)
+        res = self.run_one()
+        self.assertEqual(res["provider"], "zai")
+        self.assertNotIn("adapter", res)
+        self.assertEqual(res["billing"], "metered")
+        self.assertEqual(res["cost_usd"], 0.0054)
+        self.session("zai", total=0.0)
+        res = self.run_one()                   # zero cost with tokens
+        self.assertEqual(res["billing"], "unknown")
+        self.assertNotIn("cost_usd", res)
+
+    def test_optollm_maps_to_nothing_but_cost_stays_honest(self):
+        self.session("optollm", model="some-model", total=0.25)
+        res = self.run_one()
+        self.assertNotIn("provider", res)      # not mapped unambiguously
+        self.assertNotIn("adapter", res)
+        self.assertEqual(res["billing"], "metered")
+        self.assertEqual(res["cost_usd"], 0.25)
+
+    def test_claude_oauth_is_provider_managed_without_cost(self):
+        self.write(".claude/.credentials.json",
+                   '{"claudeAiOauth": {"accessToken": "x"}}')
+        _d, path = cl_session_dir(self.home, UUID_OK2)
+        self.write_jsonl(path, [cl_user_prompt(NOW - 60),
+                                cl_cost_state(NOW - 50, 0.75)])
+        res = self.run_tele([self.agent("claude",
+                                        self.agent_sess(UUID_OK2))])[0]
+        self.assertEqual(res["provider"], "anthropic")
+        self.assertEqual(res["billing"], "provider_managed")
+        self.assertNotIn("cost_usd", res)      # subscription route
+        self.assertNotIn("x", json.dumps(res))  # no credential values
+
+    def test_claude_without_oauth_is_metered_on_real_cost(self):
+        _d, path = cl_session_dir(self.home, UUID_OK2)
+        self.write_jsonl(path, [cl_user_prompt(NOW - 60),
+                                cl_cost_state(NOW - 50, 0.0)])
+        res = self.run_tele([self.agent("claude",
+                                        self.agent_sess(UUID_OK2))])[0]
+        self.assertEqual(res["billing"], "unknown")
+        self.assertNotIn("cost_usd", res)
+
+    def test_context_window_from_models_store_only(self):
+        self.write(".pi/agent/models-store.json", json.dumps({
+            "zai": {"models": [{"id": "glm-test-5",
+                                "contextWindow": 204800}]},
+            "openai-codex": {"models": [{"id": "gpt-5.x",
+                                         "contextWindow": 272000}]}}))
+        self.session("zai")
+        res = self.run_one()
+        self.assertEqual(res["context_window"], 204800)
+        self.assertEqual(res["context_window_source"], "pi_models_store")
+
+    def test_unknown_model_has_no_context_window(self):
+        self.write(".pi/agent/models-store.json", json.dumps({
+            "zai": {"models": [{"id": "glm-test-5",
+                                "contextWindow": 204800}]}}))
+        self.session("zai", model="never-seen-model")
+        res = self.run_one()
+        self.assertNotIn("context_window", res)
+        self.assertNotIn("context_window_source", res)
+
+    def test_bridge_window_from_installed_policy(self):
+        self.write(".pi/agent/npm/node_modules/pi-claude-bridge/"
+                   "src/models.ts", self.MODELS_TS)
+        self.write(".pi/agent/claude-bridge.json",
+                   '{"askClaude":{"enabled":false},'
+                   '"provider":{"plan":"pro"}}')
+        self.session("claude-bridge", model="claude-opus-5-5")
+        res = self.run_one()
+        self.assertEqual(res["context_window"], 1000000)
+        self.assertEqual(res["context_window_source"], "bridge_config")
+        # unmeasured model: the MEASURED bare-id window, not a placeholder
+        self.session("claude-bridge", model="claude-haiku-9")
+        self.assertEqual(self.run_one()["context_window"], 200000)
+        # plan-gated: opus-4-6 needs max or extra usage
+        self.session("claude-bridge", model="claude-opus-4-6")
+        self.assertEqual(self.run_one()["context_window"], 200000)
+        p = self.write(".pi/agent/claude-bridge.json",
+                       '{"provider":{"plan":"max"}}')
+        os.utime(p, None)                     # fresh mtime for the registry
+        self.assertEqual(self.run_one()["context_window"], 1000000)
+        # forceTwoHundredK pins even a measured id
+        p = self.write(".pi/agent/claude-bridge.json",
+                       '{"provider":{"plan":"max",'
+                       '"forceTwoHundredK":["claude-opus-5-5"]}}')
+        os.utime(p, None)
+        self.session("claude-bridge", model="claude-opus-5-5")
+        self.assertEqual(self.run_one()["context_window"], 200000)
+
+    def test_registry_cache_is_mtime_keyed(self):
+        self.write(".pi/agent/models-store.json", json.dumps({
+            "zai": {"models": [{"id": "glm-test-5",
+                                "contextWindow": 204800}]}}))
+        self.session("zai")
+        self.assertEqual(self.run_one()["context_window"], 204800)
+        p = self.write(".pi/agent/models-store.json", json.dumps({
+            "zai": {"models": [{"id": "glm-test-5",
+                                "contextWindow": 1000000}]}}))
+        os.utime(p, (time.time() + 5, time.time() + 5))   # fresh mtime
+        self.assertEqual(self.run_one()["context_window"], 1000000)
+
+    def test_child_inherits_parent_route_and_billing(self):
+        parent = self.parent("pc.jsonl", [
+            pi_session_line(NOW - 200), pi_user(NOW - 200, "go")])
+        rid = "c0000001-1111-4222-8333-444455556666"
+        child = self.run_child(parent, rid, [
+            pi_session_header(NOW - 150, id="x"),
+            pi_assistant(NOW - 100, pi_usage(1000, 50, 900, 100, 0.0),
+                         [{"type": "text", "text": "x"}],
+                         model="claude-opus-5-5",
+                         provider="claude-bridge")])
+        self.meta(child, rid, {"runId": rid, "agent": "worker",
+                               "exitCode": 0})
+        k = self.run_tele([self.pi_agent(parent)])[0]["children"][0]
+        self.assertEqual(k["provider"], "anthropic")
+        self.assertEqual(k["adapter"], "claude-bridge")
+        self.assertEqual(k["billing"], "provider_managed")
+        self.assertNotIn("cost_usd", k)
+
+    def test_no_registry_files_emit_no_window_keys(self):
+        self.session("zai")
+        res = self.run_one()
+        self.assertNotIn("context_window", res)
+        self.assertNotIn("context_window_source", res)
 
 
 class CacheWrites(Base):

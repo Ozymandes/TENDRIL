@@ -279,13 +279,15 @@ class HealthDocTests(Base):
                             run=lambda a, t: (0, '{"running":true}', ""),
                             home=self.home, now=NOW,
                             units={"notify": "active", "scheduler": "active",
-                                   "guardian": "inactive"})
+                                   "guardian": "inactive"},
+                            capacity={"state": "available", "enabled": []})
         self.assertEqual(set(doc), {"version", "host", "generated_at",
                                     "herdr", "tendril", "notify",
-                                    "scheduler", "guardian"})
+                                    "scheduler", "guardian", "capacity"})
         self.assertLessEqual(set(doc["herdr"]),
                              {"state", "last_healthy_at", "since",
-                              "version"})
+                              "version", "client_version",
+                              "server_version", "binary"})
         dump = json.dumps(doc)
         for word in ("reachable", "unreachable", "transport", "ssh",
                      "mosh", "latency", "ping"):
@@ -327,18 +329,34 @@ class HealthDocTests(Base):
                            ("guardian", "tendril-guardian.timer")):
             with open(os.path.join(unit_dir, unit), "w") as f:
                 f.write("# unit\n")
-        cases = [((0, "active\ninactive\nactive\n", ""),
+
+        def show_out(*rows):
+            text = ""
+            for unit, active in rows:
+                text += ("Id=%s\nActiveState=%s\nSubState=waiting\n"
+                         "Result=success\nExecMainStatus=0\n"
+                         "ExecMainExitTimestampUSec=0\n\n"
+                         % (unit, active))
+            return text
+
+        def run_fake(text):
+            return lambda a, t, _t=text: (0, _t, "")
+        cases = [(show_out(("herdr-notify.service", "active"),
+                           ("tendril-schedule.timer", "inactive"),
+                           ("tendril-guardian.timer", "active")),
                   {"notify": "active", "scheduler": "inactive",
                    "guardian": "active"}),
-                 ((3, "failed\ninactive\n", ""),
+                 (show_out(("herdr-notify.service", "failed"),
+                           ("tendril-schedule.timer", "inactive")),
                   {"notify": "failed", "scheduler": "inactive",
                    "guardian": "inactive"}),
-                 ((0, "", ""),
-                  {"notify": "inactive", "scheduler": "inactive",
-                   "guardian": "inactive"})]
-        for (rc, out, err), expected in cases:
-            states = th.unit_states(run=lambda a, t, _rc=rc, _o=out:
-                                    (_rc, _o, ""), home=self.home)
+                 (show_out(("herdr-notify.service", "active"),
+                           ("tendril-schedule.timer", "active"),
+                           ("tendril-guardian.timer", "active")),
+                  {"notify": "active", "scheduler": "active",
+                   "guardian": "active"})]
+        for text, expected in cases:
+            states = th.unit_states(run=run_fake(text), home=self.home)
             self.assertEqual(states, expected)
 
     def test_unit_states_absent_without_files(self):
@@ -356,6 +374,120 @@ class HealthDocTests(Base):
         self.assertEqual(states, {"notify": "inactive",
                                   "scheduler": "absent",
                                   "guardian": "absent"})
+
+    def _seed_units(self):
+        unit_dir = os.path.join(self.home, ".config", "systemd", "user")
+        os.makedirs(unit_dir, exist_ok=True)
+        for unit in ("herdr-notify.service", "tendril-schedule.timer",
+                     "tendril-schedule.service", "tendril-guardian.timer",
+                     "tendril-guardian.service"):
+            with open(os.path.join(unit_dir, unit), "w") as f:
+                f.write("# unit\n")
+
+    @staticmethod
+    def _show(units):
+        """One `systemctl show` stdout block per (unit, ActiveState,
+        SubState, Result, ExecMainStatus, ExecMainExitTimestampUSec)."""
+        text = ""
+        for unit, active, sub, result, status, usec in units:
+            text += ("Id=%s\nActiveState=%s\nSubState=%s\nResult=%s\n"
+                     "ExecMainStatus=%s\nExecMainExitTimestampUSec=%s\n\n"
+                     % (unit, active, sub, result, status, usec))
+        return text
+
+    def test_timer_sections_active_with_ok_last_tick(self):
+        # §7.4: a oneshot whose service is inactive between ticks is
+        # HEALTHY — timer active/waiting + last tick ok ⇒ state active.
+        self._seed_units()
+        text = self._show([
+            ("herdr-notify.service", "active", "running", "success", "0", "0"),
+            ("tendril-schedule.timer", "active", "waiting", "success",
+             "n/a", "0"),
+            ("tendril-schedule.service", "inactive", "dead", "success",
+             "0", str(int(NOW) * 1000000)),
+            ("tendril-guardian.timer", "active", "waiting", "success",
+             "n/a", "0"),
+            ("tendril-guardian.service", "inactive", "dead", "success",
+             "0", str(int(NOW) * 1000000))])
+        states, timers = th.unit_facts(run=lambda a, t: (0, text, ""),
+                                       home=self.home)
+        self.assertEqual(states, {"notify": "active", "scheduler": "active",
+                                  "guardian": "active"})
+        self.assertEqual(timers["scheduler"],
+                         {"state": "active", "timer": "waiting",
+                          "last_tick": "ok", "last_tick_at": int(NOW)})
+        self.assertEqual(timers["guardian"]["timer"], "waiting")
+
+    def test_timer_sections_degraded_on_failed_last_tick(self):
+        self._seed_units()
+        text = self._show([
+            ("herdr-notify.service", "inactive", "dead", "success", "0", "0"),
+            ("tendril-schedule.timer", "active", "waiting", "success",
+             "n/a", "0"),
+            ("tendril-schedule.service", "failed", "failed", "exit-code",
+             "1", str(int(NOW) * 1000000)),
+            ("tendril-guardian.timer", "active", "waiting", "success",
+             "n/a", "0"),
+            ("tendril-guardian.service", "inactive", "dead", "success",
+             "0", str(int(NOW) * 1000000))])
+        _states, timers = th.unit_facts(run=lambda a, t: (0, text, ""),
+                                        home=self.home)
+        self.assertEqual(timers["scheduler"],
+                         {"state": "degraded", "timer": "waiting",
+                          "last_tick": "failed", "last_tick_at": int(NOW)})
+
+    def test_timer_sections_inactive_and_never_run(self):
+        self._seed_units()
+        text = self._show([
+            ("herdr-notify.service", "inactive", "dead", "success", "0", "0"),
+            ("tendril-schedule.timer", "inactive", "dead", "success",
+             "n/a", "0"),
+            ("tendril-schedule.service", "inactive", "dead", "success",
+             "0", "0"),
+            ("tendril-guardian.timer", "active", "waiting", "success",
+             "n/a", "0"),
+            ("tendril-guardian.service", "inactive", "dead", "success",
+             "0", "0")])
+        _states, timers = th.unit_facts(run=lambda a, t: (0, text, ""),
+                                        home=self.home)
+        self.assertEqual(timers["scheduler"],
+                         {"state": "inactive", "timer": "inactive"})
+        self.assertEqual(timers["guardian"],
+                         {"state": "active", "timer": "waiting"})
+
+    def test_timer_sections_absent_when_units_not_installed(self):
+        _states, timers = th.unit_facts(run=lambda a, t: (0, "", ""),
+                                        home=self.home)
+        self.assertEqual(timers, {"scheduler": {"state": "absent"},
+                                  "guardian": {"state": "absent"}})
+
+    def test_capacity_health_states(self):
+        # capacity_health delegates to tendril_capacity.health_section
+        # (h2's read-only §7.4 helper) — the fakes stand in for it
+        class FakeCap:
+            @staticmethod
+            def health_section(home=None):
+                return {"state": "error", "enabled": ["claude_oauth"]}
+        self.assertEqual(th.capacity_health(mod=FakeCap),
+                         {"state": "error", "enabled": ["claude_oauth"]})
+
+        class OkCap:
+            @staticmethod
+            def health_section(home=None):
+                return {"state": "available", "enabled": []}
+        self.assertEqual(th.capacity_health(mod=OkCap),
+                         {"state": "available", "enabled": []})
+
+        class Boom:
+            @staticmethod
+            def health_section(home=None):
+                raise RuntimeError("boom")
+        self.assertEqual(th.capacity_health(mod=Boom), {"state": "absent"})
+
+    def test_capacity_health_absent_without_module_data(self):
+        # the real module, empty temp HOME: no cached section yet
+        self.assertEqual(th.capacity_health(home=self.home),
+                         {"state": "absent", "enabled": []})
 
 
 # ------------------------------------------------------ guardian tick
@@ -502,6 +634,81 @@ class TickTests(Base):
 
 
 # ------------------------------------------------- guarded lifecycle
+# --------------------------------------------------- health doc v2 (§7.4)
+class HealthDocV2Tests(Base):
+    def doc(self, probe3, binary="recorded", client="0.9.3"):
+        return th.health_doc(host="h", herdr="/fake/herdr",
+                             run=lambda a, t: (0, "", ""),
+                             home=self.home, now=NOW, probe=probe3,
+                             units={"notify": "active", "scheduler": "active",
+                                    "guardian": "active"},
+                             binary=binary, client_version=client)
+
+    def test_versions_and_binary_recorded(self):
+        doc = self.doc(lambda: ("running", "0.9.3", True))
+        self.assertEqual(doc["herdr"]["state"], "running")
+        self.assertEqual(doc["herdr"]["binary"], "recorded")
+        self.assertEqual(doc["herdr"]["client_version"], "0.9.3")
+        self.assertEqual(doc["herdr"]["server_version"], "0.9.3")
+
+    def test_protocol_no_from_server_is_mismatch(self):
+        # the server's own `compatible:false` — the `herdr api` protocol
+        # error case, independent of the version strings
+        doc = self.doc(lambda: ("running", "0.9.3", False))
+        self.assertEqual(doc["herdr"]["state"], "mismatch")
+
+    def test_version_difference_is_mismatch(self):
+        doc = self.doc(lambda: ("running", "0.8.2", None))
+        self.assertEqual(doc["herdr"]["state"], "mismatch")
+        self.assertEqual(doc["herdr"]["server_version"], "0.8.2")
+
+    def test_stale_record_degrades_tendril_with_hint(self):
+        # §7.4: the recorded binary lagged/vanished and the resolver had
+        # to re-detect — health says degraded with the fix, never a path
+        doc = self.doc(lambda: ("running", "0.9.4", True), binary="detected",
+                       client="0.9.4")
+        self.assertEqual(doc["herdr"]["state"], "running")
+        doc = th.health_doc(host="h", herdr="/fake/herdr",
+                            run=lambda a, t: (0, "", ""),
+                            home=self.home, now=NOW,
+                            probe=lambda: ("running", "0.9.4", True),
+                            units={"notify": "active", "scheduler": "active",
+                                   "guardian": "active"},
+                            binary="detected", client_version="0.9.4",
+                            stale_record=True)
+        self.assertEqual(doc["tendril"],
+                         {"state": "degraded",
+                          "hint": "re-run tendril --upgrade"})
+        self.assertNotIn("/", json.dumps(doc))
+
+    def test_no_client_is_missing_binary(self):
+        doc = th.health_doc(host="h", herdr=None, run=lambda a, t: (0, "", ""),
+                            home=self.home, now=NOW,
+                            probe=lambda: ("unknown", None, None),
+                            units={"notify": "absent", "scheduler": "absent",
+                                   "guardian": "absent"})
+        self.assertEqual(doc["herdr"]["binary"], "missing")
+        self.assertEqual(doc["herdr"]["state"], "unknown")
+        self.assertNotIn("client_version", doc["herdr"])
+
+    def test_capacity_block_in_doc(self):
+        doc = th.health_doc(host="h", herdr=None, run=lambda a, t: (0, "", ""),
+                            home=self.home, now=NOW,
+                            probe=lambda: ("down", None, None),
+                            units={"notify": "absent", "scheduler": "absent",
+                                   "guardian": "absent"},
+                            capacity={"state": "adapters_disabled",
+                                      "enabled": []})
+        self.assertEqual(doc["capacity"], {"state": "adapters_disabled",
+                                           "enabled": []})
+
+    def test_no_paths_in_v2_fields(self):
+        doc = self.doc(lambda: ("running", "0.9.3", True))
+        dump = json.dumps(doc)
+        self.assertNotIn("/fake/herdr", dump)
+        self.assertNotIn("/", dump)
+
+
 class RestartTests(Base):
     def setUp(self):
         super().setUp()
@@ -509,7 +716,7 @@ class RestartTests(Base):
         self.api_true = lambda: True
 
     def verb(self, verb, states, starter=None, stopper=None, api=None,
-             probe=None):
+             probe=None, client_version=None):
         started, stop_calls = [], []
 
         def default_starter():
@@ -533,7 +740,8 @@ class RestartTests(Base):
                              api=api,
                              starter=starter, stopper=stopper,
                              epoch=self.clock.epoch, mono=self.clock.mono,
-                             sleep=self.clock.sleep), started, stop_calls
+                             sleep=self.clock.sleep,
+                             client_version=client_version), started, stop_calls
 
     def test_restart_success_is_verified(self):
         doc, started, _ = self.verb("restart", ["down", "down", "running"])
@@ -573,6 +781,101 @@ class RestartTests(Base):
                                     ["running", "down", "running"],
                                     api=[False, True])
         self.assertEqual(doc["ok"], True)
+        self.assertEqual(len(started), 1)
+
+    def test_restart_records_ownership_on_success(self):
+        doc, started, _ = self.verb("restart", ["down", "running"])
+        self.assertEqual(doc["ok"], True)
+        self.assertEqual(self.state().get("started_by"), "tendril")
+
+    def test_stop_clears_ownership(self):
+        th.save_state(self.p["state"], {"started_by": "tendril",
+                                        "started_at": 123})
+        doc, _, _ = self.verb("stop", ["running"])
+        self.assertEqual(doc["ok"], True)
+        self.assertNotIn("started_by", self.state())
+
+    def test_restart_mismatched_foreign_server_is_refused(self):
+        # §7.4: running server speaks another protocol and TENDRIL did not
+        # start it — never touch it, never start a second one.
+        doc, started, stopped = self.verb(
+            "restart", [],
+            probe=lambda: ("running", "0.8.2", False))
+        self.assertEqual(doc, {"ok": False, "error": th.E_MISMATCH})
+        self.assertEqual(started, [])
+        self.assertEqual(stopped, [])
+
+    def test_restart_mismatched_version_foreign_server_is_refused(self):
+        # same verdict from version evidence alone (no protocol flag)
+        doc, started, stopped = self.verb(
+            "restart", [], client_version="0.9.3",
+            probe=lambda: ("running", "0.8.2", None))
+        self.assertEqual(doc, {"ok": False, "error": th.E_MISMATCH})
+        self.assertEqual(started, [])
+        self.assertEqual(stopped, [])
+
+    def test_restart_mismatched_tendril_owned_server_is_stopped_first(self):
+        th.save_state(self.p["state"], {"started_by": "tendril",
+                                        "started_at": 123})
+        seq = [("running", "0.8.2", False),   # pre-check: mismatched
+               ("running", "0.8.2", False),   # stop verification: still up
+               ("down", None, None),          # stop verification: gone
+               ("down", None, None),          # verify: not yet
+               ("running", "0.9.3", True)]    # verify: right server, up
+        doc, started, stopped = self.verb("restart", [], probe=lambda:
+                                          seq.pop(0) if seq else
+                                          ("running", "0.9.3", True))
+        self.assertEqual(doc, {"ok": True, "herdr": {"state": "running"}})
+        self.assertEqual(len(stopped), 1)
+        self.assertEqual(len(started), 1)
+        self.assertEqual(self.state().get("started_by"), "tendril")
+
+    def test_restart_mismatched_owned_stop_failure_is_refused(self):
+        th.save_state(self.p["state"], {"started_by": "tendril",
+                                        "started_at": 123})
+        stops = []
+
+        def failing_stopper():
+            stops.append(1)
+            return False
+        doc, started, _ = self.verb(
+            "restart", [], stopper=failing_stopper,
+            probe=lambda: ("running", "0.8.2", False))
+        self.assertEqual(doc, {"ok": False, "error": th.E_STOP})
+        self.assertEqual(started, [])
+        self.assertEqual(len(stops), 1)
+
+    def test_restart_mismatched_stop_that_never_lands_is_refused(self):
+        # the stop "succeeded" but the server never went away: refuse
+        # rather than start a second server on top of it
+        th.save_state(self.p["state"], {"started_by": "tendril",
+                                        "started_at": 123})
+        doc, started, stopped = self.verb(
+            "restart", [],
+            probe=lambda: ("running", "0.8.2", False))
+        self.assertEqual(doc, {"ok": False, "error": th.E_MISMATCH})
+        self.assertEqual(started, [])
+
+    def test_start_refused_on_mismatched_foreign_server(self):
+        doc, started, _ = self.verb(
+            "start", [], probe=lambda: ("running", "0.8.2", False))
+        self.assertEqual(doc, {"ok": False, "error": th.E_MISMATCH})
+        self.assertEqual(started, [])
+
+    def test_restart_verification_rejects_wrong_version_server(self):
+        # the started binary must verify as THE recorded client version:
+        # a server that comes up at another version is not success —
+        # the verify loop keeps waiting and finally reports no-up
+        n = {"i": 0}
+
+        def probe():
+            n["i"] += 1
+            if n["i"] == 1:                   # pre-check: nothing running
+                return "down", None, None
+            return "running", "0.8.2", True   # a WRONG-version server
+        doc, started, _ = self.verb("restart", [], client_version="0.9.3",
+                                    probe=probe, api=lambda: True)
+        self.assertEqual(doc, {"ok": False, "error": th.E_NOUP})
         self.assertEqual(len(started), 1)
 
     def test_stop_landing_mid_restart_is_never_resurrected(self):
@@ -841,7 +1144,9 @@ class UnitInstallTests(Base):
         self.assertEqual(self.calls,
                          [["systemctl", "--user", "daemon-reload"],
                           ["systemctl", "--user", "enable", "--now",
-                           thost.GUARDIAN_TIMER]])
+                           thost.GUARDIAN_TIMER],
+                          ["systemctl", "--user", "is-active",
+                           thost.GUARDIAN_TIMER]])   # final state report (§7.4)
         self.calls = []
         rc, out = self.refresh()
         self.assertEqual(rc, 0)
@@ -867,6 +1172,8 @@ class UnitInstallTests(Base):
         self.assertEqual(self.calls,
                          [["systemctl", "--user", "daemon-reload"],
                           ["systemctl", "--user", "enable", "--now",
+                           thost.GUARDIAN_TIMER],
+                          ["systemctl", "--user", "is-active",
                            thost.GUARDIAN_TIMER]])
 
     def test_inactive_timer_reenabled_without_change(self):
@@ -880,6 +1187,8 @@ class UnitInstallTests(Base):
                          [["systemctl", "--user", "is-active",
                            thost.GUARDIAN_TIMER],
                           ["systemctl", "--user", "enable", "--now",
+                           thost.GUARDIAN_TIMER],
+                          ["systemctl", "--user", "is-active",
                            thost.GUARDIAN_TIMER]])
 
     def test_launchd_host_is_a_noop(self):

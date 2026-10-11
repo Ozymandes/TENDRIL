@@ -23,7 +23,9 @@ test_client_install), recording every argv in TENDRIL_RECORD. Covers:
 
 HOME is a temp dir; the real home is never touched. Stdlib only.
 """
+import base64
 import importlib.util
+import json
 import io
 import contextlib
 import os
@@ -195,6 +197,66 @@ class FixedVerbs(LauncherEnv):
                          ["ssh -o BatchMode=yes -o ConnectTimeout=6 "
                           "testhost remote-agents schedule add "
                           "'%s'" % GOOD_PAYLOAD])
+
+    # ---- §7.3: strict target schema on the launcher side ------------
+
+    def b64(self, doc):
+        import base64
+        return base64.urlsafe_b64encode(
+            json.dumps(doc).encode()).decode().rstrip("=")
+
+    def new_target_payload(self, target):
+        return self.b64({"title": "t", "prompt": "p", "workspace": "w15",
+                         "harness": "pi",
+                         "trigger": {"kind": "at", "at": 1791590000},
+                         "target": target})
+
+    def test_target_new_form_dials(self):
+        p = self.run_launcher(["testhost", "schedule", "add",
+                               self.new_target_payload({"kind": "new"})])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_target_existing_form_dials(self):
+        for t in ({"kind": "existing", "pane": "w16:p5", "harness": "pi"},
+                  {"kind": "existing", "pane": "w9:pB", "harness": "claude",
+                   "agent_started_at": 1791580000}):
+            open(self.record, "w").close()      # one dial per case
+            p = self.run_launcher(["testhost", "schedule", "add",
+                                   self.new_target_payload(t)])
+            self.assertEqual(p.returncode, 0, (t, p.stdout + p.stderr))
+            self.assertEqual(len(self.calls()), 1)
+
+    def test_malformed_targets_refused_with_nothing_on_the_wire(self):
+        bad = [
+            {"kind": "other"},
+            {"kind": "existing"},
+            {"kind": "existing", "pane": "w16:p5; rm -rf", "harness": "pi"},
+            {"kind": "existing", "pane": "p5", "harness": "pi"},
+            {"kind": "existing", "pane": "w16:p5", "harness": "PI"},
+            {"kind": "existing", "pane": "w16:p5", "harness": "pi",
+             "agent_started_at": "soon"},
+            {"kind": "existing", "pane": "w16:p5", "harness": "pi",
+             "extra": 1},
+            "existing",
+            {"kind": "new", "pane": "w16:p5"},
+        ]
+        for t in bad:
+            p = self.run_launcher(["testhost", "schedule", "add",
+                                   self.new_target_payload(t)])
+            self.assertEqual(p.returncode, 2, t)
+            self.assertEqual(self.calls(), [], t)   # NOTHING dialed
+            self.assertIn("usage", p.stdout + p.stderr)
+
+    def test_truncated_target_object_is_refused(self):
+        import base64
+        raw = '{"title":"t","prompt":"p","workspace":"w15",'
+        raw += '"harness":"pi","trigger":{"kind":"at","at":1},'
+        raw += '"target":{"kind":'
+        payload = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+        p = self.run_launcher(["testhost", "schedule", "add", payload])
+        self.assertEqual(p.returncode, 2)
+        self.assertEqual(self.calls(), [])
 
     def test_schedule_add_takes_the_full_contract_length(self):
         p = self.run_launcher(["testhost", "schedule", "add", "b" * 16384])

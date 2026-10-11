@@ -73,7 +73,7 @@ DOC_KEYS = {"version", "host", "generated_at", "focused_workspace",
             "focused_pane", "workspaces", "capabilities", "health"}
 WS_KEYS = {"id", "label", "number", "focused", "agents"}
 AGENT_KEYS = {"pane_id", "tab_id", "agent", "status", "focused",
-              "harness"}
+              "harness", "prompt_ready"}
 
 
 class SnapshotCommand(unittest.TestCase):
@@ -152,9 +152,11 @@ class SnapshotCommand(unittest.TestCase):
         agents = self.doc()["workspaces"][0]["agents"]
         self.assertEqual(agents, [
             {"pane_id": "w15:p1", "tab_id": "w15:t1", "agent": "pi",
-             "status": "working", "focused": True, "harness": "pi"},
+             "status": "working", "focused": True, "harness": "pi",
+             "prompt_ready": False},
             {"pane_id": "w15:p2", "tab_id": "w15:t2", "agent": "claude",
-             "status": "unknown", "focused": False, "harness": "claude"},
+             "status": "unknown", "focused": False, "harness": "claude",
+             "prompt_ready": False},
         ])
 
     def test_never_leaks_cwd_titles_or_sessions(self):
@@ -334,6 +336,21 @@ def _fake_module(name, fn):
     return m
 
 
+class PromptReady(unittest.TestCase):
+    """§7.3: prompt_ready = launchable harness + agent present + idle/done
+    (host-computed; the phone derives Busy / Needs input / Not supported
+    from status itself)."""
+
+    def test_table(self):
+        f = ra._prompt_ready
+        self.assertTrue(f("idle", "pi"))
+        self.assertTrue(f("done", "claude"))
+        self.assertFalse(f("working", "pi"))       # busy
+        self.assertFalse(f("blocked", "pi"))       # needs input
+        self.assertFalse(f("unknown", "pi"))
+        self.assertFalse(f("idle", "tcsh"))        # not a launchable harness
+
+
 class OptionalSections(unittest.TestCase):
     """Contract §1 hook signature: tendril_capacity.snapshot_section(
     budget_s) and tendril_schedule.snapshot_section() return
@@ -386,7 +403,7 @@ class OptionalSections(unittest.TestCase):
             raise RuntimeError("boom")
         sec = {"available": True, "tasks": []}
         extra, caps = self.call(cap=boom,
-                                sched=lambda: (sec, "schedule"))
+                                sched=lambda snap=None: (sec, "schedule"))
         self.assertEqual(extra, {"schedule": sec})
         self.assertEqual(caps, ["schedule"])
 
@@ -405,7 +422,7 @@ class OptionalSections(unittest.TestCase):
                 "tendril_capacity": _fake_module("tendril_capacity",
                                                  lambda budget_s=1.0: cap),
                 "tendril_schedule": _fake_module("tendril_schedule",
-                                                 lambda: sched),
+                                                 lambda snap=None: sched),
                 "tendril_health": _fake_module("tendril_health",
                                                lambda: health)}), \
              mock.patch.object(ra, "HERDR", "herdr"), \

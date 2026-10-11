@@ -229,15 +229,18 @@ def _touch(entry, ts):
         entry["last_seen_at"] = ts
 
 
-def _wire_event(entry, kind, tool, ts):
-    """Append one v3 wire event ({kind, tool?, at}); cap newest-last. Only
-    kinds, tool NAMES and epoch times ever enter this list."""
+def _wire_event(entry, kind, tool, ts, name=None):
+    """Append one v3 wire event ({kind, tool?, name?, at}); cap newest-last.
+    Only kinds, tool NAMES, sanitized agent names and epoch times ever
+    enter this list."""
     at = ts if ts is not None else entry.get("last_seen_at")
     if at is None:
         return
     ev = {"kind": kind}
     if tool:
         ev["tool"] = tool
+    if name:
+        ev["name"] = name
     ev["at"] = int(at)
     events = entry.get("events")
     if not isinstance(events, list):
@@ -344,9 +347,24 @@ def _open_call(entry, cid, name, ts, args):
     # slot 3 holds ONLY the derived phase word — never the command text.
     oc[cid] = [nm, ts, _arg_base(args), _bash_phase_word(nm, args)]
     if _is_delegate(nm):
-        _wire_event(entry, "subagent", nm, ts)
-    elif nm:
-        _wire_event(entry, "tool", nm, ts)
+        # §7.2: a subagent event may carry the child TYPE name; status is
+        # unknown at open time and never guessed here.
+        _wire_event(entry, "subagent", nm, ts,
+                    name=_delegate_name(args))
+    # plain tools emit NO open-time event: kind "tool" means completed
+    # (contract 0.2 §7.2); the completion path (_event) emits it.
+
+
+def _delegate_name(args):
+    """Sanitized agent TYPE name from a delegate call's arguments (§7.2
+    subagent event `name`), or None. Only the sanitized token survives."""
+    if not isinstance(args, dict):
+        return None
+    for k in ("agent", "name", "subagent_type", "subagent"):
+        sn = _sanitize_name(args.get(k))
+        if sn:
+            return sn
+    return None
 
 
 def _close_call(entry, cid):
@@ -691,22 +709,262 @@ def _wire_phase(status, tool_name, bash_phase):
     return None                              # absent otherwise
 
 
+# ---------- provenance: provider / adapter / billing / context window ----------
+# Contract 0.2 §7.1: provider is the canonical UPSTREAM VENDOR (a bridge or
+# route name is never a provider); adapter names the bridge when one is
+# used; billing is metered only for real per-call charges; context_window
+# comes ONLY from an explicit local registry — never a built-in table,
+# never guessed from a model name.
+_PROVIDERS = {
+    # raw transcript provider token → (canonical vendor, adapter | None)
+    "claude-bridge": ("anthropic", "claude-bridge"),
+    "openai-codex": ("openai", None),
+    "openai": ("openai", None),
+    "anthropic": ("anthropic", None),
+    "zai": ("zai", None),
+    "google": ("google", None),
+    "mistral": ("mistral", None),
+}
+# Deliberately unmapped (provider stays ABSENT until the id maps
+# unambiguously — no guessing): optollm and any unknown token.
+_MODELS_STORE = ".pi/agent/models-store.json"
+_BRIDGE_CFG = ".pi/agent/claude-bridge.json"
+_BRIDGE_MODELS_TS = ".pi/agent/npm/node_modules/pi-claude-bridge/src/models.ts"
+_CREDENTIALS = ".claude/.credentials.json"
+_REG_CACHE = {}                       # key → (mtime | None, value)
+
+
+def _registry(key, path, loader):
+    """mtime-keyed registry read: re-reads only when the file changed;
+    a missing file is cached as (None, None). Keyed by (name, path) so
+    distinct homes never share an entry. Never raises."""
+    cache_key = (key, path)
+    try:
+        mt = os.stat(path).st_mtime_ns
+    except OSError:
+        mt = None
+    hit = _REG_CACHE.get(cache_key)
+    if hit is not None and hit[0] == mt:
+        return hit[1]
+    val = None
+    if mt is not None:
+        try:
+            val = loader(path)
+        except Exception:
+            val = None
+    _REG_CACHE[cache_key] = (mt, val)
+    return val
+
+
+def _models_store(home):
+    """{raw_provider: {model_id: contextWindow}} from Pi's models-store
+    (its `models` value is a list of entries carrying id + contextWindow).
+    Only that one field is copied; nothing else is read."""
+    def load(path):
+        with open(path, "rb") as f:
+            d = json.loads(f.read(4 * 1024 * 1024))
+        if not isinstance(d, dict):
+            return None
+        out = {}
+        for prov, pv in d.items():
+            models = pv.get("models") if isinstance(pv, dict) else None
+            if not isinstance(models, list):
+                continue
+            ids = {}
+            for m in models[:512]:
+                if isinstance(m, dict) and isinstance(m.get("id"), str) \
+                        and isinstance(m.get("contextWindow"), int) \
+                        and not isinstance(m["contextWindow"], bool) \
+                        and m["contextWindow"] > 0:
+                    ids[m["id"]] = m["contextWindow"]
+            if ids:
+                out[prov] = ids
+        return out or None
+    return _registry("models", os.path.join(home, _MODELS_STORE), load)
+
+
+def _bridge_settings(home):
+    """(plan, extra_usage, forced_200k_ids) from claude-bridge.json — the
+    plan-tier settings only (never any credential material)."""
+    def load(path):
+        with open(path, "rb") as f:
+            d = json.loads(f.read(65536))
+        p = d.get("provider") if isinstance(d, dict) else None
+        if not isinstance(p, dict):
+            return None
+        plan = p.get("plan")
+        force = p.get("forceTwoHundredK")
+        return (plan if plan in ("pro", "max") else None,
+                bool(p.get("longContextExtraUsage")),
+                set(force) if isinstance(force, list) else set())
+    return _registry("bridgecfg", os.path.join(home, _BRIDGE_CFG), load)
+
+
+_RE_TS_CONST = re.compile(r"const\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([0-9_]{1,12})\s*;")
+_RE_TS_MEASURED = re.compile(r"MEASURED_ONE_M\s*=\s*new\s+Set\(\[(.*?)\]",
+                             re.S)
+_RE_TS_GATED = re.compile(r"PLAN_GATED_ONE_M[^{]*\{(.*?)\n\}", re.S)
+_RE_TS_GATE_ROW = re.compile(
+    r'"(claude-[a-z0-9._-]{1,64})":\s*\(settings\)\s*=>\s*(.+?),?\s*(?=\n|\}|$)')
+
+
+def _bridge_model_policy(home):
+    """(measured_1m, gated, two_k, one_m) parsed DEFENSIVELY from the
+    installed claude-bridge model policy (src/models.ts). The bridge
+    registers exactly this window per model — pi's own status-bar
+    denominator — so it is the authoritative local definition:
+    forceTwoHundredK → two_k; MEASURED_ONE_M ids → one_m; the two known
+    plan-gated ids → per claude-bridge.json plan settings; everything
+    else → two_k, which is the MEASURED served window of a bare id, not
+    a placeholder (see the bridge's diag/CONTEXT-SIZE.md). Any parse
+    failure → None: no window is ever emitted from a guessed source."""
+    def load(path):
+        with open(path, "rb") as f:
+            raw = f.read(512 * 1024).decode("utf-8", "replace")
+        consts = {k: int(v.replace("_", ""))
+                  for k, v in _RE_TS_CONST.findall(raw)}
+        two_k = consts.get("TWO_HUNDRED_K_CONTEXT")
+        one_m = consts.get("ONE_M_CONTEXT")
+        if not two_k or not one_m or one_m <= two_k:
+            return None
+        measured = set()
+        m = _RE_TS_MEASURED.search(raw)
+        if m:
+            measured = set(re.findall(r'"(claude-[a-z0-9._-]{1,64})"',
+                                      m.group(1)))
+        gated = {}
+        g = _RE_TS_GATED.search(raw)
+        if g:
+            for mid, pred in _RE_TS_GATE_ROW.findall(g.group(1)):
+                gated[mid] = pred.strip()
+        return measured, gated, two_k, one_m
+    return _registry("bridgems", os.path.join(home, _BRIDGE_MODELS_TS), load)
+
+
+def _gate_open(pred, plan, extra):
+    """Evaluate ONLY the gate predicate shapes the installed file ships;
+    anything else conservatively stays closed (the bridge's own safe
+    default window applies)."""
+    p = re.sub(r"\s+", "", pred)
+    if p == 'settings.plan==="max"||settings.longContextExtraUsage':
+        return plan == "max" or extra
+    if p == "settings.longContextExtraUsage":
+        return extra
+    return False
+
+
+def _bridge_window(model, home):
+    """(window, 'bridge_config') for a claude-bridge model id, or
+    (None, None) when the installed policy cannot be parsed."""
+    pol = _bridge_model_policy(home)
+    if not pol or not isinstance(model, str) or not model:
+        return None, None
+    measured, gated, two_k, one_m = pol
+    settings = _bridge_settings(home)
+    plan = settings[0] if settings else None
+    extra = settings[1] if settings else False
+    forced = settings[2] if settings else set()
+    if model in forced:
+        return two_k, "bridge_config"
+    if model in measured:
+        return one_m, "bridge_config"
+    if model in gated:
+        return (one_m if _gate_open(gated[model], plan, extra) else two_k,
+                "bridge_config")
+    return two_k, "bridge_config"          # bare id: measured 200K served
+
+
+def _context_window(harness, raw_provider, model, home):
+    """(window, source) — pi_models_store for pi provider+model ids listed
+    there, bridge_config for claude-bridge via the installed policy.
+    NOTHING else: a model missing from every registry emits no window."""
+    if harness == "pi" and isinstance(model, str) and model:
+        store = _models_store(home)
+        if store and isinstance(raw_provider, str):
+            w = store.get(raw_provider, {}).get(model)
+            if isinstance(w, int) and not isinstance(w, bool) and w > 0:
+                return w, "pi_models_store"
+        if raw_provider == "claude-bridge":
+            return _bridge_window(model, home)
+    return None, None
+
+
+def _cred_oauth(home):
+    """True when ~/.claude/.credentials.json CONTAINS a claudeAiOauth
+    object. Key presence only — no value is ever read, copied or logged."""
+    def load(path):
+        with open(path, "rb") as f:
+            d = json.loads(f.read(65536))
+        return isinstance(d, dict) and "claudeAiOauth" in d
+    return bool(_registry("cred", os.path.join(home, _CREDENTIALS), load))
+
+
+def _provenance(harness, entry, home):
+    """§7.1 flat facts for one agent/child entry: provider (+adapter),
+    billing, and cost_usd ONLY when billing is metered. Claude Code's
+    upstream is Anthropic by definition; its billing is provider_managed
+    on a claude.ai OAuth login (key presence only) and otherwise metered
+    when a real totalCostUSD was recorded. pi billing follows the route:
+    a claude-bridge turn is provider_managed (the transcript's cost.total
+    is 0); a positive per-call cost is metered; zero/absent cost with
+    tokens is unknown; nothing derived at all emits no billing."""
+    out = {}
+    if harness == "claude":
+        out["provider"] = "anthropic"
+        if _cred_oauth(home):
+            out["billing"] = "provider_managed"
+        else:
+            cost = entry.get("cost_last")
+            cost = float(cost) if isinstance(cost, (int, float)) else 0.0
+            out["billing"] = "metered" if cost > 0 else "unknown"
+            if cost > 0:
+                out["cost_usd"] = round(cost, 4)
+        return out
+    raw = entry.get("provider")
+    mapped = _PROVIDERS.get(raw) if isinstance(raw, str) else None
+    if mapped is not None:
+        provider, adapter = mapped
+        out["provider"] = provider
+        if adapter:
+            out["adapter"] = adapter
+    if raw == "claude-bridge":              # subscription route: never metered
+        out["billing"] = "provider_managed"
+        return out
+    # billing does not depend on knowing the route: a positive transcript
+    # cost is a real per-call charge even when the provider token is one
+    # we do not map (the provider key then stays absent — no guessing).
+    cost = entry.get("cost_sum")
+    cost = float(cost) if isinstance(cost, (int, float)) else 0.0
+    tokens = (entry.get("context_tokens") or 0) \
+        + (entry.get("output_tokens") or 0)
+    if cost > 0:
+        out["billing"] = "metered"
+        out["cost_usd"] = round(cost, 4)
+    elif tokens > 0:
+        out["billing"] = "unknown"
+    return out
+
+
 # ---------- wire emit ----------
-def _emit(harness, entry, status, now):
+def _emit(harness, entry, status, now, home=None):
+    home = home or HOME
     out = {"harness": harness}
-    for k in ("model", "provider", "effort"):
+    for k in ("model", "effort"):
         v = entry.get(k)
         if isinstance(v, str) and v:
             out[k] = v
+    out.update(_provenance(harness, entry, home))
+    cw, cws = _context_window(harness, entry.get("provider"),
+                              entry.get("model"), home)
+    if cw:
+        out["context_window"] = int(cw)
+        out["context_window_source"] = cws
     if entry.get("started_at"):
         out["started_at"] = int(entry["started_at"])
     if entry.get("context_tokens"):
         out["context_tokens"] = int(entry["context_tokens"])
     if entry.get("output_tokens"):
         out["output_tokens"] = int(entry["output_tokens"])
-    cost = entry.get("cost_sum") if harness == "pi" else entry.get("cost_last")
-    if cost is not None:
-        out["cost_usd"] = round(float(cost), 4)
     seen = entry.get("last_seen_at")
     oc = entry.get("open_calls") or {}
     tool_base = None
@@ -740,7 +998,9 @@ def _emit(harness, entry, status, now):
     if isinstance(kids, dict) and kids:
         rows = sorted((ce for ce in kids.values() if isinstance(ce, dict)),
                       key=_child_last, reverse=True)
-        children = [_child_emit(harness, ce, now) for ce in rows[:CHILD_CAP]]
+        children = [_child_emit(harness, ce, now, home,
+                                entry.get("provider"))
+                    for ce in rows[:CHILD_CAP]]
         if children:
             out["children"] = children
     return out
@@ -1027,6 +1287,31 @@ def _terminal_stop(sr):
         "toolUse", "tool_use", "tool")
 
 
+def _error_stop(sr):
+    """An EXPLICIT error stop reason (e.g. pi's "error" family): failed
+    evidence per contract 0.2 §7.2. Generic stops are never errors."""
+    return isinstance(sr, str) and (sr == "error" or sr.startswith("error_"))
+
+
+def _error_is_final(ce):
+    """The child's last record is an error tool result: no assistant turn,
+    no prompt and no later-opened tool call happened after it (§7.2
+    'error as FINAL record'). An earlier tool error followed by more work
+    is recovery, never failure."""
+    err = ce.get("last_error_ts")
+    if err is None:
+        return False
+    for k in ("last_assistant_at", "last_prompt_at"):
+        v = ce.get(k)
+        if isinstance(v, (int, float)) and v >= err:
+            return False
+    for rec in (ce.get("open_calls") or {}).values():
+        if isinstance(rec, (list, tuple)) and len(rec) > 1 \
+                and isinstance(rec[1], (int, float)) and rec[1] >= err:
+            return False
+    return True
+
+
 def _child_last(ce):
     vals = [v for v in (ce.get("last_seen_at"), ce.get("mtime"))
             if isinstance(v, (int, float))]
@@ -1034,8 +1319,14 @@ def _child_last(ce):
 
 
 def _child_status(ce, now):
-    """done | failed | working | tool | thinking | unknown per contract 0.2.
-    Meta exitCode wins; then timing rules; nothing is ever guessed."""
+    """done | failed | working | tool | thinking | stale | unknown per
+    contract 0.2 §7.2. exitCode wins; then explicit error evidence (an
+    error stop reason, or an error as the FINAL record with no later
+    assistant turn); otherwise a terminal stop → done; the active-window
+    rules are unchanged; quiet past the active window with no terminal
+    evidence → stale; unknown only with no timestamps at all. An earlier
+    tool error followed by more work is NEVER a failure, and historical
+    children are done/stale/unknown — never failed by inference."""
     code = (ce.get("meta") or {}).get("exitCode")
     if isinstance(code, int):
         return "done" if code == 0 else "failed"
@@ -1043,11 +1334,14 @@ def _child_status(ce, now):
     if last is None:
         return "unknown"
     quiet = now - last
-    if ce.get("last_error_ts") is not None and quiet >= CHILD_QUIET_S:
+    if _error_stop(ce.get("stop_reason")):
         return "failed"
-    if _terminal_stop(ce.get("stop_reason")) and quiet >= CHILD_QUIET_S:
-        return "done"
+    if quiet >= CHILD_QUIET_S and _error_is_final(ce):
+        return "failed"
     if quiet <= CHILD_ACTIVE_S:
+        if _terminal_stop(ce.get("stop_reason")) \
+                and quiet >= CHILD_QUIET_S:
+            return "done"
         if ce.get("open_calls"):
             return "tool"
         ap = ce.get("last_assistant_at")
@@ -1056,11 +1350,17 @@ def _child_status(ce, now):
                                              or rp >= ap):
             return "working"
         return "thinking"
-    return "unknown"
+    if _terminal_stop(ce.get("stop_reason")):
+        return "done"
+    return "stale"
 
 
-def _child_emit(harness, ce, now):
-    """One wire child dict; unknown facts are omitted, never fabricated."""
+def _child_emit(harness, ce, now, home=None, parent_provider=None):
+    """One wire child dict; unknown facts are omitted, never fabricated.
+    §7.1 provenance rides on children too: the child transcript's own
+    provider wins, falling back to the parent's route for children that
+    have recorded none."""
+    home = home or HOME
     status = _child_status(ce, now)
     out = {"kind": "subagent", "harness": harness, "status": status}
     sid = _short_id(ce.get("run_id"), ce.get("session_id"))
@@ -1085,17 +1385,26 @@ def _child_emit(harness, ce, now):
                 + (mu.get("cacheWrite") or 0)
         ctx = int(total) if total else None
     if ctx:
+        ce["context_tokens"] = int(ctx)      # meta-derived: feed provenance
         out["context_tokens"] = int(ctx)
     outp = ce.get("output_tokens")
     if not outp and mu.get("output") is not None:
         outp = mu["output"]
     if outp:
+        ce["output_tokens"] = int(outp)
         out["output_tokens"] = int(outp)
+    raw = ce.get("provider") if isinstance(ce.get("provider"), str) \
+        else parent_provider
     cost = ce.get("cost_sum") if harness == "pi" else None
     if cost is None and isinstance(mu.get("cost"), (int, float)):
         cost = mu["cost"]
     if cost is not None:
-        out["cost_usd"] = round(float(cost), 4)
+        ce["cost_sum"] = float(cost)         # _provenance reads cost_sum
+    out.update(_provenance(harness, ce, home))
+    cw, cws = _context_window(harness, raw, ce.get("model"), home)
+    if cw:
+        out["context_window"] = int(cw)
+        out["context_window_source"] = cws
     seen = _child_last(ce)
     oc = ce.get("open_calls") or {}
     tool_base = None
@@ -1217,7 +1526,8 @@ def for_agents(agents, budget=BUDGET_S, cache_path=None, home=None, now=None):
                             except Exception:
                                 pass            # children never fail the parent
                         res = _emit(harness, entry,
-                                    str(a.get("agent_status") or ""), now)
+                                    str(a.get("agent_status") or ""), now,
+                                    home)
                         by_path[path] = res
                         cache[path] = entry
                         touched = True

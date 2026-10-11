@@ -978,5 +978,237 @@ class TestCliAndStatus(Base):
         no_leak(self, MARKER, r.stdout + r.stderr, "cli output")
 
 
+class TestReasonsAndHealth(Base):
+    """§7.5: unknown providers say WHY (reason + enable id); §7.1: zero
+    cost is a provider-managed/unknown route, never a 0.0 charge; the
+    health module's read-only section hook.
+    These drive _assemble/health_section directly (the scanner-produced
+    cache shape), so no fixture transcript churn is needed."""
+
+    def cache_with(self, files, net=None):
+        cache = {"acc_ver": tc.ACC_VERSION, "files": files}
+        if net:
+            cache["net"] = net
+        return cache
+
+    def prov(self, pid, cache, enabled=()):
+        sec = tc._assemble(cache, NOW, enabled=list(enabled))
+        for rec in sec.get("providers", []):
+            if rec.get("id") == pid:
+                return rec
+        self.fail("provider %s missing" % pid)
+
+    def claude_unknown(self, net=None):
+        return self.cache_with({
+            "/h/.claude/s.jsonl": {"kind": "claude", "last_ts": NOW,
+                                   "days": {tc._local_date(NOW):
+                                            {"tok": 50}}, "mday": {}}},
+            net=net)
+
+    def test_disabled_adapter_reason_and_enable_id(self):
+        rec = self.prov("claude", self.claude_unknown())
+        self.assertEqual(rec["state"], "unknown")
+        self.assertEqual(rec["reason"], "adapter_disabled")
+        self.assertEqual(rec["enable"], "claude_oauth")
+
+    def test_adapter_failures_map_to_reasons(self):
+        rec = self.prov("claude", self.claude_unknown(
+            {"claude_oauth": {"fail": "auth"}}), enabled=("claude_oauth",))
+        self.assertEqual(rec["reason"], "auth_error")
+        self.assertNotIn("enable", rec)
+        rec = self.prov("claude", self.claude_unknown(
+            {"claude_oauth": {"fail": "net"}}), enabled=("claude_oauth",))
+        self.assertEqual(rec["reason"], "network_error")
+        rec = self.prov("claude", self.claude_unknown(),
+                        enabled=("claude_oauth",))
+        self.assertEqual(rec["reason"], "no_data")
+
+    def test_provider_without_adapter_is_feature_missing(self):
+        cache = self.cache_with({
+            "/h/.pi/g.jsonl": {"kind": "pi", "last_ts": NOW, "prov": {
+                "google": {"days": {tc._local_date(NOW):
+                                    {"tok": 10}}, "mday": {}}}}})
+        rec = self.prov("google", cache)
+        self.assertEqual(rec["reason"], "feature_missing")
+        self.assertNotIn("enable", rec)
+
+    def test_zero_cost_today_is_omitted_never_zero(self):
+        today, yday = tc._local_date(NOW), tc._local_date(NOW - 86400)
+        cache = self.cache_with({
+            "/h/.pi/z.jsonl": {"kind": "pi", "last_ts": NOW, "prov": {
+                "zai": {"days": {yday: {"tok": 100, "cost": 0.5},
+                                 today: {"tok": 10, "cost": 0.0}},
+                        "mday": {}}}}})
+        rec = self.prov("zai", cache)
+        self.assertNotIn("cost_today_usd", rec)   # §7.1: never a fake 0.0
+
+    def test_positive_cost_today_still_emitted(self):
+        today = tc._local_date(NOW)
+        cache = self.cache_with({
+            "/h/.pi/z.jsonl": {"kind": "pi", "last_ts": NOW, "prov": {
+                "zai": {"days": {today: {"tok": 100, "cost": 0.25}},
+                        "mday": {}}}}})
+        rec = self.prov("zai", cache, enabled=("zai_quota",))
+        self.assertEqual(rec["cost_today_usd"], 0.25)
+
+    def test_health_section_states(self):
+        # no cache at all → absent
+        self.assertEqual(tc.health_section(home=self.home,
+                                           cache_path=self.cache),
+                         {"state": "absent", "enabled": []})
+        # a usable cached section → available (and read-only: no file made)
+        cache = self.claude_unknown()
+        cache["section"] = tc._assemble(cache, NOW, enabled=[])
+        os.makedirs(os.path.dirname(self.cache), exist_ok=True)
+        tc._save_cache(cache, self.cache)
+        before = os.stat(self.cache).st_mtime_ns
+        doc = tc.health_section(home=self.home, cache_path=self.cache)
+        self.assertEqual(doc, {"state": "adapters_disabled",
+                               "enabled": []})
+        self.assertEqual(os.stat(self.cache).st_mtime_ns, before)
+        # one healthy provider → available
+        cache["section"]["providers"][0]["state"] = "ready"
+        tc._save_cache(cache, self.cache)
+        doc = tc.health_section(home=self.home, cache_path=self.cache)
+        self.assertEqual(doc["state"], "available")
+        # enabled adapter flips the designed state even with all-unknown
+        with mock.patch.object(tc, "enabled_ids", return_value=["zai_quota"]):
+            doc = tc.health_section(home=self.home, cache_path=self.cache)
+        self.assertEqual(doc, {"state": "available",
+                               "enabled": ["zai_quota"]})
+        # unreadable cache is an error, never a raise
+        with mock.patch.object(tc, "_load_cache",
+                               side_effect=RuntimeError("boom")):
+            doc = tc.health_section(home=self.home, cache_path=self.cache)
+        self.assertEqual(doc, {"state": "error", "enabled": []})
+
+    def test_enable_is_idempotent(self):
+        for _ in range(2):
+            self.assertTrue(tc.set_enabled("claude_oauth", True,
+                                           home=self.home))
+            self.assertTrue(tc.set_enabled("zai_quota", True,
+                                           home=self.home))
+        with open(os.path.join(self.home, ".config", "tendril",
+                               "capacity.json")) as f:
+            self.assertEqual(json.load(f),
+                             {"enabled": ["claude_oauth", "zai_quota"]})
+        self.assertEqual(tc.enabled_ids(self.home),
+                         ["claude_oauth", "zai_quota"])
+
+    def bridge_cache(self, extra_files=None):
+        """A pi-via-claude-bridge day (tokens, cost 0.0 — never metered)
+        plus a claude_local day with real tokens, and an optollm route."""
+        today = tc._local_date(NOW)
+        files = {
+            "/h/.pi/b.jsonl": {"kind": "pi", "last_ts": NOW, "prov": {
+                "claude-bridge": {"days": {today: {"tok": 100,
+                                                   "cost": 0.0}},
+                                  "mday": {"claude-opus-5-5":
+                                           {today: 100}}}}},
+            "/h/.claude/c.jsonl": {"kind": "claude", "last_ts": NOW,
+                                   "days": {today: {"tok": 50}},
+                                   "mday": {}},
+            "/h/.pi/o.jsonl": {"kind": "pi", "last_ts": NOW, "prov": {
+                "optollm": {"days": {today: {"tok": 10}}, "mday": {}}}},
+        }
+        files.update(extra_files or {})
+        return self.cache_with(files)
+
+    def ids(self, cache, enabled=()):
+        return [p["id"] for p in
+                tc._assemble(cache, NOW, enabled=list(enabled))
+                ["providers"]]
+
+    def test_bridge_tokens_fold_into_claude(self):
+        cache = self.bridge_cache()
+        provs = {p["id"]: p for p in
+                 tc._assemble(cache, NOW, enabled=[])["providers"]}
+        self.assertNotIn("claude-bridge", provs)   # §7.1: never a provider
+        claude = provs["claude"]
+        self.assertEqual(claude["tokens_today"], 150)   # 100 bridge + 50 local
+        self.assertEqual(claude["harness"], "claude")   # rollout wins
+        # provider_managed route: no 0.0 cost, and it creates no windows
+        self.assertNotIn("cost_today_usd", claude)
+        self.assertEqual(claude["state"], "unknown")
+        self.assertNotIn("windows", claude)
+        # bridged model usage lands in the upstream provider's by_model
+        models = {m["model"]: m["tokens"] for m in claude["by_model"]}
+        self.assertEqual(models["claude-opus-5-5"], 100)
+
+    def test_bridge_only_host_still_gets_the_claude_entry(self):
+        cache = self.bridge_cache(extra_files={
+            "/h/.pi/b.jsonl": {"kind": "pi", "last_ts": NOW, "prov": {
+                "claude-bridge": {"days": {tc._local_date(NOW):
+                                           {"tok": 100}}, "mday": {}}}},
+            "/h/.pi/o.jsonl": {"kind": "pi", "last_ts": NOW, "prov": {
+                "optollm": {"days": {tc._local_date(NOW):
+                                     {"tok": 10}}, "mday": {}}}},
+        })
+        ids = self.ids(cache)
+        self.assertIn("claude", ids)               # pi data alone suffices
+        self.assertNotIn("claude-bridge", ids)
+
+    def test_no_provider_id_equals_an_adapter_or_route_name(self):
+        ids = self.ids(self.bridge_cache())
+        for bad in ("claude-bridge", "openai-codex", "optollm",
+                    "claude_oauth", "codex_wham", "zai_quota"):
+            self.assertNotIn(bad, ids)
+
+    def test_unmapped_route_is_omitted_entirely(self):
+        ids = self.ids(self.bridge_cache())
+        self.assertNotIn("optollm", ids)          # no adapter → no provider
+
+    def test_openai_codex_route_folds_into_codex(self):
+        cache = self.cache_with({
+            "/h/.pi/oc.jsonl": {"kind": "pi", "last_ts": NOW, "prov": {
+                "openai-codex": {"days": {tc._local_date(NOW):
+                                          {"tok": 70}}, "mday": {}}}}})
+        provs = {p["id"]: p for p in
+                 tc._assemble(cache, NOW, enabled=[])["providers"]}
+        self.assertNotIn("openai-codex", provs)
+        self.assertEqual(provs["codex"]["tokens_today"], 70)
+        self.assertEqual(provs["codex"]["reason"], "adapter_disabled")
+        self.assertEqual(provs["codex"]["enable"], "codex_wham")
+
+    def test_scan_folds_route_pids_at_ingest(self):
+        entry = tc._fresh_entry("pi")
+        line = json.dumps({
+            "type": "message",
+            "timestamp": iso(NOW),
+            "message": {"role": "assistant", "provider": "claude-bridge",
+                        "model": "claude-opus-5-5",
+                        "timestamp": NOW * 1000,
+                        "usage": {"input": 30, "output": 4,
+                                  "cacheWrite": 0,
+                                  "cost": {"total": 0.0}}}},
+            separators=(",", ":")).encode()
+        tc._pi_line(line, entry, NOW)
+        self.assertEqual(list(entry["prov"]), ["claude"])
+        opto = json.dumps({
+            "type": "message",
+            "timestamp": iso(NOW),
+            "message": {"role": "assistant", "provider": "optollm",
+                        "model": "x", "timestamp": NOW * 1000,
+                        "usage": {"input": 30, "output": 4,
+                                  "cacheWrite": 0,
+                                  "cost": {"total": 0.0}}}},
+            separators=(",", ":")).encode()
+        tc._pi_line(opto, entry, NOW)
+        self.assertEqual(list(entry["prov"]), ["claude"])   # nowhere
+
+    def test_acc_version_bump_invalidates_pre_attribution_caches(self):
+        # an old cache (raw claude-bridge keys, acc_ver 2) starts clean
+        old = {"acc_ver": 2, "scanned_at": 0, "files": {
+            "/h/.pi/x.jsonl": {"kind": "pi", "last_ts": NOW, "prov": {
+                "claude-bridge": {"days": {tc._local_date(NOW):
+                                           {"tok": 9}},
+                                  "mday": {}}}}}}
+        self.assertNotEqual(tc.ACC_VERSION, 2)
+        cache = old
+        if cache.get("acc_ver") != tc.ACC_VERSION:     # collect()'s rule
+            cache = {"acc_ver": tc.ACC_VERSION}
+        self.assertEqual(cache.get("files"), None)
+
+
 if __name__ == "__main__":
     unittest.main()

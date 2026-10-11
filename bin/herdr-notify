@@ -29,6 +29,10 @@ from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tendril_link  # canonical deep-link payloads; lives next to this file
+try:
+    import tendril_herdr   # the ONE §7.4 herdr resolver (recorded → env → detect)
+except ImportError:        # stale install: keep polling with the plain fallback
+    tendril_herdr = None
 
 # ---------- portable configuration + Herdr client detection ----------
 CONFIG_SEARCH = [
@@ -54,83 +58,29 @@ def load_config():
 CONFIG = load_config()
 
 
-def _herdr_candidates():
-    out = []
-    override = CONFIG.get("HERDR_BIN") or os.environ.get("HERDR_BIN")
-    if override:
-        out.append(os.path.expanduser(override))
+def _stale_herdr():              # no resolver module installed: first runnable
+    for cand in (CONFIG.get("HERDR_BIN"), os.environ.get("HERDR_BIN")):
+        cand = os.path.expanduser(cand or "")
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
     found = shutil.which("herdr")
     if found:
-        out.append(found)
-    # install.sh (~/.local/bin) and Homebrew locations: launchd/systemd PATHs omit them
+        return found
     for d in ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"):
         p = os.path.join(os.path.expanduser(d), "herdr")
-        if os.path.isfile(p):
-            out.append(p)
-    mise = os.path.expanduser("~/.local/share/mise/installs/herdr")
-    latest = os.path.join(mise, "latest", "herdr")
-    if os.path.isfile(latest):
-        out.append(latest)
-    if os.path.isdir(mise):
-        versions = []
-        for name in os.listdir(mise):
-            p = os.path.join(mise, name, "herdr")
-            if os.path.isfile(p):
-                versions.append((name, p))
-        versions.sort(key=lambda t: [int(x) if x.isdigit() else 0
-                                     for x in t[0].split(".")], reverse=True)
-        out += [p for _, p in versions]
-    seen, uniq = set(), []
-    for cand in out:
-        real = os.path.realpath(cand)
-        if real not in seen:
-            seen.add(real)
-            uniq.append(cand)
-    return uniq
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
 
 
-HERDR_VERDICTS = []
-
-
-def herdr_probe(path):
+if tendril_herdr is not None:
     try:
-        v = subprocess.run([path, "--version"], capture_output=True,
-                           text=True, timeout=6)
-        version = (v.stdout or v.stderr).strip() or "(no version output)"
-    except subprocess.TimeoutExpired:
-        return False, "no answer to --version (timeout)"
-    except OSError as e:
-        return False, f"not runnable: {e}"
-    try:
-        s = subprocess.run([path, "status"], capture_output=True,
-                           text=True, timeout=8)
-        txt = (s.stdout or "") + (s.stderr or "")
-    except subprocess.TimeoutExpired:
-        return False, f"{version}; status timed out"
-    except OSError as e:
-        return False, f"{version}; status failed: {e}"
-    running = re.search(r"status:\s*running", txt)
-    compatible = (re.search(r"endpoint_compatible:\s*yes", txt)
-                  or re.search(r"private_protocol_compatible:\s*yes", txt))
-    if running and compatible:
-        return True, f"{version} (protocol-compatible with running server)"
-    if running:
-        return False, f"{version} (INCOMPATIBLE with running server)"
-    return True, f"{version} (no running server detected)"
-
-
-def detect_herdr():
-    picked = None
-    for cand in _herdr_candidates():
-        ok, detail = herdr_probe(cand)
-        HERDR_VERDICTS.append((cand, ok, detail))
-        if ok:
-            picked = cand
-            break
-    return picked
-
-
-HERDR = detect_herdr()
+        HERDR = tendril_herdr.resolve(config=CONFIG,
+                                      env=os.environ)["bin"]
+    except Exception:              # the watcher must never die on resolve
+        HERDR = None
+else:
+    HERDR = _stale_herdr()
 ENV_FILE = (os.environ.get("NOTIFY_ENV")
             or os.path.expanduser("~/.config/remote-agents/notify.env"))
 POLL_SECONDS = 8

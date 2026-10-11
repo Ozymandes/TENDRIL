@@ -564,14 +564,19 @@ def _render_unit(body, python):
 
 
 def refresh_schedule(pkg_dir, run=_run, dry_run=False, out=None,
-                     home_dir=None, which=shutil.which, python=None):
+                     home_dir=None, which=shutil.which, python=None,
+                     ensure=False):
     """Install/refresh the scheduler units (tendril-schedule.service and
     tendril-schedule.timer, LINK-CONTRACT-0.2 §3) beside the watcher unit,
     mirroring the watcher refresh: write each unit only when its content
     differs, daemon-reload only when something was written, and
-    `enable --now` the timer only then (or when it is not active). A
-    launchd host or a machine without a user systemd is the documented
-    no-op (macOS ticks by hand; docs/MACOS.md). Never raises; 0 ok."""
+    `enable --now` the timer only then (or when it is not active).
+    ensure=True (`./install --upgrade`): ALWAYS daemon-reload + enable
+    --now — a timer stopped out-of-band (e.g. during recovery testing)
+    must come back on the next upgrade (§7.4) — and the final timer state
+    is reported either way. A launchd host or a machine without a user
+    systemd is the documented no-op (macOS ticks by hand; docs/MACOS.md).
+    Never raises; 0 ok."""
     out = out or sys.stdout
     if which("launchctl"):
         # launchd host (backend()'s precedence): macOS runs the tick by hand
@@ -615,36 +620,47 @@ def refresh_schedule(pkg_dir, run=_run, dry_run=False, out=None,
         print("  [dry-run] scheduler: daemon-reload + enable --now %s"
               % SCHEDULE_TIMER, file=out)
         return 0
-    if changed:
+    if changed or ensure:
         run(["systemctl", "--user", "daemon-reload"], 8)
         rc, _, _ = run(["systemctl", "--user", "enable", "--now",
                         SCHEDULE_TIMER], 8)
         print("  scheduler: timer %s" % ("enabled" if rc == 0
                                           else "enable FAILED"), file=out)
-        return 0 if rc == 0 else 1
-    dst = os.path.join(unit_dir, SCHEDULE_TIMER)
-    if not os.path.isfile(dst):
-        print("  scheduler: timer not installed - skipped", file=out)
-        return 0
+        if rc != 0:
+            return 1
+    else:
+        dst = os.path.join(unit_dir, SCHEDULE_TIMER)
+        if not os.path.isfile(dst):
+            print("  scheduler: timer not installed - skipped", file=out)
+            return 0
+        _, state, _ = run(["systemctl", "--user", "is-active", SCHEDULE_TIMER], 5)
+        if state.strip() == "active":
+            print("  scheduler: timer active", file=out)
+            return 0
+        rc, _, _ = run(["systemctl", "--user", "enable", "--now", SCHEDULE_TIMER], 8)
+        print("  scheduler: timer was inactive - %s"
+              % ("enabled" if rc == 0 else "enable FAILED"), file=out)
+        if rc != 0:
+            return 1
     _, state, _ = run(["systemctl", "--user", "is-active", SCHEDULE_TIMER], 5)
-    if state.strip() == "active":
-        print("  scheduler: timer active", file=out)
-        return 0
-    rc, _, _ = run(["systemctl", "--user", "enable", "--now", SCHEDULE_TIMER], 8)
-    print("  scheduler: timer was inactive - %s"
-          % ("enabled" if rc == 0 else "enable FAILED"), file=out)
-    return 0 if rc == 0 else 1
+    print("  scheduler: timer is %s"
+          % (state.strip() or "unknown"), file=out)
+    return 0
 
 
 def refresh_guardian(pkg_dir, run=_run, dry_run=False, out=None,
-                     home_dir=None, which=shutil.which, python=None):
+                     home_dir=None, which=shutil.which, python=None,
+                     ensure=False):
     """Install/refresh the guardian units (tendril-guardian.service and
     tendril-guardian.timer, LINK-CONTRACT-0.2 §6) beside the scheduler
     units: write each unit only when its content differs, daemon-reload
     only when something was written, and `enable --now` the timer only
-    then (or when it is not active). A launchd host or a machine without
-    a user systemd is the documented no-op (the guardian can be run by
-    hand: `remote-agents health tick`). Never raises; 0 ok.
+    then (or when it is not active). ensure=True (`./install --upgrade`):
+    ALWAYS daemon-reload + enable --now and report the final state, so a
+    stopped guardian timer comes back on the next upgrade (§7.4). A
+    launchd host or a machine without a user systemd is the documented
+    no-op (the guardian can be run by hand: `remote-agents health tick`).
+    Never raises; 0 ok.
 
     Self-contained on purpose: refresh_schedule (the scheduler's own
     refresh) is left strictly alone so the two refreshes never conflict.
@@ -692,26 +708,33 @@ def refresh_guardian(pkg_dir, run=_run, dry_run=False, out=None,
         print("  [dry-run] guardian: daemon-reload + enable --now %s"
               % GUARDIAN_TIMER, file=out)
         return 0
-    if changed:
+    if changed or ensure:
         run(["systemctl", "--user", "daemon-reload"], 8)
         rc, _, _ = run(["systemctl", "--user", "enable", "--now",
                         GUARDIAN_TIMER], 8)
         print("  guardian: timer %s" % ("enabled" if rc == 0
                                          else "enable FAILED"), file=out)
-        return 0 if rc == 0 else 1
-    dst = os.path.join(unit_dir, GUARDIAN_TIMER)
-    if not os.path.isfile(dst):
-        print("  guardian: timer not installed - skipped", file=out)
-        return 0
+        if rc != 0:
+            return 1
+    else:
+        dst = os.path.join(unit_dir, GUARDIAN_TIMER)
+        if not os.path.isfile(dst):
+            print("  guardian: timer not installed - skipped", file=out)
+            return 0
+        _, state, _ = run(["systemctl", "--user", "is-active", GUARDIAN_TIMER], 5)
+        if state.strip() == "active":
+            print("  guardian: timer active", file=out)
+            return 0
+        rc, _, _ = run(["systemctl", "--user", "enable", "--now",
+                        GUARDIAN_TIMER], 8)
+        print("  guardian: timer was inactive - %s"
+              % ("enabled" if rc == 0 else "enable FAILED"), file=out)
+        if rc != 0:
+            return 1
     _, state, _ = run(["systemctl", "--user", "is-active", GUARDIAN_TIMER], 5)
-    if state.strip() == "active":
-        print("  guardian: timer active", file=out)
-        return 0
-    rc, _, _ = run(["systemctl", "--user", "enable", "--now",
-                    GUARDIAN_TIMER], 8)
-    print("  guardian: timer was inactive - %s"
-          % ("enabled" if rc == 0 else "enable FAILED"), file=out)
-    return 0 if rc == 0 else 1
+    print("  guardian: timer is %s"
+          % (state.strip() or "unknown"), file=out)
+    return 0
 
 
 def backend(run=_run, which=shutil.which, env=None, dry_run=False, out=None):
@@ -894,13 +917,15 @@ def main(argv=None):
         pkg = _opt(argv, "--pkg", os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))))
         py = _opt(argv, "--python", sys.executable)
-        return refresh_schedule(pkg, dry_run=dry, python=py)
+        return refresh_schedule(pkg, dry_run=dry, python=py,
+                                ensure="--ensure" in argv)
     if words[:1] == ["guardian-unit"] and len(words) == 2 \
             and words[1] in ("install", "refresh"):
         pkg = _opt(argv, "--pkg", os.path.dirname(os.path.dirname(
             os.path.abspath(__file__))))
         py = _opt(argv, "--python", sys.executable)
-        return refresh_guardian(pkg, dry_run=dry, python=py)
+        return refresh_guardian(pkg, dry_run=dry, python=py,
+                                ensure="--ensure" in argv)
     if words[:1] == ["service"] and len(words) == 2:
         verb = words[1]
         b = backend(dry_run=dry)
