@@ -83,8 +83,11 @@ else:
     HERDR = _stale_herdr()
 ENV_FILE = (os.environ.get("NOTIFY_ENV")
             or os.path.expanduser("~/.config/remote-agents/notify.env"))
-POLL_SECONDS = 8
+POLL_SECONDS = 2   # D11 freshness: parent-state changes must reach the
+                   # phone's SYNC invalidation within ~1–3 s (herdr api
+                   # snapshot is ~6 ms; the poll cost is negligible)
 MIN_REPEAT = 90  # min seconds between pushes for the same pane
+SYNC_MIN_INTERVAL = 4  # min seconds between TENDRIL · SYNC pushes
 NUDGE_DEFAULT_MINUTES = 45  # "still working" nudge threshold (0 disables)
 MAX_TITLE_LABEL = 60        # title label cap (… suffix past this)
 MAX_CWD_CHARS = 28          # keep short cwds whole, else last two components
@@ -373,7 +376,70 @@ def push(state, pid, agent, cls, workspaces, cfg, allow_push, now,
         log(f"WARN push failed for {title}: {e}")
 
 
-def poll(state, cfg, allow_push):
+# ---------- D11 freshness: the TENDRIL · SYNC invalidation event ----------
+
+# Parent-level state changes (working/idle/done/blocked, agents appearing
+# or vanishing) are the host's push-visible signal for "the snapshot just
+# changed". A SYNC is a MIN-priority ntfy message the phone never surfaces:
+# its receiver answers with one debounced snapshot refresh (§7.6). It is
+# gated behind the TENDRIL event prefix so only paired phones react.
+# Child-level changes have no host-side event source (children are derived
+# from transcripts at snapshot time) and ride the app's fast foreground
+# cadence instead.
+
+def sync_enabled(cfg):
+    """NTFY_SYNC=0/false/no/off opts a host out of SYNC events (default on)."""
+    return str(cfg.get("NTFY_SYNC", "1")).strip().lower() not in (
+        "0", "false", "no", "off")
+
+
+def sync_digest(snap):
+    """Order-independent signature of herdr-visible parent state: one
+    (pane_id, status) row per agent. No labels, no cwd — the digest itself
+    never leaves the host; only the fact of a change does."""
+    rows = [(str(a.get("pane_id") or ""), str(a.get("agent_status") or ""))
+            for a in snap.get("agents", [])]
+    return tuple(sorted(rows))
+
+
+def send_sync(cfg, now, sync):
+    """One TENDRIL · SYNC push; stamps the bookkeeping on success only, so
+    a failed send stays pending and the next poll retries."""
+    try:
+        send(cfg, "TENDRIL · SYNC", "state changed", "min",
+             "arrows_clockwise")
+        sync["last"] = now
+        sync["pending"] = False
+        log("SYNC push")
+    except Exception as e:  # a failed sync must never kill the watcher
+        sync["pending"] = True
+        log(f"WARN sync push failed: {e}")
+
+
+def maybe_sync(sig, cfg, allow_push, now, sync):
+    """Track the digest across polls and push at most one SYNC per
+    [SYNC_MIN_INTERVAL]; a change inside the window is remembered and
+    flushed at the boundary (burst coalescing). Never raises."""
+    if not (allow_push and configured(cfg) and sync_enabled(cfg)):
+        sync["sig"] = sig
+        sync["pending"] = False
+        return
+    if sig == sync.get("sig"):
+        if sync.get("pending") \
+                and now - sync.get("last", 0.0) >= SYNC_MIN_INTERVAL:
+            send_sync(cfg, now, sync)
+        return
+    first = sync.get("sig") is None
+    sync["sig"] = sig
+    if first:
+        return                   # baseline: never push on the first sighting
+    if now - sync.get("last", 0.0) >= SYNC_MIN_INTERVAL:
+        send_sync(cfg, now, sync)
+    else:
+        sync["pending"] = True
+
+
+def poll(state, cfg, allow_push, sync=None):
     """One poll cycle. Returns True on success, False when snapshot failed.
 
     State is pane_id -> (status, status_since, last_push). The still-working
@@ -423,6 +489,8 @@ def poll(state, cfg, allow_push):
     for pid in list(state):
         if pid not in seen:
             del state[pid]  # pane/agent gone; silent by design
+    if sync is not None:
+        maybe_sync(sync_digest(snap), cfg, allow_push, now, sync)
     return True
 
 
@@ -432,16 +500,21 @@ def watch():
         log(f"push NOT CONFIGURED - transitions will only be logged. "
             f"Create {ENV_FILE} (see notify.env.example).")
     state = {}
+    sync = {"sig": None, "last": 0.0, "pending": False}
     gap = False  # first failed poll must not hit an unbound local
     while True:
         sd_notify("WATCHDOG=1")  # feed systemd watchdog every cycle
-        if poll(state, cfg, allow_push=True):
+        if poll(state, cfg, allow_push=True, sync=sync):
             gap = False
         else:
             if not gap:
                 log("WARN herdr snapshot unreachable; will re-baseline on recovery")
             gap = True
             state.clear()  # re-baseline after outage: no stale notification storm
+            # the digest re-baselines too: an outage breaks continuity, so
+            # the first poll after recovery must never SYNC on stale deltas
+            sync["sig"] = None
+            sync["pending"] = False
         time.sleep(POLL_SECONDS)
 
 

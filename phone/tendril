@@ -242,6 +242,7 @@ esac
 ALIAS="${1:-$DEFAULT_ALIAS}"
 MODE=""
 ATTACH_ID=""
+SNAP_ETAG=""
 FORCE_SSH=""
 if [ "$1" = "ssh" ]; then
     ALIAS="${2:-$DEFAULT_ALIAS}"
@@ -251,8 +252,8 @@ else
         attach | resolve | focus | link | enter)
             MODE="$1"; ALIAS="$DEFAULT_ALIAS"; ATTACH_ID="${2:-}" ;;
         snapshot)
-            [ "$#" -eq 1 ] || { echo "usage: tendril [<alias>] snapshot"; exit 2; }
-            MODE="snapshot"; ALIAS="$DEFAULT_ALIAS" ;;
+            { [ "$#" -eq 1 ] || [ "$#" -eq 2 ]; } || { echo "usage: tendril [<alias>] snapshot [etag]"; exit 2; }
+            MODE="snapshot"; ALIAS="$DEFAULT_ALIAS"; SNAP_ETAG="${2:-}" ;;
         capacity)
             [ "$#" -eq 1 ] || { echo "usage: tendril [<alias>] capacity"; exit 2; }
             MODE="capacity"; ALIAS="$DEFAULT_ALIAS" ;;
@@ -275,8 +276,8 @@ else
                 attach | resolve | focus | link | enter)
                     MODE="$2"; ALIAS="$1"; ATTACH_ID="${3:-}" ;;
                 snapshot)
-                    [ "$#" -eq 2 ] || { echo "usage: tendril [<alias>] snapshot"; exit 2; }
-                    MODE="snapshot"; ALIAS="$1" ;;
+                    { [ "$#" -eq 2 ] || [ "$#" -eq 3 ]; } || { echo "usage: tendril [<alias>] snapshot [etag]"; exit 2; }
+                    MODE="snapshot"; ALIAS="$1"; SNAP_ETAG="${3:-}" ;;
                 capacity)
                     [ "$#" -eq 2 ] || { echo "usage: tendril [<alias>] capacity"; exit 2; }
                     MODE="capacity"; ALIAS="$1" ;;
@@ -299,8 +300,16 @@ REMOTE_BIN="${REMOTE_AGENTS_BIN:-remote-agents}"   # resolved on the HOST (login
 REMOTE_CMD="$REMOTE_BIN"
 
 if [ "$MODE" = "snapshot" ]; then
-    # snapshot takes NO session id: a fixed one-word remote command.
-    REMOTE_CMD="$REMOTE_BIN snapshot"
+    # snapshot takes NO session id: a fixed one-word remote command. The
+    # optional second argument is the previous document's content etag
+    # (D11 freshness): the host answers a tiny not-modified line when the
+    # document is unchanged. Regex-validated here, single-quoted there.
+    case "$SNAP_ETAG" in
+        "") REMOTE_CMD="$REMOTE_BIN snapshot" ;;
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+            REMOTE_CMD="$REMOTE_BIN snapshot --if-none-match '$SNAP_ETAG'" ;;
+        *) echo "usage: tendril [<alias>] snapshot [etag]   (etag: 16 lowercase hex)"; exit 2 ;;
+    esac
 elif [ "$MODE" = "capacity" ]; then
     # capacity is read-only and takes NO arguments: a fixed remote command.
     REMOTE_CMD="$REMOTE_BIN capacity --json"
