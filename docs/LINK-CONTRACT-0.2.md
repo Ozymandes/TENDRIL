@@ -268,6 +268,8 @@ Events: `{"kind":"tool","tool":"bash","at":…}` = tool completed; `{"kind":"err
 - Snapshot agents gain `"prompt_ready": true|false`, host-computed with the same rule (idle/done + known harness + agent present). The phone disables rows with a reason derived from status (Busy · Needs input · Not supported).
 - Task objects echo `"target":"new"|"existing"`.
 
+Pane ids are alphanumeric on real hosts (`w9:pB`, `wK:p1`): both ends validate `^[A-Za-z0-9]+:[A-Za-z0-9]+$`, never digit-only.
+
 Latency: the snapshot's schedule section reconciles RUNNING tasks against the live herdr state it already fetched (RUNNING ⇒ DONE when the pane's agent is idle/done after `started_at`; ⇒ DONE `session ended` when the pane is gone), persisting under a non-blocking flock (skip if busy). The tick stays authoritative; the snapshot never launches.
 
 ### 7.4 Health v2 (`health --json`, additive)
