@@ -235,3 +235,64 @@ the phone runs `health` once (single-flight, 8 s timeout):
 REVIVE HERDR runs `herdr restart`; success ⇒ immediate snapshot refresh
 and the panel resolves into LIVE; failure ⇒ the safe phrase inline +
 RETRY. Capability string: `health` (hosts without it ⇒ old behaviour).
+## 7 · RC2 addendum (binding — physical-certification fixes)
+
+Additive. Old phones ignore unknown keys; unknown enum words ⇒ UNKNOWN.
+
+### 7.1 Agent & child provenance (flat keys, agents and children)
+
+| key | meaning | rule |
+|---|---|---|
+| `provider` | upstream model vendor: `anthropic` `openai` `zai` `google` `mistral` … | canonical lowercase token; a bridge/proxy name is NEVER a provider |
+| `adapter` | bridge/proxy between harness and provider, e.g. `claude-bridge` | only when the harness routes through one; `[a-z0-9._-]{1,24}` |
+| `billing` | `metered` · `provider_managed` · `unknown` | `metered` only when the transcript's cost is a real per-call charge |
+| `cost_usd` | dollars | emitted **only** when `billing = metered`. A bridge/subscription route (e.g. Pi via claude-bridge writes `cost.total = 0`; Claude Code on a claude.ai OAuth login) ⇒ `provider_managed`, no `cost_usd`. Zero cost with non-zero tokens and no explicit metering ⇒ `unknown`, no `cost_usd`. |
+| `context_window` | tokens | only from an explicit local registry (Pi `~/.pi/agent/models-store.json` `contextWindow` for that provider+model, or bridge config that states it). **Never** a built-in table, never guessed from a model name. |
+| `context_window_source` | `pi_models_store` · `bridge_config` · `transcript` | required whenever `context_window` is present |
+
+Phone: `$x.xx` only for `metered`. `provider_managed` ⇒ "PROVIDER MANAGED" (+ "via <adapter>" when present). `unknown` / absent ⇒ "COST UNKNOWN". Context: `260K / 1M · 26%` when the window is present, else `260K · WINDOW UNKNOWN`.
+
+### 7.2 State semantics (no inferred blockers)
+
+Child `status` adds `stale`: no exit code, no terminal stop, quiet > `CHILD_ACTIVE_S`. `failed` ONLY on explicit evidence: non-zero `exitCode`, an explicit error stop reason, or an error as the child's final record with no later assistant turn. An earlier tool error followed by more work is NOT failure. Historical children are `done`, `stale` or `unknown` — never failed by inference.
+
+Phone UI vocabulary: RUNNING · THINKING · TOOL · WAITING · NEEDS INPUT · DONE · FAILED · STALE · UNKNOWN · IDLE. `NEEDS INPUT` = herdr `status: blocked`. **BLOCKED is not derived from anything on the current wire** (a tool error is an event, never a state). It is reserved for a future explicit blocker field.
+
+Events: `{"kind":"tool","tool":"bash","at":…}` = tool completed; `{"kind":"error","tool":"bash","at":…}` = that tool returned an error; `{"kind":"subagent","name":"worker","status":"done","at":…}` may carry the child name/status (optional).
+
+### 7.3 Scheduler destination (existing vs new session)
+
+`schedule add` JSON gains optional `"target"`:
+- absent or `{"kind":"new"}` ⇒ current behaviour (new pane, `harness` required).
+- `{"kind":"existing","pane":"w16:p5","harness":"pi","agent_started_at":1791580000}`. Host validates at add AND at launch: pane exists in `workspace`, hosts an agent of that harness, and (if given) the same `started_at` (pane-id reuse guard ⇒ FAILED `session changed`). At launch the agent must be idle or done; if working, the task stays READY and is retried each tick for ≤ 15 min, then FAILED `session busy`. herdr `status: blocked` ⇒ never dispatch (stays READY, same 15 min bound, then FAILED `session needs input`). Prompt via herdr's agent-prompt argv only; never typed into a terminal.
+- Snapshot agents gain `"prompt_ready": true|false`, host-computed with the same rule (idle/done + known harness + agent present). The phone disables rows with a reason derived from status (Busy · Needs input · Not supported).
+- Task objects echo `"target":"new"|"existing"`.
+
+Latency: the snapshot's schedule section reconciles RUNNING tasks against the live herdr state it already fetched (RUNNING ⇒ DONE when the pane's agent is idle/done after `started_at`; ⇒ DONE `session ended` when the pane is gone), persisting under a non-blocking flock (skip if busy). The tick stays authoritative; the snapshot never launches.
+
+### 7.4 Health v2 (`health --json`, additive)
+
+```jsonc
+"herdr": {"state":"running|down|stopped|mismatch|unknown",
+          "client_version":"0.9.3", "server_version":"0.8.2",   // optional
+          "binary":"recorded|detected|missing"},                // provenance word, never a path
+"scheduler": {"state":"active|degraded|inactive|absent",
+              "timer":"waiting|running|inactive|failed",
+              "last_tick":"ok|failed", "last_tick_at":1791583000},
+"guardian":  {"state":"active|degraded|inactive|absent", "timer":"…", "last_tick":"…"},
+"capacity":  {"state":"available|adapters_disabled|error|absent",
+              "enabled":["claude_local","claude_oauth"]}
+```
+A timer-driven oneshot whose service is inactive between ticks is HEALTHY (`state: active`, `timer: waiting`). `mismatch` = running server version ≠ recorded client version, or `herdr api` reports a protocol error.
+
+Herdr binary: the installer resolves the user's real Herdr (`--detect`: protocol-verified newest, mise/asdf/brew/~/.local aware, `readlink -f`) and records `HERDR_BIN=<abs>` + `HERDR_VERSION=` in the TENDRIL config; every host component (snapshot, health, guardian, scheduler, restart, launch, notify) uses the recorded path. Services never depend on PATH. A recorded path that vanished ⇒ re-detect, `binary: detected`, health `degraded`. `/usr/bin/herdr` is used only if it IS the recorded binary.
+
+`herdr restart` additionally: refuses on guard; stops only a TENDRIL-started stale/mismatched instance; starts the recorded binary; verifies server version == client version AND `api snapshot`; never leaves two servers.
+
+### 7.5 Capacity provider status
+
+When `state = unknown`, a provider carries `"reason":"adapter_disabled|auth_error|network_error|no_data|feature_missing"` and, for disabled network adapters, `"enable":"claude_oauth"` (the adapter id the user can enable). The phone renders: adapter_disabled ⇒ "Enable secure host reporting" + the exact host command; feature_missing ⇒ "Update TENDRIL on the host"; auth_error / network_error / no_data ⇒ their own sentence.
+
+### 7.6 Notification-driven invalidation (phone)
+
+Any received TENDRIL notification (TASK STARTED/WAITING/FAILED, agent finished, HERDR OFFLINE/RESTORED) schedules one snapshot refresh (debounce 1.5 s, single-flight, skipped when the app is backgrounded beyond the existing policy; HERDR events also refresh `health`). Background polling cadence is unchanged.
