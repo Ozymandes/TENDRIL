@@ -74,7 +74,7 @@ SNAPSHOT = {"result": {"snapshot": {
 }}}
 
 DOC_KEYS = {"version", "host", "generated_at", "focused_workspace",
-            "focused_pane", "workspaces", "capabilities", "health"}
+            "focused_pane", "workspaces", "capabilities", "health", "etag"}
 WS_KEYS = {"id", "label", "number", "focused", "agents"}
 AGENT_KEYS = {"pane_id", "tab_id", "agent", "status", "focused",
               "harness", "prompt_ready",
@@ -214,6 +214,54 @@ class SnapshotCommand(unittest.TestCase):
         self.assertEqual(self.main(["snapshot"]), 0)
         self.assertIn(["herdr", "api", "snapshot"], self.run_calls)
         self.assertEqual(self.doc()["version"], 3)
+
+    def test_etag_is_a_stable_16hex_content_tag(self):
+        self.assertEqual(self.main(["snapshot"]), 0)
+        doc = self.doc()
+        self.assertRegex(doc["etag"], r"^[0-9a-f]{16}$")
+        # same content (generated_at excluded) -> the SAME tag
+        self.out.seek(0)
+        self.out.truncate()
+        self.assertEqual(self.main(["snapshot"]), 0)
+        self.assertEqual(self.doc()["etag"], doc["etag"])
+
+    def test_if_none_match_on_unchanged_content_answers_tiny(self):
+        self.assertEqual(self.main(["snapshot"]), 0)
+        etag = self.doc()["etag"]
+        self.out.seek(0)
+        self.out.truncate()
+        self.assertEqual(self.main(["snapshot", "--if-none-match", etag]), 0)
+        doc = self.doc()
+        self.assertTrue(doc["not_modified"])
+        self.assertEqual(doc["etag"], etag)
+        self.assertNotIn("workspaces", doc)      # the tiny reply
+        self.assertLess(len(self.out.getvalue()), 400)
+
+    def test_if_none_match_on_changed_content_answers_full(self):
+        self.assertEqual(self.main(["snapshot"]), 0)
+        etag = self.doc()["etag"]
+        # the content changed underneath (a different herdr state):
+        changed = json.loads(json.dumps(SNAPSHOT))
+        changed["result"]["snapshot"]["agents"][0]["agent_status"] = "done"
+        self.out.seek(0)
+        self.out.truncate()
+        self.assertEqual(self.main(["snapshot", "--if-none-match", etag],
+                                   envelope=changed), 0)
+        doc = self.doc()
+        self.assertIsNone(doc.get("not_modified"))
+        self.assertNotEqual(doc["etag"], etag)   # new content, new tag
+        self.assertIn("workspaces", doc)
+
+    def test_if_none_match_validates_the_etag_shape(self):
+        for bad in ("ZZZ", "0123456789abcdef0", "", "0123456789ABCDEF"):
+            self.err.seek(0)
+            self.err.truncate(0)
+            self.out.seek(0)
+            self.out.truncate(0)
+            self.assertEqual(self.main(["snapshot", "--if-none-match", bad]),
+                             2, bad)
+            self.assertEqual(self.out.getvalue(), "")   # nothing on the wire
+            self.assertIn("usage", self.err.getvalue())
 
 
 class SnapshotLauncher(unittest.TestCase):
@@ -447,8 +495,8 @@ class OptionalSections(unittest.TestCase):
         self.assertEqual(doc["schedule"], {"available": True, "tasks": []})
         self.assertEqual(doc["health"], {"available": True})
         self.assertEqual(doc["capabilities"],
-                         ["subagents", "capacity", "schedule", "health",
-                          "titles"])
+                         ["subagents", "etag", "capacity", "schedule",
+                          "health", "titles"])
         self.assertLessEqual(ra._doc_bytes(doc), ra._SNAPSHOT_MAX_BYTES)
 
     def test_hook_failure_omits_the_section_from_the_doc(self):
@@ -472,7 +520,7 @@ class OptionalSections(unittest.TestCase):
         self.assertNotIn("capacity", doc)
         self.assertNotIn("schedule", doc)
         self.assertNotIn("health", doc)
-        self.assertEqual(doc["capabilities"], ["subagents", "titles"])
+        self.assertEqual(doc["capabilities"], ["subagents", "etag", "titles"])
 
 
 if __name__ == "__main__":

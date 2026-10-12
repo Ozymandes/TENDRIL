@@ -1635,7 +1635,9 @@ def _snapshot_doc():
         "focused_workspace": next((r["id"] for r in rows if r["focused"]), None),
         "focused_pane": focused_pane,
         "workspaces": workspaces,
-        "capabilities": ["subagents"],
+        # "etag": the phone may send `snapshot --if-none-match <etag>` and
+        # get a tiny not-modified line for unchanged polls (D11 freshness).
+        "capabilities": ["subagents", "etag"],
     }
     try:
         extra, caps = _optional_sections(snap)
@@ -1658,14 +1660,40 @@ def _snapshot_doc():
     return doc, 0
 
 
-def _snapshot_cmd():
-    """`snapshot [--json]` — non-interactive LIVE MAP document for the phone
-    (phone/tendril snapshot dials this over plain SSH). --json is accepted
-    and a no-op: the output is one compact JSON line either way. Exit codes:
-    0 ok, 1 Herdr unreachable (stdout empty, reason on stderr), 2 usage."""
+def _doc_etag(doc):
+    """16-hex content tag for the LIVE MAP document: sha256 over the doc
+    minus the volatile `generated_at` (and the `etag` key itself), so two
+    polls of an unchanged host produce the SAME tag and a poll may send it
+    back as `snapshot --if-none-match <etag>` to get a tiny not-modified
+    line instead of the ~45 KB document (D11 freshness: unchanged polls
+    must be cheap enough for a 2 s foreground cadence)."""
+    core = {k: v for k, v in doc.items()
+            if k not in ("generated_at", "etag")}
+    blob = json.dumps(core, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8", "replace")
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def _snapshot_cmd(if_none_match=None):
+    """`snapshot [--json] [--if-none-match <etag16>]` — non-interactive LIVE
+    MAP document for the phone (phone/tendril snapshot dials this over plain
+    SSH). --json is accepted and a no-op: the output is one compact JSON
+    line either way. With --if-none-match matching the document's content
+    etag, the reply is one tiny `{"not_modified":true,...}` line instead.
+    Exit codes: 0 ok, 1 Herdr unreachable (stdout empty, reason on stderr),
+    2 usage."""
     doc, code = _snapshot_doc()
     if doc is None:
         return code
+    etag = _doc_etag(doc)
+    doc["etag"] = etag
+    if if_none_match is not None and if_none_match == etag:
+        print(json.dumps({"version": doc["version"], "host": doc["host"],
+                          "generated_at": int(time.time()),
+                          "not_modified": True, "etag": etag,
+                          "capabilities": doc.get("capabilities", [])},
+                         separators=(",", ":")))
+        return 0
     print(json.dumps(doc, separators=(",", ":")))
     return 0
 
@@ -2753,10 +2781,23 @@ def main():
     if any(a in args for a in PHONE_FLAGS):
         return _phone(args)
     if args[:1] == ["snapshot"]:
-        if len(args) > 2 or (len(args) == 2 and args[1] != "--json"):
-            print("usage: remote-agents snapshot [--json]", file=sys.stderr)
+        rest = args[1:]
+        inm = None
+        if "--if-none-match" in rest:
+            i = rest.index("--if-none-match")
+            val = rest[i + 1] if i + 1 < len(rest) else None
+            if val is None or not re.match(r"^[0-9a-f]{16}$", val):
+                print("usage: remote-agents snapshot [--json] "
+                      "[--if-none-match <etag>]", file=sys.stderr)
+                return 2
+            inm = val
+            rest = rest[:i] + rest[i + 2:]
+        rest = [a for a in rest if a != "--json"]
+        if rest:
+            print("usage: remote-agents snapshot [--json] "
+                  "[--if-none-match <etag>]", file=sys.stderr)
             return 2
-        return _snapshot_cmd()
+        return _snapshot_cmd(if_none_match=inm)
     if args[:1] == ["capacity"]:
         return _capacity_cmd(args[1:])
     if args[:1] == ["schedule"]:
