@@ -996,11 +996,12 @@ def _emit(harness, entry, status, now, home=None):
                          if isinstance(e, dict)]
     kids = entry.get("children")
     if isinstance(kids, dict) and kids:
-        rows = sorted((ce for ce in kids.values() if isinstance(ce, dict)),
-                      key=_child_last, reverse=True)
+        rows = sorted(((p, ce) for p, ce in kids.items()
+                       if isinstance(ce, dict)),
+                      key=lambda kv: _child_last(kv[1]), reverse=True)
         children = [_child_emit(harness, ce, now, home,
-                                entry.get("provider"))
-                    for ce in rows[:CHILD_CAP]]
+                                entry.get("provider"), path=p)
+                    for p, ce in rows[:CHILD_CAP]]
         if children:
             out["children"] = children
     return out
@@ -1355,11 +1356,14 @@ def _child_status(ce, now):
     return "stale"
 
 
-def _child_emit(harness, ce, now, home=None, parent_provider=None):
+def _child_emit(harness, ce, now, home=None, parent_provider=None, path=None):
     """One wire child dict; unknown facts are omitted, never fabricated.
     §7.1 provenance rides on children too: the child transcript's own
     provider wins, falling back to the parent's route for children that
-    have recorded none."""
+    have recorded none. §11: a child also carries its display title — the
+    humanized role name plus the short task label derived from the child's
+    own first instruction (never just "subagent"); omitted when nothing
+    yields, and never containing transcript text."""
     home = home or HOME
     status = _child_status(ce, now)
     out = {"kind": "subagent", "harness": harness, "status": status}
@@ -1425,6 +1429,16 @@ def _child_emit(harness, ce, now, home=None, parent_provider=None):
         out["ended_at"] = int(ce["last_seen_at"])
     if ce.get("async"):
         out["async"] = True
+    if path:
+        try:
+            import tendril_titles
+            ct, csrc = tendril_titles.child_title(path, out.get("name"),
+                                                  home=home)
+            if ct and csrc:
+                out["title"] = ct
+                out["title_source"] = csrc
+        except Exception:
+            pass                            # titles never fail telemetry
     return out
 
 

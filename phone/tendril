@@ -173,7 +173,7 @@ no_alias_help() {
     echo "  set a default:  echo <alias> > ~/.config/tendril/alias"
     echo "                  (or: echo 'export TENDRIL_ALIAS=<alias>' >> ~/.bashrc)"
     echo "usage: tendril [<alias>] [attach|enter|resolve|focus|link <session-id>|snapshot] | tendril ssh <alias>"
-    echo "       tendril [<alias>] [schedule show|cancel <id> | schedule add <payload> | capacity | health | herdr restart] | tendril link"
+    echo "       tendril [<alias>] [schedule show|cancel <id> | schedule add <payload> | capacity | health | herdr restart | rename <pane> <title|--clear>] | tendril link"
     echo "first time: see docs/ANDROID.md or docs/MACOS.md — create a key, then: ssh-copy-id <alias>"
 }
 
@@ -270,6 +270,9 @@ else
         schedule)
             { [ "$#" -eq 2 ] || [ "$#" -eq 3 ]; } || { echo "usage: tendril [<alias>] schedule show|add|cancel <arg>"; exit 2; }
             MODE="schedule"; ALIAS="$DEFAULT_ALIAS"; SCHED_SUB="${2:-}"; SCHED_ARG="${3:-}" ;;
+        rename)
+            { [ "$#" -eq 3 ] || [ "$#" -eq 4 ]; } || { echo "usage: tendril [<alias>] rename <pane> <title|--clear>"; exit 2; }
+            MODE="rename"; ALIAS="$DEFAULT_ALIAS"; RENAME_PANE="${2:-}"; RENAME_TITLE="${3:-}" ;;
         *)
             case "${2:-}" in
                 attach | resolve | focus | link | enter)
@@ -292,6 +295,9 @@ else
                 schedule)
                     { [ "$#" -eq 3 ] || [ "$#" -eq 4 ]; } || { echo "usage: tendril [<alias>] schedule show|add|cancel <arg>"; exit 2; }
                     MODE="schedule"; ALIAS="$1"; SCHED_SUB="${3:-}"; SCHED_ARG="${4:-}" ;;
+                rename)
+                    { [ "$#" -eq 4 ] || [ "$#" -eq 5 ]; } || { echo "usage: tendril [<alias>] rename <pane> <title|--clear>"; exit 2; }
+                    MODE="rename"; ALIAS="$1"; RENAME_PANE="${3:-}"; RENAME_TITLE="${4:-}" ;;
             esac ;;
     esac
 fi
@@ -363,6 +369,33 @@ elif [ "$MODE" = "schedule" ]; then
             echo "usage: tendril [<alias>] schedule show|add|cancel <arg>"
             exit 2 ;;
     esac
+elif [ "$MODE" = "rename" ]; then
+    # DESIGN-FINAL-POLISH §11: the session's manual label. The pane and the
+    # title are validated HERE against the same rules the host enforces
+    # (pane w<alnum>:p<alnum>; title 1..48 chars from a printable whitelist
+    # — no quote, no control chars), then single-quoted into the remote
+    # command. The host re-sanitizes; a stale/unknown pane is refused there.
+    # same pane grammar the schedule add-target check uses (contract §7.3):
+    # w<alnum>+ : p<alnum>+ — never a bare workspace, never another prefix
+    printf '%s' "$RENAME_PANE" | grep -qE '^w[0-9A-Za-z]+:p[0-9A-Za-z]+$' \
+        || { echo "usage: tendril [<alias>] rename <pane> <title|--clear>   (pane: w16:pA)"; exit 2; }
+    if [ "$RENAME_TITLE" = "--clear" ]; then
+        RENAME_ARG="--clear"
+    else
+        # a single quote would break the host-side quoting; anything a
+        # printable-title whitelist rejects is refused here (1..48 chars;
+        # the host re-sanitizes: control chars stripped, collapsed, trimmed)
+        case "$RENAME_TITLE" in
+            "" | *\'*)
+                echo "usage: tendril [<alias>] rename <pane> <title|--clear>   (title: 1..48 printable chars, no quotes)"
+                exit 2 ;;
+        esac
+        printf '%s' "$RENAME_TITLE" \
+            | grep -qE '^[A-Za-z0-9 .,:!?&+/_#@%-]{1,48}$' \
+            || { echo "usage: tendril [<alias>] rename <pane> <title|--clear>   (title: 1..48 printable chars, no quotes)"; exit 2; }
+        RENAME_ARG="$RENAME_TITLE"
+    fi
+    REMOTE_CMD="$REMOTE_BIN rename-session '$RENAME_PANE' '$RENAME_ARG'"
 elif [ -n "$MODE" ]; then
     BAD=""
     case "$ATTACH_ID" in
@@ -398,7 +431,7 @@ case "$MODE" in
         _t_log transport-chosen-ssh
         _t_log ssh-exec
         exec ssh $SESSION_CM_OPTS "$ALIAS" "$REMOTE_CMD" ;;
-    snapshot | schedule | capacity | health | herdr)
+    snapshot | schedule | capacity | health | herdr | rename)
         _t_log transport-chosen-ssh
         _t_log ssh-exec
         exec ssh -o BatchMode=yes -o ConnectTimeout=6 $BATCH_CM_OPTS \
