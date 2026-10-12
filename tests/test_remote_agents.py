@@ -502,6 +502,8 @@ class DirectoryInheritance(unittest.TestCase):
 
     def test_removed_p_s_l_t_keys_do_not_dispatch_menu_actions(self):
         rows = [{"id": "w1", "focused": True}]
+        tmpdir = tempfile.mkdtemp(prefix="tendril selector keys ")
+        self.addCleanup(shutil.rmtree, tmpdir, True)
         with contextlib.ExitStack() as stack:
             stack.enter_context(mock.patch.object(ra, "render"))
             stack.enter_context(mock.patch.object(
@@ -513,6 +515,10 @@ class DirectoryInheritance(unittest.TestCase):
             last = stack.enter_context(mock.patch.object(ra, "load_last"))
             run = stack.enter_context(mock.patch.object(ra, "run"))
             stack.enter_context(mock.patch.object(ra, "collect", return_value=rows))
+            # The L/l presses leave the phone-consumed link-open flag — land
+            # it in a throwaway HOME, never in the operator's real state.
+            stack.enter_context(mock.patch.dict(os.environ, {"HOME": tmpdir}))
+            os.environ.pop("SSH_CONNECTION", None)
             ra.menu_loop(rows, tty_mode=False)
         project.assert_not_called()
         shell.assert_not_called()
