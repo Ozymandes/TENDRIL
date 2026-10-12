@@ -19,3 +19,4 @@ tendril_telemetry.py
 tendril_schedule.py
 tendril_capacity.py
 tendril_health.py
+tendril_titles.py

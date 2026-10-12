@@ -1076,6 +1076,26 @@ class ChildStatusMapping(ChildBase):
         self.assertEqual(k["status"], "done")
         self.assertEqual(k["ended_at"], NOW - 100)
 
+    def test_terminal_stop_is_done_immediately_fresh_quiet(self):
+        """D11 freshness: the transcript's own end-of-run record is
+        explicit evidence — `done` the moment it is scanned, never held
+        for a 20 s quiet window."""
+        k = self.scenario([
+            pi_session_header(NOW - 100, id="x"),
+            pi_user(NOW - 20, "child prompt"),
+            pi_assistant_stop(NOW - 2, pi_usage(1, 1, 0, 0, 0.0))])
+        self.assertEqual(k["status"], "done")
+        self.assertEqual(k["ended_at"], NOW - 2)
+
+    def test_a_prompt_newer_than_the_stop_is_working_again(self):
+        """D11 guard: multi-turn same-dir children prompt again after a
+        stop — the newer prompt wins and the child is `working` again."""
+        k = self.scenario([
+            pi_session_header(NOW - 100, id="x"),
+            pi_assistant_stop(NOW - 50, pi_usage(1, 1, 0, 0, 0.0)),
+            pi_user(NOW - 2, "another turn")])
+        self.assertEqual(k["status"], "working")
+
     def test_error_then_quiet_is_failed(self):
         k = self.scenario([
             pi_session_header(NOW - 200, id="x"),

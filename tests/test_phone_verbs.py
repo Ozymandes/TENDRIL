@@ -174,6 +174,23 @@ class FixedVerbs(LauncherEnv):
         self.assertEqual(self.calls(), [])
         self.assertIn("usage", p.stdout + p.stderr)
 
+    def test_snapshot_etag_is_forwarded_single_quoted(self):
+        p = self.run_launcher(["testhost", "snapshot", "0123456789abcdef"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.calls(),
+                         ["ssh -o BatchMode=yes -o ConnectTimeout=6 "
+                          + BATCH_CM +
+                          " testhost remote-agents snapshot"
+                          " --if-none-match '0123456789abcdef'"])
+
+    def test_snapshot_malformed_etag_is_refused_without_dialing(self):
+        for bad in ("ZZTOOLONG99999", "0123456789ABCDEF",
+                    "0123456789abcdef0", "a; b"):
+            p = self.run_launcher(["testhost", "snapshot", bad])
+            self.assertEqual(p.returncode, 2, bad)
+            self.assertEqual(self.calls(), [], bad)
+            self.assertIn("usage", p.stdout + p.stderr)
+
     def test_snapshot_explicit_alias_extra_arg_is_refused(self):
         p = self.run_launcher(["testhost", "snapshot", "--evil"])
         self.assertEqual(p.returncode, 2)

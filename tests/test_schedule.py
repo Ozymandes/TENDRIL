@@ -1096,11 +1096,16 @@ exit 0
             calls = [ln.rstrip("\n").rstrip("\t").split("\t")
                      for ln in f if ln.startswith(("tab\t", "agent\t"))]
         # §7.3: the herdr agent-prompt argv ONLY — never a new pane,
-        # never agent start
+        # never agent start. D10: --wait carries the full --until match
+        # set — rc 0 is herdr's pickup/completion proof, not a 15 s
+        # completion race (a >15 s turn used to stamp FAILED `prompt
+        # rejected` while the agent kept working).
         self.assertEqual(calls,
                          [["agent", "prompt", "w15:p5",
                            "Audit the architecture and report findings",
-                           "--wait", "--timeout", "15000"]])
+                           "--wait", "--until", "working",
+                           "--until", "blocked", "--until", "idle",
+                           "--until", "done", "--timeout", "15000"]])
         disk = self.ondisk()["tasks"][0]
         self.assertEqual(disk["state"], "RUNNING")
         self.assertEqual(disk["pane_id"], "w15:p5")
@@ -1129,7 +1134,9 @@ exit 0
         self.assertEqual(calls[2],
                          ["agent", "prompt", "w15:p9",
                           "Audit the architecture and report findings",
-                          "--wait", "--timeout", "15000"])
+                          "--wait", "--until", "working",
+                          "--until", "blocked", "--until", "idle",
+                          "--until", "done", "--timeout", "15000"])
         disk = self.ondisk()["tasks"][0]
         self.assertEqual(disk["state"], "RUNNING")
         self.assertEqual(disk["pane_id"], "w15:p9")
@@ -1648,6 +1655,122 @@ class ReconcileTests(Base):
         self.assertEqual(row["state"], ts.DONE)
         done = [t for t in sec["tasks"] if t["id"] == row["id"]]
         self.assertEqual(done[0]["state"], ts.DONE)
+
+
+# ---------------------------------------------------------------------
+# D10 (§13 release blocker): the REAL launcher argv — remote-agents'
+# _schedule_launcher — mocked at the subprocess boundary (ra.run). The
+# launch acknowledgment is herdr's pickup proof (`--wait` + the full
+# --until match set), never a 15 s completion race: a turn longer than
+# the timeout used to stamp FAILED `prompt rejected` AFTER herdr had
+# accepted the prompt (reproduced live 2026-10-11, workspace tendril-cert:
+# a 25 s sleep task FAILED at +15 s while the pane answered at +40 s).
+# ---------------------------------------------------------------------
+RA = load_mod("remote_agents_under_test", CLI)
+
+
+class ScheduleLauncherArgvTests(unittest.TestCase):
+    """_schedule_launcher(task) at the herdr subprocess boundary: exact
+    argv per path, contract phrases on failure, pane id on success."""
+
+    PROMPT = "Audit the architecture and report findings"
+    UNTIL = ["--wait", "--until", "working", "--until", "blocked",
+             "--until", "idle", "--until", "done", "--timeout", "15000"]
+
+    def task(self, target=None):
+        return {"id": "t-20261011-1a2b3c4d", "title": "t",
+                "prompt": self.PROMPT, "workspace": "w15",
+                "harness": "pi", "pane_id": None,
+                "target": target if target is not None
+                else {"kind": "existing", "pane": "w15:p5",
+                      "harness": "pi"}}
+
+    def run_launcher(self, results, target=None, herdr="hd"):
+        """results: list of (rc, out, err) consumed by ra.run calls in
+        order; returns ((ok, pane_id, err), argv_calls)."""
+        calls = []
+
+        def fake_run(argv, timeout=None):
+            calls.append((list(argv), timeout))
+            rc, out, err = results[min(len(calls) - 1, len(results) - 1)]
+            return rc, out, err
+
+        real_run, real_herdr = RA.run, RA.HERDR
+        RA.run, RA.HERDR = fake_run, herdr
+        try:
+            launch = RA._schedule_launcher()
+            return launch(self.task(target)), calls
+        finally:
+            RA.run, RA.HERDR = real_run, real_herdr
+
+    def test_existing_target_prompts_the_pane_with_pickup_ack(self):
+        (ok, pane_id, err), calls = self.run_launcher([(0, "{}", "")])
+        self.assertTrue(ok)
+        self.assertEqual(pane_id, "w15:p5")
+        self.assertIsNone(err)
+        self.assertEqual(calls, [(["hd", "agent", "prompt", "w15:p5",
+                                   self.PROMPT] + self.UNTIL, 25)])
+
+    def test_existing_target_herdr_timeout_is_prompt_rejected(self):
+        # herdr's own --timeout fires (rc 124 through ra.run): the only
+        # honest reading is 'no execution evidence' — the phrase stays the
+        # contract's and the pane id is never recorded.
+        (ok, pane_id, err), calls = self.run_launcher([(124, "", "timeout")])
+        self.assertFalse(ok)
+        self.assertIsNone(pane_id)
+        self.assertEqual(err, "prompt rejected")
+        self.assertEqual(len(calls), 1)
+
+    def test_existing_target_blocked_refusal_is_prompt_rejected(self):
+        (ok, pane_id, err), _ = self.run_launcher([(1, "", "agent_blocked")])
+        self.assertFalse(ok)
+        self.assertIsNone(pane_id)
+        self.assertEqual(err, "prompt rejected")
+
+    def test_existing_target_malformed_pane_never_reaches_herdr(self):
+        (ok, pane_id, err), calls = self.run_launcher(
+            [(0, "{}", "")],
+            target={"kind": "existing", "pane": "w15:p5; rm",
+                    "harness": "pi"})
+        self.assertFalse(ok)
+        self.assertEqual(err, "launch refused")
+        self.assertEqual(calls, [])
+
+    def test_new_target_full_argv_sequence_with_pickup_ack(self):
+        tab_out = ('{"result":{"pane":{"pane_id":"w15:p9",'
+                   '"tab_id":"w15:t9"}}}')
+        (ok, pane_id, err), calls = self.run_launcher(
+            [(0, tab_out, ""), (0, "{}", ""), (0, "{}", "")],
+            target={"kind": "new"})
+        self.assertTrue(ok)
+        self.assertEqual(pane_id, "w15:p9")
+        self.assertIsNone(err)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(calls[0][0],
+                         ["hd", "tab", "create", "--workspace", "w15",
+                          "--label", "tendril-1a2b3c4d", "--no-focus"])
+        self.assertEqual(calls[1][0],
+                         ["hd", "agent", "start", "tendril-1a2b3c4d",
+                          "--kind", "pi", "--pane", "w15:p9",
+                          "--timeout", "30000"])
+        self.assertEqual(calls[2][0],
+                         ["hd", "agent", "prompt", "w15:p9", self.PROMPT]
+                         + self.UNTIL)
+
+    def test_new_target_tab_create_failure_is_workspace_missing(self):
+        (ok, pane_id, err), calls = self.run_launcher(
+            [(1, "", "no such workspace")], target={"kind": "new"})
+        self.assertFalse(ok)
+        self.assertIsNone(pane_id)
+        self.assertEqual(err, "workspace missing")
+        self.assertEqual(len(calls), 1)
+
+    def test_no_herdr_is_launch_refused(self):
+        (ok, pane_id, err), calls = self.run_launcher(
+            [(0, "{}", "")], herdr=None)
+        self.assertFalse(ok)
+        self.assertEqual(err, "launch refused")
+        self.assertEqual(calls, [])
 
 
 if __name__ == "__main__":

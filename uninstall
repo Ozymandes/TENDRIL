@@ -106,6 +106,12 @@ else
     done
 fi
 
+# the Pi session auto-titler extension (§11) — one file we installed
+if [ -f "$HOME/.pi/agent/extensions/tendril-session-title.ts" ]; then
+    rm -f "$HOME/.pi/agent/extensions/tendril-session-title.ts"
+    say "removed: ~/.pi/agent/extensions/tendril-session-title.ts"
+fi
+
 # bin timestamped backups created by the installer are leftovers too
 ls "$BIN_DIR"/remote-agents.bak.* "$BIN_DIR"/herdr-notify.bak.* >/dev/null 2>&1 \
     && say "note: .bak.* copies remain in $BIN_DIR (review before deleting)"

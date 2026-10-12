@@ -122,6 +122,19 @@ phone_snapshot() {
     done
 }
 
+# pi_extension - the session auto-titler (DESIGN-FINAL-POLISH §11) rides
+# with the host install and upgrade, the same way Herdr's own integration
+# sits in ~/.pi/agent/extensions: ONE copied file, mode 644, idempotent.
+# pi loads every extension in that directory; the extension does the rest
+# (it is inert when its session already has a name or is a subagent child).
+PI_EXT_DIR="$HOME/.pi/agent/extensions"
+pi_extension() {
+    act "create $PI_EXT_DIR" mkdir -p "$PI_EXT_DIR" || return 1
+    act "install $PI_EXT_DIR/tendril-session-title.ts" \
+        install_atomic 644 "$PKG_DIR/pi/tendril-session-title.ts" \
+            "$PI_EXT_DIR/tendril-session-title.ts"
+}
+
 # ---------------- herdr config merge (shared: install and upgrade) -------
 # plan|apply the managed detach/switch set only; unrelated lines and
 # conflicts are never touched, every write is backed up first and rolled
@@ -406,6 +419,7 @@ upgrade_install() {
         act "link $BIN_DIR/tendril -> remote-agents" ln -sfn remote-agents "$BIN_DIR/tendril"
     fi
     phone_snapshot
+    pi_extension
     say ""
     say "1b) Herdr binary record (contract §7.4)"
     record_herdr
@@ -694,6 +708,7 @@ else
     act "link $BIN_DIR/tendril -> remote-agents" ln -sfn remote-agents "$BIN_DIR/tendril"
 fi
 phone_snapshot
+pi_extension
 path_hint
 # provenance is recorded the moment the files are in place: everything
 # downstream (the version self-check below, tendril --upgrade later) reads

@@ -415,6 +415,7 @@ def _pi_obj(d, entry):
             entry["effort"] = m["thinkingLevel"]
         if isinstance(m.get("stopReason"), str):
             entry["stop_reason"] = m["stopReason"]
+            entry["stop_at"] = ts
         u = m.get("usage")
         if isinstance(u, dict):
             c = u.get("cost")
@@ -517,6 +518,7 @@ def _cl_obj(d, entry):
         sr = m.get("stop_reason")
         if isinstance(sr, str):
             entry["stop_reason"] = sr
+            entry["stop_at"] = ts
         u = m.get("usage")
         if isinstance(u, dict):
             _cl_usage(entry, _num(u.get("output_tokens")),
@@ -996,11 +998,12 @@ def _emit(harness, entry, status, now, home=None):
                          if isinstance(e, dict)]
     kids = entry.get("children")
     if isinstance(kids, dict) and kids:
-        rows = sorted((ce for ce in kids.values() if isinstance(ce, dict)),
-                      key=_child_last, reverse=True)
+        rows = sorted(((p, ce) for p, ce in kids.items()
+                       if isinstance(ce, dict)),
+                      key=lambda kv: _child_last(kv[1]), reverse=True)
         children = [_child_emit(harness, ce, now, home,
-                                entry.get("provider"))
-                    for ce in rows[:CHILD_CAP]]
+                                entry.get("provider"), path=p)
+                    for p, ce in rows[:CHILD_CAP]]
         if children:
             out["children"] = children
     return out
@@ -1322,11 +1325,13 @@ def _child_status(ce, now):
     """done | failed | working | tool | thinking | stale | unknown per
     contract 0.2 §7.2. exitCode wins; then explicit error evidence (an
     error stop reason, or an error as the FINAL record with no later
-    assistant turn); otherwise a terminal stop → done; the active-window
-    rules are unchanged; quiet past the active window with no terminal
-    evidence → stale; unknown only with no timestamps at all. An earlier
-    tool error followed by more work is NEVER a failure, and historical
-    children are done/stale/unknown — never failed by inference."""
+    assistant turn); then an explicit terminal stop → done immediately
+    (D11: the transcript's own end-of-run record is evidence, not an
+    inference); otherwise the active-window rules; quiet past the active
+    window with no terminal evidence → stale; unknown only with no
+    timestamps at all. An earlier tool error followed by more work is
+    NEVER a failure, and historical children are done/stale/unknown —
+    never failed by inference."""
     code = (ce.get("meta") or {}).get("exitCode")
     if isinstance(code, int):
         return "done" if code == 0 else "failed"
@@ -1338,10 +1343,20 @@ def _child_status(ce, now):
         return "failed"
     if quiet >= CHILD_QUIET_S and _error_is_final(ce):
         return "failed"
-    if quiet <= CHILD_ACTIVE_S:
-        if _terminal_stop(ce.get("stop_reason")) \
-                and quiet >= CHILD_QUIET_S:
+    # An explicit terminal stop is the run's own end-of-run record, not an
+    # inference: it is 'done' the moment it is scanned (D11 freshness — the
+    # old quiet >= CHILD_QUIET_S gate delayed a finished child ~20 s even
+    # when the transcript already said the run ended; only INFERRED done
+    # states need the anti-flap window). Guard: a NEWER prompt means the
+    # child started another turn (multi-turn same-dir children) — then the
+    # active-window rules below decide, as before.
+    if _terminal_stop(ce.get("stop_reason")):
+        sa = ce.get("stop_at")
+        rp = ce.get("last_prompt_at")
+        if not isinstance(sa, (int, float)) or \
+                not isinstance(rp, (int, float)) or rp <= sa:
             return "done"
+    if quiet <= CHILD_ACTIVE_S:
         if ce.get("open_calls"):
             return "tool"
         ap = ce.get("last_assistant_at")
@@ -1350,16 +1365,17 @@ def _child_status(ce, now):
                                              or rp >= ap):
             return "working"
         return "thinking"
-    if _terminal_stop(ce.get("stop_reason")):
-        return "done"
     return "stale"
 
 
-def _child_emit(harness, ce, now, home=None, parent_provider=None):
+def _child_emit(harness, ce, now, home=None, parent_provider=None, path=None):
     """One wire child dict; unknown facts are omitted, never fabricated.
     §7.1 provenance rides on children too: the child transcript's own
     provider wins, falling back to the parent's route for children that
-    have recorded none."""
+    have recorded none. §11: a child also carries its display title — the
+    humanized role name plus the short task label derived from the child's
+    own first instruction (never just "subagent"); omitted when nothing
+    yields, and never containing transcript text."""
     home = home or HOME
     status = _child_status(ce, now)
     out = {"kind": "subagent", "harness": harness, "status": status}
@@ -1425,6 +1441,16 @@ def _child_emit(harness, ce, now, home=None, parent_provider=None):
         out["ended_at"] = int(ce["last_seen_at"])
     if ce.get("async"):
         out["async"] = True
+    if path:
+        try:
+            import tendril_titles
+            ct, csrc = tendril_titles.child_title(path, out.get("name"),
+                                                  home=home)
+            if ct and csrc:
+                out["title"] = ct
+                out["title_source"] = csrc
+        except Exception:
+            pass                            # titles never fail telemetry
     return out
 
 

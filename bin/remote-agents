@@ -1623,6 +1623,12 @@ def _enforce_doc_cap(doc):
                   "output_tokens", "context_tokens", "started_at",
                   "effort", "provider", "model"):
             a.pop(k, None)
+    # titles are the PRIMARY identity (§11): the last thing to go
+    for a in agents:
+        if _doc_bytes(doc) <= _SNAPSHOT_MAX_BYTES:
+            return
+        for k in ("title", "title_source"):
+            a.pop(k, None)
 
 
 def _snapshot_doc():
@@ -1673,7 +1679,9 @@ def _snapshot_doc():
         "focused_workspace": next((r["id"] for r in rows if r["focused"]), None),
         "focused_pane": focused_pane,
         "workspaces": workspaces,
-        "capabilities": ["subagents"],
+        # "etag": the phone may send `snapshot --if-none-match <etag>` and
+        # get a tiny not-modified line for unchanged polls (D11 freshness).
+        "capabilities": ["subagents", "etag"],
     }
     try:
         extra, caps = _optional_sections(snap)
@@ -1682,18 +1690,54 @@ def _snapshot_doc():
                                 if c not in doc["capabilities"]]
     except Exception:                # hooks must never fail the map
         pass
+    # Session titles (DESIGN-FINAL-POLISH §11): one resolved `title` +
+    # `title_source` per agent, additive and best-effort — any failure just
+    # leaves the fields off and the phone falls back to the harness name.
+    try:
+        import tendril_titles
+        tendril_titles.annotate_document(doc, rows)
+        if "titles" not in doc["capabilities"]:
+            doc["capabilities"].append("titles")
+    except Exception:
+        pass
     _enforce_doc_cap(doc)
     return doc, 0
 
 
-def _snapshot_cmd():
-    """`snapshot [--json]` — non-interactive LIVE MAP document for the phone
-    (phone/tendril snapshot dials this over plain SSH). --json is accepted
-    and a no-op: the output is one compact JSON line either way. Exit codes:
-    0 ok, 1 Herdr unreachable (stdout empty, reason on stderr), 2 usage."""
+def _doc_etag(doc):
+    """16-hex content tag for the LIVE MAP document: sha256 over the doc
+    minus the volatile `generated_at` (and the `etag` key itself), so two
+    polls of an unchanged host produce the SAME tag and a poll may send it
+    back as `snapshot --if-none-match <etag>` to get a tiny not-modified
+    line instead of the ~45 KB document (D11 freshness: unchanged polls
+    must be cheap enough for a 2 s foreground cadence)."""
+    core = {k: v for k, v in doc.items()
+            if k not in ("generated_at", "etag")}
+    blob = json.dumps(core, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8", "replace")
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def _snapshot_cmd(if_none_match=None):
+    """`snapshot [--json] [--if-none-match <etag16>]` — non-interactive LIVE
+    MAP document for the phone (phone/tendril snapshot dials this over plain
+    SSH). --json is accepted and a no-op: the output is one compact JSON
+    line either way. With --if-none-match matching the document's content
+    etag, the reply is one tiny `{"not_modified":true,...}` line instead.
+    Exit codes: 0 ok, 1 Herdr unreachable (stdout empty, reason on stderr),
+    2 usage."""
     doc, code = _snapshot_doc()
     if doc is None:
         return code
+    etag = _doc_etag(doc)
+    doc["etag"] = etag
+    if if_none_match is not None and if_none_match == etag:
+        print(json.dumps({"version": doc["version"], "host": doc["host"],
+                          "generated_at": int(time.time()),
+                          "not_modified": True, "etag": etag,
+                          "capabilities": doc.get("capabilities", [])},
+                         separators=(",", ":")))
+        return 0
     print(json.dumps(doc, separators=(",", ":")))
     return 0
 
@@ -1779,7 +1823,22 @@ def _schedule_launcher():
     into the pane chosen at add — never a new pane, never typed into a
     terminal. TARGET takes a pane id (verified live via
     `herdr agent get <pane>`). Failure phrases are exactly the
-    contract's three."""
+    contract's three.
+
+    D10 (§13 release blocker): `--wait` used to wait for the turn to
+    SETTLE with --timeout 15000, so any turn longer than 15 s — most
+    real prompts — returned herdr's `timeout` after the prompt had been
+    ACCEPTED and launched, and the task was stamped FAILED `prompt
+    rejected` while the agent kept working (reproduced live 2026-10-11:
+    a 25 s sleep task → FAILED at +15 s, pane finished at +40 s). The
+    launch acknowledgment is now herdr's own pickup proof: `--wait` with
+    the full `--until working blocked idle done` match set returns rc 0
+    as soon as herdr OBSERVES the agent leave idle after the submission
+    (its 5 s activity gate) or sees the turn already settled — rc 0
+    proves execution started (or finished), never merely that bytes were
+    typed. A longer turn stays RUNNING and the tick/snapshot reconcile
+    finishes it (pane idle/done ⇒ DONE); rc ≠ 0 still means no execution
+    evidence ⇒ FAILED `prompt rejected`."""
     def launch(task):
         if not HERDR:
             return False, None, "launch refused"
@@ -1790,6 +1849,8 @@ def _schedule_launcher():
                 return False, None, "launch refused"
             rc, out, err = run([HERDR, "agent", "prompt", pane,
                                 task.get("prompt") or "", "--wait",
+                                "--until", "working", "--until", "blocked",
+                                "--until", "idle", "--until", "done",
                                 "--timeout", "15000"], 25)
             if rc != 0:
                 return False, None, "prompt rejected"
@@ -1814,8 +1875,24 @@ def _schedule_launcher():
                             "--timeout", "30000"], 45)
         if rc != 0:
             return False, None, "launch refused"
+        # §11: a scheduled task that CREATED the session makes the task
+        # title the session's native name. The pane's Pi extension consumes
+        # this pending record on its first prompt (written BEFORE the
+        # `agent prompt` below, so the ordering always holds); the wire
+        # title comes from the schedule section either way (level 3).
+        try:
+            import tendril_titles
+            tendril_titles.enqueue_native(pane, task.get("title"),
+                                          kind="scheduled")
+        except Exception:
+            pass                            # naming never blocks a launch
+        # same pickup acknowledgment as the §7.3 existing path (D10): rc 0
+        # proves the fresh agent took the prompt; the turn's real length is
+        # the tick/reconcile RUNNING→DONE business, not the launcher's.
         rc, out, err = run([HERDR, "agent", "prompt", pane,
                             task.get("prompt") or "", "--wait",
+                            "--until", "working", "--until", "blocked",
+                            "--until", "idle", "--until", "done",
                             "--timeout", "15000"], 25)
         if rc != 0:
             return False, None, "prompt rejected"
@@ -1974,6 +2051,63 @@ def _schedule_cmd(args):
 # ---------- health/herdr: Herdr health & recovery (contract §6) ----------
 HEALTH_PUSH = {"offline": ("high", "rotating_light"),
                "restored": ("default", "white_check_mark")}
+
+
+# ---------- titles: the session naming verbs (DESIGN-FINAL-POLISH §11) ------
+
+def _rename_session_cmd(args):
+    """`rename-session <pane_id> <title>` / `rename-session <pane_id> --clear`
+    — the manual level-1 label (§11), phone-invocable. Validation matches the
+    phone launcher: a pane id, then a title sanitized on the host (control
+    chars stripped, collapsed, capped at 48) or --clear. The pane must exist
+    AND host a session right now: an override is never written blind, so a
+    reused pane can never carry a stale label. One JSON line on stdout."""
+    try:
+        import tendril_titles
+    except Exception:
+        print("no titles module: tendril_titles.py missing next to "
+              "remote-agents", file=sys.stderr)
+        return 1
+    if len(args) != 2:
+        print("usage: remote-agents rename-session <pane_id> <title>"
+              " | rename-session <pane_id> --clear", file=sys.stderr)
+        return 2
+    pane = args[0]
+    title = None if args[1] == "--clear" else args[1]
+    if not PANE_RE.match(pane):
+        print(json.dumps({"ok": False, "error": "bad pane id"},
+                         separators=(",", ":")))
+        return 2
+    snap = snapshot()
+    if snap is None:
+        print(json.dumps({"ok": False, "error": "Herdr is not answering"},
+                         separators=(",", ":")))
+        return 1
+    agent = next((a for a in snap.get("agents", [])
+                  if isinstance(a, dict) and a.get("pane_id") == pane), None)
+    ok, phrase = tendril_titles.rename_session(pane, title, agent=agent)
+    if not ok:
+        print(json.dumps({"ok": False, "error": phrase},
+                         separators=(",", ":")))
+        return 1
+    reply = {"ok": True, "pane_id": pane}
+    if phrase is not None:
+        reply["title"] = phrase             # --clear echoes no title
+    print(json.dumps(reply, separators=(",", ":")))
+    return 0
+
+
+def _titles_cmd(args):
+    """`titles backfill [--dry-run]` — the one-shot §11 migration: derive
+    titles for root sessions that have none and persist them in the host
+    cache ONLY (existing transcripts are never appended to). Idempotent."""
+    try:
+        import tendril_titles
+    except Exception:
+        print("no titles module: tendril_titles.py missing next to "
+              "remote-agents", file=sys.stderr)
+        return 1
+    return tendril_titles.main(args)
 
 
 def _health_notifier():
@@ -2584,6 +2718,14 @@ persistent AI agents.
   tendril herdr stop         intentional stop: writes the stop guard, then
                              stops Herdr (guard keeps the guardian silent)
   tendril herdr start        clears the guard, then starts + verifies
+  tendril rename-session <pane_id> <title> | <pane_id> --clear
+                              the session's manual label (§11): sanitized,
+                              ≤ 48 chars; also reaches the live Pi session's
+                              native name. One JSON line
+  tendril titles backfill [--dry-run]
+                              one-shot §11 migration: derive titles for old
+                              sessions that have none; writes ONLY the host
+                              cache, never the transcripts. Idempotent
   tendril service status|start|stop|restart|logs
                               the notification watcher, on launchd or systemd
   tendril --pair [--code | --manual]
@@ -2688,14 +2830,31 @@ def main():
     if any(a in args for a in PHONE_FLAGS):
         return _phone(args)
     if args[:1] == ["snapshot"]:
-        if len(args) > 2 or (len(args) == 2 and args[1] != "--json"):
-            print("usage: remote-agents snapshot [--json]", file=sys.stderr)
+        rest = args[1:]
+        inm = None
+        if "--if-none-match" in rest:
+            i = rest.index("--if-none-match")
+            val = rest[i + 1] if i + 1 < len(rest) else None
+            if val is None or not re.match(r"^[0-9a-f]{16}$", val):
+                print("usage: remote-agents snapshot [--json] "
+                      "[--if-none-match <etag>]", file=sys.stderr)
+                return 2
+            inm = val
+            rest = rest[:i] + rest[i + 2:]
+        rest = [a for a in rest if a != "--json"]
+        if rest:
+            print("usage: remote-agents snapshot [--json] "
+                  "[--if-none-match <etag>]", file=sys.stderr)
             return 2
-        return _snapshot_cmd()
+        return _snapshot_cmd(if_none_match=inm)
     if args[:1] == ["capacity"]:
         return _capacity_cmd(args[1:])
     if args[:1] == ["schedule"]:
         return _schedule_cmd(args[1:])
+    if args[:1] == ["rename-session"]:
+        return _rename_session_cmd(args[1:])
+    if args[:1] == ["titles"]:
+        return _titles_cmd(args[1:])
     if args[:1] == ["health"]:
         return _health_cmd(args[1:])
     if args[:1] == ["herdr"]:
@@ -2721,6 +2880,8 @@ def main():
               file=sys.stderr)
         print("       remote-agents health --json|tick | herdr restart|stop|start",
               file=sys.stderr)
+        print("       remote-agents rename-session <pane_id> <title|--clear> "
+              "| titles backfill [--dry-run]", file=sys.stderr)
         print("       remote-agents capacity enable|disable "
               "<claude_oauth|codex_wham|zai_quota>", file=sys.stderr)
         print("       remote-agents --pair [--code | --manual] | --upgrade [--verbose]",

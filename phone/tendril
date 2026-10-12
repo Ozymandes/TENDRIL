@@ -176,7 +176,7 @@ no_alias_help() {
     echo "  set a default:  echo <alias> > ~/.config/tendril/alias"
     echo "                  (or: echo 'export TENDRIL_ALIAS=<alias>' >> ~/.bashrc)"
     echo "usage: tendril [<alias>] [attach|enter|resolve|focus|link <session-id>|snapshot] | tendril ssh <alias>"
-    echo "       tendril [<alias>] [schedule show|cancel <id> | schedule add <payload> | capacity | health | herdr restart] | tendril link"
+    echo "       tendril [<alias>] [schedule show|cancel <id> | schedule add <payload> | capacity | health | herdr restart | rename <pane> <title|--clear>] | tendril link"
     echo "first time: see docs/ANDROID.md or docs/MACOS.md — create a key, then: ssh-copy-id <alias>"
 }
 
@@ -245,6 +245,7 @@ esac
 ALIAS="${1:-$DEFAULT_ALIAS}"
 MODE=""
 ATTACH_ID=""
+SNAP_ETAG=""
 FORCE_SSH=""
 if [ "$1" = "ssh" ]; then
     ALIAS="${2:-$DEFAULT_ALIAS}"
@@ -254,8 +255,8 @@ else
         attach | resolve | focus | link | enter)
             MODE="$1"; ALIAS="$DEFAULT_ALIAS"; ATTACH_ID="${2:-}" ;;
         snapshot)
-            [ "$#" -eq 1 ] || { echo "usage: tendril [<alias>] snapshot"; exit 2; }
-            MODE="snapshot"; ALIAS="$DEFAULT_ALIAS" ;;
+            { [ "$#" -eq 1 ] || [ "$#" -eq 2 ]; } || { echo "usage: tendril [<alias>] snapshot [etag]"; exit 2; }
+            MODE="snapshot"; ALIAS="$DEFAULT_ALIAS"; SNAP_ETAG="${2:-}" ;;
         link-manifest)
             [ "$#" -eq 1 ] || { echo "usage: tendril [<alias>] link-manifest"; exit 2; }
             MODE="link-manifest"; ALIAS="$DEFAULT_ALIAS" ;;
@@ -276,13 +277,16 @@ else
         schedule)
             { [ "$#" -eq 2 ] || [ "$#" -eq 3 ]; } || { echo "usage: tendril [<alias>] schedule show|add|cancel <arg>"; exit 2; }
             MODE="schedule"; ALIAS="$DEFAULT_ALIAS"; SCHED_SUB="${2:-}"; SCHED_ARG="${3:-}" ;;
+        rename)
+            { [ "$#" -eq 3 ] || [ "$#" -eq 4 ]; } || { echo "usage: tendril [<alias>] rename <pane> <title|--clear>"; exit 2; }
+            MODE="rename"; ALIAS="$DEFAULT_ALIAS"; RENAME_PANE="${2:-}"; RENAME_TITLE="${3:-}" ;;
         *)
             case "${2:-}" in
                 attach | resolve | focus | link | enter)
                     MODE="$2"; ALIAS="$1"; ATTACH_ID="${3:-}" ;;
                 snapshot)
-                    [ "$#" -eq 2 ] || { echo "usage: tendril [<alias>] snapshot"; exit 2; }
-                    MODE="snapshot"; ALIAS="$1" ;;
+                    { [ "$#" -eq 2 ] || [ "$#" -eq 3 ]; } || { echo "usage: tendril [<alias>] snapshot [etag]"; exit 2; }
+                    MODE="snapshot"; ALIAS="$1"; SNAP_ETAG="${3:-}" ;;
                 link-manifest)
                     [ "$#" -eq 2 ] || { echo "usage: tendril [<alias>] link-manifest"; exit 2; }
                     MODE="link-manifest"; ALIAS="$1" ;;
@@ -301,6 +305,9 @@ else
                 schedule)
                     { [ "$#" -eq 3 ] || [ "$#" -eq 4 ]; } || { echo "usage: tendril [<alias>] schedule show|add|cancel <arg>"; exit 2; }
                     MODE="schedule"; ALIAS="$1"; SCHED_SUB="${3:-}"; SCHED_ARG="${4:-}" ;;
+                rename)
+                    { [ "$#" -eq 4 ] || [ "$#" -eq 5 ]; } || { echo "usage: tendril [<alias>] rename <pane> <title|--clear>"; exit 2; }
+                    MODE="rename"; ALIAS="$1"; RENAME_PANE="${3:-}"; RENAME_TITLE="${4:-}" ;;
             esac ;;
     esac
 fi
@@ -308,8 +315,16 @@ REMOTE_BIN="${REMOTE_AGENTS_BIN:-remote-agents}"   # resolved on the HOST (login
 REMOTE_CMD="$REMOTE_BIN"
 
 if [ "$MODE" = "snapshot" ]; then
-    # snapshot takes NO session id: a fixed one-word remote command.
-    REMOTE_CMD="$REMOTE_BIN snapshot"
+    # snapshot takes NO session id: a fixed one-word remote command. The
+    # optional second argument is the previous document's content etag
+    # (D11 freshness): the host answers a tiny not-modified line when the
+    # document is unchanged. Regex-validated here, single-quoted there.
+    case "$SNAP_ETAG" in
+        "") REMOTE_CMD="$REMOTE_BIN snapshot" ;;
+        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+            REMOTE_CMD="$REMOTE_BIN snapshot --if-none-match '$SNAP_ETAG'" ;;
+        *) echo "usage: tendril [<alias>] snapshot [etag]   (etag: 16 lowercase hex)"; exit 2 ;;
+    esac
 elif [ "$MODE" = "link-manifest" ]; then
     # the staged Link build's manifest (v0.2.x update check): read-only,
     # fixed one-word remote command, sh-parsable — the Link app compares
@@ -377,6 +392,33 @@ elif [ "$MODE" = "schedule" ]; then
             echo "usage: tendril [<alias>] schedule show|add|cancel <arg>"
             exit 2 ;;
     esac
+elif [ "$MODE" = "rename" ]; then
+    # DESIGN-FINAL-POLISH §11: the session's manual label. The pane and the
+    # title are validated HERE against the same rules the host enforces
+    # (pane w<alnum>:p<alnum>; title 1..48 chars from a printable whitelist
+    # — no quote, no control chars), then single-quoted into the remote
+    # command. The host re-sanitizes; a stale/unknown pane is refused there.
+    # same pane grammar the schedule add-target check uses (contract §7.3):
+    # w<alnum>+ : p<alnum>+ — never a bare workspace, never another prefix
+    printf '%s' "$RENAME_PANE" | grep -qE '^w[0-9A-Za-z]+:p[0-9A-Za-z]+$' \
+        || { echo "usage: tendril [<alias>] rename <pane> <title|--clear>   (pane: w16:pA)"; exit 2; }
+    if [ "$RENAME_TITLE" = "--clear" ]; then
+        RENAME_ARG="--clear"
+    else
+        # a single quote would break the host-side quoting; anything a
+        # printable-title whitelist rejects is refused here (1..48 chars;
+        # the host re-sanitizes: control chars stripped, collapsed, trimmed)
+        case "$RENAME_TITLE" in
+            "" | *\'*)
+                echo "usage: tendril [<alias>] rename <pane> <title|--clear>   (title: 1..48 printable chars, no quotes)"
+                exit 2 ;;
+        esac
+        printf '%s' "$RENAME_TITLE" \
+            | grep -qE '^[A-Za-z0-9 .,:!?&+/_#@%-]{1,48}$' \
+            || { echo "usage: tendril [<alias>] rename <pane> <title|--clear>   (title: 1..48 printable chars, no quotes)"; exit 2; }
+        RENAME_ARG="$RENAME_TITLE"
+    fi
+    REMOTE_CMD="$REMOTE_BIN rename-session '$RENAME_PANE' '$RENAME_ARG'"
 elif [ -n "$MODE" ]; then
     BAD=""
     case "$ATTACH_ID" in
@@ -412,7 +454,7 @@ case "$MODE" in
         _t_log transport-chosen-ssh
         _t_log ssh-exec
         exec ssh $SESSION_CM_OPTS "$ALIAS" "$REMOTE_CMD" ;;
-    snapshot | schedule | capacity | health | herdr | link-manifest)
+    snapshot | schedule | capacity | health | herdr | rename | link-manifest)
         _t_log transport-chosen-ssh
         _t_log ssh-exec
         exec ssh -o BatchMode=yes -o ConnectTimeout=6 $BATCH_CM_OPTS \
