@@ -170,10 +170,18 @@ def _is_camel(tok):
 
 def _normalize_word(w, first=False):
     """One word of a finished candidate: allowlist/digit/CamelCase keep
-    their written form, everything else sentence-cases."""
+    their written form, everything else sentence-cases. A hyphenated token
+    whose suffix segments are single letters is a designation ("Wave-A"):
+    the suffixes stay uppercase, the head follows the first/mid rule."""
     key = w.lower()
     if key in _ACRONYMS:
         return _ACRONYMS[key]
+    segs = w.split("-")
+    if len(segs) > 1 and all(
+            len(s) == 1 and s.isalpha() for s in segs[1:]):
+        head = segs[0][:1].upper() + segs[0][1:].lower() if first \
+            else segs[0].lower()
+        return "-".join([head] + [s.upper() for s in segs[1:]])
     if any(ch.isdigit() for ch in w) or _is_camel(w):
         return w
     if first:
@@ -216,6 +224,102 @@ _ADJ_TAIL_RE = re.compile(
 _ED_NOUNS = frozenset({"changed", "field", "content", "ground", "sound",
                        "thing", "king", "ring", "spring", "warning",
                        "family", "supply", "july", "ally", "rely"})
+
+# ------------------------------------------------------- round-3 shape rules
+# Negative instructions state a CONSTRAINT, never a topic ("Do not touch
+# remote-agents"): the clause is skipped for the next qualifying one.
+_NEGATIVE_CLAUSE_RE = re.compile(
+    r"^(?:do not|don't|dont|never|avoid|stop|no)\b", re.IGNORECASE)
+# a candidate never STARTS on a preposition ("With parallel capability …")
+_LEAD_PREP = frozenset("""
+with without within under over after before during between among amongst
+across against around behind below beneath beside besides beyond despite
+except inside outside through throughout toward towards until upon from
+into onto off out up down near since via per at by in of on to for about
+amid along
+""".split())
+_LEAD_ARTICLE = frozenset({"the", "a", "an"})
+# "… to/into/from the <noun>" location tails are a direction, not a topic
+_LOC_PREPS = frozenset({"to", "into", "from"})
+_LOC_DET = frozenset({"the", "a", "an", "his", "her", "my", "your", "our",
+                      "their", "its", "this", "that"})
+# vague modifiers carry no identity; a verb-led candidate whose only object
+# is vague-plus-generic-or-product is a weak fragment ("Open the pdf",
+# "Locate the real local Tendril"), never a title
+_VAGUE_MODS = frozenset(
+    "real actual local remote current new whole entire full proper simple "
+    "quick single one two some various own same other".split())
+# generic nouns are never the lone object of a verb-led title, and never a
+# summary term ("Result sentence", "Seconds agent", "Open the pdf")
+_GENERIC_NOUNS = frozenset("""
+result results sentence sentences word words composition compositions
+second seconds agent agents prompt prompts truth truths adapter adapters
+file files output outputs error errors pdf pdfs thing things stuff
+""".split())
+# bare verbs for the round-3 shapes: three in a row ("Locate inspect
+# synchronize") and verb-led weak objects
+_TITLE_VERBS = frozenset("""
+open close locate inspect synchronize synchronise rename copy move run fix
+update make build use get go work start stop launch add remove create delete
+write read send check verify test try finalize finalise prepare merge
+complete finish restore audit install integrate migrate deploy configure
+initialize initialise implement refactor
+""".split())
+# internal-CamelCase product names stay salient summary terms; any other
+# CamelCase token is a code identifier ("MouseArea", "AgentReach"), never one
+_PRODUCT_CAMEL = frozenset({"github", "gitlab", "postgresql"})
+# version/number-suffixed tokens ("Prompt-2", "-v1.0", "GLM-5.3") are build
+# artefacts, never summary terms
+_VERSION_SUFFIX_RE = re.compile(r"[-._]v?\d")
+
+
+def _verb_stem_ok(lw):
+    if lw in _TITLE_VERBS:
+        return True
+    for suf in ("ies", "es", "s", "ing", "ed"):
+        if not lw.endswith(suf):
+            continue
+        stem = lw[:-len(suf)]
+        if stem in _TITLE_VERBS:
+            return True
+        if suf == "ies" and stem + "y" in _TITLE_VERBS:
+            return True
+        if suf in ("es", "s") and stem + "e" in _TITLE_VERBS:
+            return True
+        if suf == "ing" and (stem + "e" in _TITLE_VERBS
+                             or (len(stem) >= 3 and stem[-1] == stem[-2]
+                                 and stem[:-1] in _TITLE_VERBS)):
+            return True
+        if suf == "ed" and (stem + "e" in _TITLE_VERBS
+                            or (len(stem) >= 3 and stem[-1] == stem[-2]
+                                and stem[:-1] in _TITLE_VERBS)):
+            return True
+        return False
+    return False
+
+
+def _is_verb(w):
+    lw = w.lower().strip(".,;:!?()[]{}\"'")
+    return bool(lw) and _verb_stem_ok(lw)
+
+
+def _is_gerund(w):
+    """A leading gerund narrates an activity ("Running Pi update results");
+    only gerunds of KNOWN verbs count — unknown -ing words may be nouns."""
+    lw = w.lower().strip(".,;:!?()[]{}\"'")
+    if not lw.endswith("ing") or len(lw) < 6:
+        return False
+    stem = lw[:-3]
+    return stem in _TITLE_VERBS or stem + "e" in _TITLE_VERBS \
+        or (len(stem) >= 3 and stem[-1] == stem[-2]
+            and stem[:-1] in _TITLE_VERBS)
+
+
+def _generic_term(tok):
+    """True when any hyphen/plus segment of the token is a generic noun
+    ("GPU-adapter" → adapter)."""
+    return any(p in _GENERIC_NOUNS for p in re.split(r"[-+]", tok.lower()))
+
 
 def _tail_nounlike(words, allow_ing_tail=False):
     """True when the LAST word can end a title (noun-like / product token).
@@ -310,10 +414,14 @@ _SUMMARY_STOP = frozenset(
     "wanted want thanks good great nice best better worse bad bash zsh shell tool tools subagent subagents sleep full true false launch launches launching one two return returns image images finish finishes finished taskdone containing including regarding involving project root "
        "request requests background hello already reference command commands "
        "task calls call summarize analysis visual through max word urls url "
-       "create created".split())
+       "create created sudo nothing something anything everything".split())
 # machine role ids a harness assigns sessions: `general-purpose#20894abc`
 _ROLE_ID_RE = re.compile(
     r"^([A-Za-z][A-Za-z0-9._-]{1,40})#[0-9a-fA-F]{6,8}$")
+# bare harness role names a Pi session may be natively labelled with: a ROLE,
+# never a title — they get the same role · label treatment as `<role>#<id8>`
+_ROLE_ONLY = frozenset({"explore", "plan", "general purpose",
+                        "general-purpose"})
 # label prefixes that STRIP to their content (label form keeps the topic)
 _LABEL_RE = re.compile(
     r"^(task|context|role|note|important|current state)\s*:\s*",
@@ -491,25 +599,44 @@ def _normalize_candidate(text):
                if c and c.strip()]
     if not clauses:
         return None
-    clause = clauses[0]
     # the product name alone ("TENDRIL LINK —") and short shouty heads defer
     # to the next, more specific segment of the title line
     def _defers(c):
         words = _meaningful_words(c.split())
         return len(words) < 2 or (len(words) <= 2 and _shouty_clause(c)) \
             or _all_product_words(words)
-    if len(clauses) > 1 and _defers(clause):
-        clause = clauses[1]
-    # iteratively strip leading politeness/filler phrases
-    changed = True
-    while changed:
-        changed = False
-        low = clause.lower()
-        for f in _FILLERS:
-            if low.startswith(f + " ") or low.startswith(f + ":") or low == f:
-                clause = clause[len(f):].lstrip(" ,.:;-—–")
-                changed = True
-                break
+
+    def _prep(c):
+        # iteratively strip leading politeness/filler phrases
+        changed = True
+        while changed:
+            changed = False
+            low = c.lower()
+            for f in _FILLERS:
+                if low.startswith(f + " ") or low.startswith(f + ":") \
+                        or low == f:
+                    c = c[len(f):].lstrip(" ,.:;-—–")
+                    changed = True
+                    break
+        return c.strip() or None
+
+    start = 1 if (len(clauses) > 1 and _defers(clauses[0])) else 0
+    clause = None
+    for c in clauses[start:]:
+        # a negative instruction ("Do not touch remote-agents") states a
+        # constraint, never a topic — take the next qualifying clause
+        if _NEGATIVE_CLAUSE_RE.match(c):
+            continue
+        c = _prep(c)
+        if not c or _NEGATIVE_CLAUSE_RE.match(c):
+            continue
+        # a candidate never STARTS on a preposition ("With parallel …")
+        if _clean_token(c.split(" ", 1)[0]).lower() in _LEAD_PREP:
+            continue
+        clause = c
+        break
+    if clause is None:
+        return None
     # scaffolding clauses hide behind fillers ("and execute this as one"):
     # re-check AFTER the strip
     if re.match(r"^(execute this|this is|we are|i want this|wait|sleep)\b",
@@ -523,7 +650,32 @@ def _finalize(words, limit, allow_ing_tail=False):
     words = _meaningful_words(words)
     if len(words) < 2:
         return None
+    low = [w.lower() for w in words]
+    # three bare verbs in a row is a verb salad, never a topic
+    # ("Locate inspect synchronize")
+    if any(_is_verb(low[i]) and _is_verb(low[i + 1]) and _is_verb(low[i + 2])
+           for i in range(len(low) - 2)):
+        return None
+
+    def _strip_loc_tails(ws, lo):
+        # "… to/into/from the <noun>" location tails are a direction, not a
+        # topic ("Copy one file to the windows" → "Copy one file")
+        for _ in range(2):
+            if len(ws) >= 4 and lo[-3] in _LOC_PREPS and lo[-2] in _LOC_DET:
+                del ws[-3:]
+                del lo[-3:]
+            else:
+                break
+
+    _strip_loc_tails(words, low)
     words = _sentence_case(words)
+    low = [w.lower() for w in words]
+    # a leading article is scaffolding, not identity ("The de comitè parity")
+    while len(words) > 2 and low[0] in _LEAD_ARTICLE:
+        words.pop(0)
+        low.pop(0)
+    if words:
+        words = _sentence_case(words)
     # clause-boundary back-off: never END on a function word, determiner,
     # preposition, auxiliary, dangling adjective or bare verb — back off to
     # the last noun-like word; too few words afterwards → fall through
@@ -540,6 +692,8 @@ def _finalize(words, limit, allow_ing_tail=False):
             cut = cut[:cut.rfind(" ")]
         title = cut.strip(" \t,;:—–-·")
         words = title.split(" ")
+        low = [w.lower() for w in words]
+        _strip_loc_tails(words, low)
         while len(words) >= 2 and not _tail_nounlike(words, allow_ing_tail):
             words.pop()
         title = " ".join(words)
@@ -559,6 +713,26 @@ def _finalize(words, limit, allow_ing_tail=False):
     return title or None
 
 
+def _weak_verb_object(title):
+    """A verb-led candidate whose only remaining object is generic
+    ("Open the pdf") or a product name ("Locate the real local Tendril") is
+    a weak fragment, never a title: None (fall through)."""
+    words = title.split(" ")
+    if not words or not _is_verb(words[0]):
+        return title
+    skip = _STOPWORDS | _VAGUE_MODS
+    rest = _meaningful_words([
+        w for w in words[1:]
+        if _clean_token(w).lower() not in skip and not _is_verb(w)])
+    if not rest:
+        return None                     # bare verb, no topic at all
+    if len(rest) == 1:
+        r = rest[0].lower()
+        if r in _GENERIC_NOUNS or r in _PRODUCT_WORDS:
+            return None
+    return title
+
+
 def derive_title(text, limit=DERIVE_CAP):
     """§11 level 4: a stable title from the first user instruction, or None.
     Deterministic, local, no network, no LLM."""
@@ -569,7 +743,20 @@ def derive_title(text, limit=DERIVE_CAP):
     kept = [w for w in words if not _is_noise(_clean_token(w))]
     # a secret must NEVER surface: dropped along the way; if nothing
     # meaningful remains the candidate falls through (None).
-    return _finalize(kept, limit)
+    # Judge the SURVIVING prose head: noise tokens (dates, paths, ids) can
+    # head the clause and only drop inside finalize.
+    heads = _meaningful_words([_clean_token(w) for w in kept])
+    if heads:
+        # a leading gerund of a known verb narrates an activity, never a
+        # topic ("Running Pi update results")
+        if _is_gerund(heads[0]):
+            return None
+        # the surviving head never starts on a preposition
+        # ("… With parallel capability")
+        if heads[0].lower() in _LEAD_PREP:
+            return None
+    title = _finalize(kept, limit)
+    return _weak_verb_object(title) if title else None
 
 
 def derive_summary(turns, limit=DERIVE_CAP):
@@ -603,6 +790,24 @@ def derive_summary(turns, limit=DERIVE_CAP):
                 continue                    # routing tokens and dates
             if _LABEL_COMPOUND_RE.match(tok):
                 continue                    # general-purpose, phase-one…
+            # summary debris (round 3): config/path fragments, version-
+            # suffixed tokens ("Prompt-2", "murex-specimen-engine-v1.0"),
+            # generic nouns ("Result sentence") and internal-CamelCase code
+            # identifiers ("MouseArea", "AgentReach") are never salient
+            if any(ch in tok for ch in "._/-"):
+                continue
+            if _VERSION_SUFFIX_RE.search(tok):
+                continue
+            if _generic_term(tok):
+                continue
+            if _is_camel(tok) and tok.lower() not in _PRODUCT_CAMEL:
+                continue
+            # hash/package artefacts ("CBFD75", "foo2zjs") are never topics
+            if tok.isalnum() and any(ch.isdigit() for ch in tok) \
+                    and any(ch.isalpha() for ch in tok) \
+                    and ((tok.isupper() and len(tok) >= 4)
+                         or (tok.islower() and len(tok) >= 5)):
+                continue
             if key not in scores:
                 scores[key] = [0, len(order)]
                 order.append(key)
@@ -629,6 +834,10 @@ def derive_summary(turns, limit=DERIVE_CAP):
             tok = _clean_token(raw)
             if tok and tok.lower() in scores and tok.lower() not in cased:
                 cased[tok.lower()] = tok
+    # a summary needs at least one real (non-acronym) word: pairs of bare
+    # acronym tokens ("MCP Pi", "UI API", "LIVE QA") are debris, not a topic
+    if all(sum(ch.islower() for ch in cased[k]) < 3 for k in top):
+        return None
     words = [cased[k] for k in top]
     return _finalize(words, limit, allow_ing_tail=True)
 
@@ -944,6 +1153,10 @@ def _native_title(agent, key, titles, now, home=None):
             role = _ROLE_ID_RE.match(name)
             if role:
                 return _role_native_title(key, role.group(1), home)
+            # bare role names ("Explore", "Plan", "General purpose") are the
+            # harness's agent role, not a title: label them like children do
+            if name.strip().lower().replace("_", " ") in _ROLE_ONLY:
+                return _role_native_title(key, name, home, total_cap=32)
             return name, "native"
     name = agent.get("name")
     if isinstance(name, str) and name.strip() \
@@ -962,21 +1175,26 @@ def _native_title(agent, key, titles, now, home=None):
     return None
 
 
-def _role_native_title(path, role, home):
-    """`<role>#<id8>` natives: `Backend scout · <short task label>` — the
-    humanized role name plus the first instruction's label; `None` for the
-    label keeps the bare humanized role (never the raw hash)."""
+def _role_native_title(path, role, home, total_cap=None):
+    """Role natives: `Backend scout · <short task label>` — the humanized
+    role name plus the first instruction's label; `None` for the label keeps
+    the bare humanized role (never the raw hash). `total_cap` (role-only
+    natives) bounds the WHOLE title, label included, at 32 chars."""
     role_name = humanize_role(role)
     if not role_name:
         return None
+    label_cap = CHILD_TASK_CAP
+    if total_cap:
+        label_cap = min(label_cap, total_cap - len(role_name) - 3)
     label = None
-    try:
-        turns = first_instructions(path, max_turns=1, window=65536) \
-            if path else []
-        t = derive_title(turns[0]) if turns else None
-        label = sanitize_title(t, CHILD_TASK_CAP) if t else None
-    except Exception:
-        label = None
+    if label_cap >= 6:
+        try:
+            turns = first_instructions(path, max_turns=1, window=65536) \
+                if path else []
+            t = derive_title(turns[0]) if turns else None
+            label = sanitize_title(t, label_cap) if t else None
+        except Exception:
+            label = None
     if label:
         return "%s · %s" % (role_name, label), "instruction"
     return role_name, "native"

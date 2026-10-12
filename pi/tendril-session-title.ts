@@ -70,6 +70,17 @@ function isCamel(tok) {
 function normalizeWord(w, first) {
 	const key = w.toLowerCase();
 	if (ACRONYMS.has(key)) return ACRONYMS.get(key);
+	// a hyphenated token whose suffix segments are single letters is a
+	// designation ("Wave-A"): suffixes stay uppercase, the head follows the
+	// first/mid rule
+	const segs = w.split("-");
+	if (segs.length > 1 && segs.slice(1).every((s) => s.length === 1 && /[a-zA-Z]/.test(s))) {
+		const head = first
+			? segs[0].charAt(0).toUpperCase() + segs[0].slice(1).toLowerCase()
+			: segs[0].toLowerCase();
+		return [head].concat(segs.slice(1).map((s) => s.toUpperCase()))
+			.join("-");
+	}
 	if (/\d/.test(w) || isCamel(w)) return w;
 	if (first) return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
 	return w.toLowerCase();
@@ -103,6 +114,88 @@ whose where why how least itself themselves myself yourself
 `.split(/\s+/));
 const ADJ_TAIL_RE = /(ive|ful|ous|less|able|ible)$|ed$|ing$|ly$/;
 const ED_NOUNS = new Set(["changed", "field", "content", "ground", "sound", "thing", "king", "ring", "spring", "warning", "family", "supply", "july", "ally", "rely"]);
+// --- round-3 shape rules ---
+// Negative instructions state a CONSTRAINT, never a topic ("Do not touch
+// remote-agents"): the clause is skipped for the next qualifying one.
+const NEGATIVE_CLAUSE_RE = /^(?:do not|don't|dont|never|avoid|stop|no)\b/i;
+// a candidate never STARTS on a preposition ("With parallel capability ...")
+const LEAD_PREP = new Set(`
+with without within under over after before during between among amongst
+across against around behind below beneath beside besides beyond despite
+except inside outside through throughout toward towards until upon from
+into onto off out up down near since via per at by in of on to for about
+amid along
+`.split(/\s+/));
+const LEAD_ARTICLE = new Set(["the", "a", "an"]);
+// "... to/into/from the <noun>" location tails are a direction, not a topic
+const LOC_PREPS = new Set(["to", "into", "from"]);
+const LOC_DET = new Set(["the", "a", "an", "his", "her", "my", "your", "our", "their", "its", "this", "that"]);
+// vague modifiers carry no identity; a verb-led candidate whose only object
+// is vague-plus-generic-or-product is a weak fragment ("Open the pdf",
+// "Locate the real local Tendril"), never a title
+const VAGUE_MODS = new Set(
+	("real actual local remote current new whole entire full proper simple "
+		+ "quick single one two some various own same other").split(" "));
+// generic nouns are never the lone object of a verb-led title, and never a
+// summary term ("Result sentence", "Seconds agent", "Open the pdf")
+const GENERIC_NOUNS = new Set(`
+result results sentence sentences word words composition compositions
+second seconds agent agents prompt prompts truth truths adapter adapters
+file files output outputs error errors pdf pdfs thing things stuff
+`.split(/\s+/));
+// bare verbs for the round-3 shapes: three in a row ("Locate inspect
+// synchronize") and verb-led weak objects
+const TITLE_VERBS = new Set(`
+open close locate inspect synchronize synchronise rename copy move run fix
+update make build use get go work start stop launch add remove create delete
+write read send check verify test try finalize finalise prepare merge
+complete finish restore audit install integrate migrate deploy configure
+initialize initialise implement refactor
+`.split(/\s+/));
+// internal-CamelCase product names stay salient summary terms; any other
+// CamelCase token is a code identifier ("MouseArea", "AgentReach"), never one
+const PRODUCT_CAMEL = new Set(["github", "gitlab", "postgresql"]);
+// version/number-suffixed tokens ("Prompt-2", "-v1.0", "GLM-5.3") are build
+// artefacts, never summary terms
+const VERSION_SUFFIX_RE = /[-._]v?\d/;
+
+function verbStemOk(lw) {
+	if (TITLE_VERBS.has(lw)) return true;
+	for (const suf of ["ies", "es", "s", "ing", "ed"]) {
+		if (!lw.endsWith(suf)) continue;
+		const stem = lw.slice(0, lw.length - suf.length);
+		if (TITLE_VERBS.has(stem)) return true;
+		if (suf === "ies" && TITLE_VERBS.has(stem + "y")) return true;
+		if ((suf === "es" || suf === "s") && TITLE_VERBS.has(stem + "e")) return true;
+		const doubled = stem.length >= 3 && stem[stem.length - 1] === stem[stem.length - 2]
+			&& TITLE_VERBS.has(stem.slice(0, -1));
+		if ((suf === "ing" || suf === "ed") && (TITLE_VERBS.has(stem + "e") || doubled)) return true;
+		return false;
+	}
+	return false;
+}
+
+function isVerb(w) {
+	const lw = w.toLowerCase().replace(/^[.,;:!?()[\]{}"']+|[.,;:!?()[\]{}"']+$/g, "");
+	return lw.length > 0 && verbStemOk(lw);
+}
+
+// A leading gerund of a KNOWN verb narrates an activity ("Running Pi update
+// results"); unknown -ing words may be nouns and stay.
+function isGerund(w) {
+	const lw = w.toLowerCase().replace(/^[.,;:!?()[\]{}"']+|[.,;:!?()[\]{}"']+$/g, "");
+	if (!lw.endsWith("ing") || lw.length < 6) return false;
+	const stem = lw.slice(0, -3);
+	return TITLE_VERBS.has(stem) || TITLE_VERBS.has(stem + "e")
+		|| (stem.length >= 3 && stem[stem.length - 1] === stem[stem.length - 2]
+			&& TITLE_VERBS.has(stem.slice(0, -1)));
+}
+
+// True when any hyphen/plus segment of the token is a generic noun
+// ("GPU-adapter" -> adapter).
+function genericTerm(tok) {
+	return tok.toLowerCase().split(/[-+]/).some((p) => GENERIC_NOUNS.has(p));
+}
 const DEBRIS_CHARS_RE = /["'{}\[\]<>=|\\`]/;
 const FILLERS = [
 	"please", "pls", "plz", "hey", "hi", "ok", "okay", "so", "then", "now",
@@ -183,7 +276,7 @@ launching one two return returns image images finish finishes finished
 taskdone containing including regarding involving project root
 request requests background hello already reference command commands
 task calls call summarize analysis visual through max word urls url create
-created
+created sudo nothing something anything everything
 `.split(/\s+/));
 const HEADER_RE = /^#{1,6}\s+/;
 const BANNER_RE = /^([-_=*~·─-╿]{5,})$/;
@@ -327,7 +420,6 @@ function normalizeCandidate(text) {
 	const clauses = candidate.split(CLAUSE_SPLIT_RE)
 		.map((c) => (c || "").trim()).filter((c) => c.length > 0);
 	if (clauses.length === 0) return null;
-	let clause = clauses[0];
 	// the product name alone ("TENDRIL LINK —") and short shouty heads defer
 	// to the next, more specific segment of the title line
 	const defers = (c) => {
@@ -336,27 +428,41 @@ function normalizeCandidate(text) {
 			|| (words.length <= 2 && shoutyClause(c))
 			|| allProductWords(words);
 	};
-	if (clauses.length > 1 && defers(clause)) {
-		clause = clauses[1];
+	// iteratively strip leading politeness/filler phrases
+	const prep = (c) => {
+		let changed = true;
+		while (changed) {
+			changed = false;
+			const low = c.toLowerCase();
+			for (const f of FILLERS) {
+				if (low.startsWith(f + " ") || low.startsWith(f + ":") || low === f) {
+					c = c.slice(f.length).replace(/^[ ,.:;\-—–]+/, "");
+					changed = true;
+					break;
+				}
+			}
+		}
+		return c.trim() || null;
+	};
+	const start = clauses.length > 1 && defers(clauses[0]) ? 1 : 0;
+	let clause = null;
+	for (let c of clauses.slice(start)) {
+		// a negative instruction ("Do not touch remote-agents") states a
+		// constraint, never a topic — take the next qualifying clause
+		if (NEGATIVE_CLAUSE_RE.test(c)) continue;
+		c = prep(c);
+		if (!c || NEGATIVE_CLAUSE_RE.test(c)) continue;
+		// a candidate never STARTS on a preposition ("With parallel ...")
+		if (LEAD_PREP.has(cleanToken(c.split(TOKEN_SPLIT_RE, 1)[0]).toLowerCase())) continue;
+		clause = c;
+		break;
 	}
+	if (clause === null) return null;
 	// scaffolding clauses hide behind fillers ("and execute this as one"):
 	// re-check AFTER the strip
 	if (/^(execute this|this is|we are|i want this|wait|sleep)\b/i.test(clause)
 		|| earlyBeClause(clause)) {
 		return null; // scaffolding/narration, never a topic
-	}
-	// iteratively strip leading politeness/filler phrases
-	let changed = true;
-	while (changed) {
-		changed = false;
-		const low = clause.toLowerCase();
-		for (const f of FILLERS) {
-			if (low.startsWith(f + " ") || low.startsWith(f + ":") || low === f) {
-				clause = clause.slice(f.length).replace(/^[ ,.:;\-—–]+/, "");
-				changed = true;
-				break;
-			}
-		}
 	}
 	return clause || null;
 }
@@ -365,7 +471,32 @@ function finalize(words, limit, allowIngTail = false) {
 	const cleaned = meaningfulWords(
 		words.map((w) => cleanToken(w)).filter((w) => w.length > 0));
 	if (cleaned.length < 2) return null;
+	let low = cleaned.map((w) => w.toLowerCase());
+	// three bare verbs in a row is a verb salad, never a topic
+	// ("Locate inspect synchronize")
+	for (let i = 0; i + 2 < low.length; i += 1) {
+		if (isVerb(low[i]) && isVerb(low[i + 1]) && isVerb(low[i + 2])) return null;
+	}
+	// "... to/into/from the <noun>" location tails are a direction, not a
+	// topic ("Copy one file to the windows" -> "Copy one file")
+	const stripLocTails = (ws, lo) => {
+		for (let n = 0; n < 2; n += 1) {
+			if (ws.length >= 4 && LOC_PREPS.has(lo[lo.length - 3])
+				&& LOC_DET.has(lo[lo.length - 2])) {
+				ws.splice(-3);
+				lo.splice(-3);
+			} else break;
+		}
+	};
+	stripLocTails(cleaned, low);
 	let parts = sentenceCase(cleaned);
+	low = parts.map((w) => w.toLowerCase());
+	// a leading article is scaffolding, not identity ("The de comitè parity")
+	while (parts.length > 2 && LEAD_ARTICLE.has(low[0])) {
+		parts.shift();
+		low.shift();
+	}
+	if (parts.length > 0) parts = sentenceCase(parts);
 	// clause-boundary back-off: never END on a function word, determiner,
 	// preposition, auxiliary, dangling adjective or bare verb
 	while (parts.length > 0 && !tailNounLike(parts, allowIngTail)) parts.pop();
@@ -378,6 +509,8 @@ function finalize(words, limit, allowIngTail = false) {
 		if (sp > 0) cut = cut.slice(0, sp);
 		title = cut.replace(/^[\t ,;:—–\-·]+|[\t ,;:—–\-·]+$/g, "");
 		parts = title.split(" ");
+		low = parts.map((w) => w.toLowerCase());
+		stripLocTails(parts, low);
 		while (parts.length >= 2 && !tailNounLike(parts, allowIngTail)) parts.pop();
 		title = parts.join(" ");
 	}
@@ -392,12 +525,42 @@ function finalize(words, limit, allowIngTail = false) {
 	return title.length > 0 ? title : null;
 }
 
+// A verb-led candidate whose only remaining object is generic ("Open the
+// pdf") or a product name ("Locate the real local Tendril") is a weak
+// fragment, never a title: null (fall through).
+function weakVerbObject(title) {
+	const words = title.split(" ");
+	if (words.length === 0 || !isVerb(words[0])) return title;
+	const skip = new Set([...STOPWORDS, ...VAGUE_MODS]);
+	const rest = meaningfulWords(words.slice(1).filter(
+		(w) => !skip.has(cleanToken(w).toLowerCase()) && !isVerb(w)));
+	if (rest.length === 0) return null; // bare verb, no topic at all
+	if (rest.length === 1) {
+		const r = rest[0].toLowerCase();
+		if (GENERIC_NOUNS.has(r) || PRODUCT_WORDS.has(r)) return null;
+	}
+	return title;
+}
+
 export function deriveTitle(text, limit = DERIVE_CAP) {
 	const clause = normalizeCandidate(text);
 	if (clause === null) return null;
 	const words = clause.split(TOKEN_SPLIT_RE).filter((w) => w.length > 0);
 	const kept = words.filter((w) => !isNoise(cleanToken(w)));
-	return finalize(kept, limit);
+	// judge the SURVIVING prose head: noise tokens (dates, paths, ids) can
+	// head the clause and only drop inside finalize
+	const heads = meaningfulWords(kept.map((w) => cleanToken(w))
+		.filter((w) => w.length > 0));
+	if (heads.length > 0) {
+		// a leading gerund of a known verb narrates an activity, never a
+		// topic ("Running Pi update results")
+		if (isGerund(heads[0])) return null;
+		// the surviving head never starts on a preposition
+		// ("... With parallel capability")
+		if (LEAD_PREP.has(heads[0].toLowerCase())) return null;
+	}
+	const title = finalize(kept, limit);
+	return title ? weakVerbObject(title) : null;
 }
 
 export function deriveSummary(turns, limit = DERIVE_CAP) {
@@ -415,6 +578,18 @@ export function deriveSummary(turns, limit = DERIVE_CAP) {
 			const key = tok.toLowerCase();
 			if (STOPWORDS.has(key) || SUMMARY_STOP.has(key)) continue;
 			if (SENTINEL_RE.test(tok) || DATE_TOKEN_RE.test(tok)) continue;
+			// summary debris (round 3): config/path fragments, version-
+			// suffixed tokens ("Prompt-2", "murex-specimen-engine-v1.0"),
+			// generic nouns ("Result sentence") and internal-CamelCase code
+			// identifiers ("MouseArea", "AgentReach") are never salient
+			if (/[._/-]/.test(tok)) continue;
+			if (VERSION_SUFFIX_RE.test(tok)) continue;
+			if (genericTerm(tok)) continue;
+			if (isCamel(tok) && !PRODUCT_CAMEL.has(key)) continue;
+			// hash/package artefacts ("CBFD75", "foo2zjs") are never topics
+			if (/^[A-Za-z0-9]+$/.test(tok) && /\d/.test(tok) && /[A-Za-z]/.test(tok)
+				&& ((tok === tok.toUpperCase() && tok.length >= 4)
+					|| (tok === tok.toLowerCase() && tok.length >= 5))) continue;
 			if (!scores.has(key)) scores.set(key, { score: 0, first: order++ });
 			const entry = scores.get(key);
 			if (!seen.has(key)) {
@@ -448,6 +623,9 @@ export function deriveSummary(turns, limit = DERIVE_CAP) {
 			}
 		}
 	}
+	// a summary needs at least one real (non-acronym) word: pairs of bare
+	// acronym tokens ("MCP Pi", "UI API", "LIVE QA") are debris, not a topic
+	if (top.every((k) => [...cased.get(k)].filter((c) => c >= "a" && c <= "z").length < 3)) return null;
 	return finalize(top.map((k) => cased.get(k)), limit, true);
 }
 

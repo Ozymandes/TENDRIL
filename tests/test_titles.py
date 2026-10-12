@@ -244,6 +244,41 @@ class Precedence(TitlesTestBase):
         self.assertEqual(source2, "instruction")
         self.assertTrue(title is not None and "#" not in title)
 
+    def test_role_only_native_gets_short_label(self):
+        """Bare harness role names ("Explore", "Plan", "General purpose") are
+        a ROLE, never a title: humanized, plus the first instruction's short
+        label when one derives, ≤ 32 chars total (round 3, category 4)."""
+        for role in ("Explore", "Plan", "General purpose",
+                     "general-purpose"):
+            path = self.write_pi(
+                "w/--home-x--/roleonly-%s.jsonl" % role.replace(" ", "-"),
+                _pi_session(1_800_000_000, "Audit the capacity adapter math",
+                            name=role))
+            title, source = tt.resolve_agent(self._agent(path), "tendril",
+                                             [], titles={}, home=self.home)
+            humanized = tt.humanize_role(role)
+            self.assertTrue(title.startswith(humanized + " ·"),
+                            "%s: %s" % (role, title))
+            self.assertLessEqual(len(title), 32)
+            self.assertEqual(source, "instruction")
+        # no derivable label: the bare humanized role stays
+        path = self.write_pi("w/--home-x--/roleonly-bare.jsonl", _pi_session(
+            1_800_000_000, "ok", name="Explore"))
+        title, source = tt.resolve_agent(self._agent(path), "tendril", [],
+                                         titles={}, home=self.home)
+        self.assertEqual((title, source), ("Explore", "native"))
+
+    def test_negative_instruction_never_title(self):
+        """Negative instructions state a constraint, never a topic: the
+        clause is skipped for the next qualifying one, else None (round 3,
+        category 1)."""
+        self.assertIsNone(tt.derive_title("Do not touch the Tendril"))
+        self.assertIsNone(tt.derive_title("Do not restart the audit"))
+        self.assertEqual(
+            tt.derive_title("Do not touch remote-agents. Rewrite the pane "
+                            "registry locks"),
+            "Rewrite the pane registry locks")
+
     def test_manual_beats_everything(self):
         path = self.write_pi("w/--home-x--/e.jsonl", _pi_session(
             1_800_000_000, "Rewrite the pairing bloom timings",
