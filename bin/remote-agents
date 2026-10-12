@@ -471,7 +471,7 @@ def render(rows, note="", selected=None):
         if cur:
             grouped.append(cur)
         return grouped
-    feet = foot_lines(["N New", "I Info", "? Help", "R Refresh", "Q Quit"])
+    feet = foot_lines(["N New", "I Info", "? Help", "R Refresh", "Q Quit", "L Link"])
 
     compact = len(rows) > 6
     # Paths yield when needed to keep the menu and prompt on screen, or when
@@ -1318,14 +1318,21 @@ def menu_loop(rows, tty_mode=False, fd=None, note="", preferred_id=None):
         elif raw.lower() == "l":
             # U9: the phone asked for the TENDRIL Link app. The selector
             # runs on the HOST and cannot reach Android's `am`; instead it
-            # exits with a distinctive status that phone/tendril — which
-            # launched the ssh session — turns into the fixed local
-            # `am start -n app.tendril.link/.MainActivity`. ssh propagates
-            # the status; mosh does not (verified: mosh 1.4.0 exits 0
-            # regardless), so over mosh — and when the selector runs on
-            # the host directly — this one-line hint is what the user
-            # sees. 75 = EX_TEMPFAIL; remote-agents exits only 0/1/2
-            # otherwise.
+            # signals the phone launcher, which turns the signal into the
+            # fixed local `am start -n app.tendril.link/.MainActivity`.
+            # Two transports, two signals (LINK-CONTRACT-0.2 §4):
+            # - ssh propagates exit statuses — 75 = EX_TEMPFAIL rides the
+            #   status (remote-agents exits only 0/1/2 otherwise).
+            # - mosh does NOT (verified mosh 1.4.0 exits 0 regardless), so
+            #   the request rides a flag file the phone launcher consumes
+            #   with one BatchMode ssh after the session ends.
+            # Over mosh — and when the selector runs on the host directly —
+            # the one-line hint is also what the user sees in-band.
+            if os.environ.get("SSH_CONNECTION"):
+                print("L opens TENDRIL Link on the phone — "
+                      "if nothing opened, run: tendril link")
+                return LINK_OPEN_EXIT
+            _request_link_open()
             print("L opens TENDRIL Link on the phone — "
                   "if nothing opened, run: tendril link")
             return LINK_OPEN_EXIT
@@ -1357,6 +1364,43 @@ MAX_TOKEN = 129                             # beyond this the token is junk
 SUBCOMMANDS = ("attach", "enter", "resolve", "focus", "link")
 # Selector key L: exit status the phone launcher watches for (see menu_loop).
 LINK_OPEN_EXIT = 75
+
+
+def _request_link_open():
+    """Leave the phone-consumed link-open request (the mosh path of the
+    selector's L key): mosh drops exit statuses, so the request rides a
+    flag file instead — the phone launcher consumes it with one BatchMode
+    ssh (`--link-open-request`) after the session ends. Atomic tmp+rename;
+    failures are silent (the in-band hint still tells the user the way)."""
+    d = os.path.join(os.path.expanduser("~"), ".local", "state", "tendril")
+    try:
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, ".link-open-request.tmp")
+        with open(tmp, "w") as fh:
+            fh.write("open\n")
+        os.replace(tmp, os.path.join(d, "link-open-request"))
+    except OSError:
+        pass
+
+
+def _link_open_request():
+    """Consume-and-report the selector's L request (phone launcher, after a
+    mosh selector session): prints `open` exactly when the flag existed and
+    removes it — consume-once — prints nothing otherwise; always exit 0."""
+    flag = os.path.join(
+        os.path.expanduser("~"), ".local", "state", "tendril", "link-open-request")
+    try:
+        with open(flag) as fh:
+            content = fh.read().strip()
+    except OSError:
+        return 0
+    try:
+        os.remove(flag)
+    except OSError:
+        pass
+    if content == "open":
+        print("open")
+    return 0
 _RANK_NAME = {rank: name for name, rank in RANK.items()}
 STALE_NOTE = "That agent session has ended — choose another."
 
@@ -2558,6 +2602,9 @@ persistent AI agents.
                               assets, one asset's raw bytes (tendril,
                               termux-url-opener, agent, link-apk), or a
                               generated setup/upgrade script for Termux
+  tendril --link-open-request
+                              consume-and-report the selector's L request
+                              (mosh path): prints `open` once, then clears
   tendril --link-stage <path> stage a built TENDRIL Link APK (tendril-link.apk
                               + tendril-link.json) so phones can pick it up
   tendril --version           the installed version and commit
@@ -2634,6 +2681,8 @@ def main():
         return 0
     if "--upgrade" in args:
         return _upgrade(args)
+    if "--link-open-request" in args:
+        return _link_open_request()
     if "--pair" in args:
         return _pair(args)
     if any(a in args for a in PHONE_FLAGS):

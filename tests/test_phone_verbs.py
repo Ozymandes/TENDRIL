@@ -78,6 +78,14 @@ REMOTE_STUB = ('printf \'remote-agents %s\\n\' "$*" >> "$TENDRIL_RECORD"\n'
                '&& printf \'%s\\n\' "$TENDRIL_REMOTE_MSG"\n'
                'exit "${TENDRIL_REMOTE_RC:-0}"\n')
 AM_STUB = 'printf \'am %s\\n\' "$*" >> "$TENDRIL_RECORD"\nexit 0\n'
+# ssh stub that ANSWERS the link-open flag request (the real mosh-path
+# fix): the consume call prints `open` when TENDRIL_FLAG_OPEN is set;
+# every other call records and exits 0 (the key probe included).
+FLAG_SSH_STUB = (
+    'printf \'ssh %s\\n\' "$*" >> "$TENDRIL_RECORD"\n'
+    'case " $*" in *" --link-open-request"*) '
+    '[ -n "${TENDRIL_FLAG_OPEN:-}" ] && printf \'open\\n\' ;; esac\n'
+    'exit 0\n')
 TERMUX_AM_STUB = ('printf \'termux-am %s\\n\' "$*" >> "$TENDRIL_RECORD"\n'
                   'exit 0\n')
 
@@ -408,6 +416,21 @@ class LinkVerb(LauncherEnv):
         self.assertEqual(self.calls(), [])
 
 
+    def test_link_manifest_is_one_batchmode_ssh_with_a_fixed_command(self):
+        p = self.run_launcher(["testhost", "link-manifest"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.calls(),
+                         ["ssh -o BatchMode=yes -o ConnectTimeout=6 "
+                          + BATCH_CM +
+                          " testhost remote-agents --phone-manifest"])
+
+    def test_link_manifest_extra_arg_is_refused_without_dialing(self):
+        p = self.run_launcher(["link-manifest", "--evil"])
+        self.assertEqual(p.returncode, 2)
+        self.assertEqual(self.calls(), [])
+        self.assertIn("usage", p.stdout + p.stderr)
+
+
 class SelectorLKey(LauncherEnv):
     """The selector's L key (75): am over ssh, hint over mosh/host."""
 
@@ -430,7 +453,8 @@ class SelectorLKey(LauncherEnv):
     def test_over_mosh_the_hint_is_printed_and_am_never_runs(self):
         # The host selector prints the hint and exits 75; mosh-client does
         # not propagate the status (the stub encodes that), so the launcher
-        # exits 0 with the hint on the terminal and no `am` anywhere.
+        # consumes the host-side L flag with one BatchMode ssh; the stub
+        # answers nothing, so no `am` anywhere — the hint is the UX.
         p = self.run_launcher(["testhost"], TENDRIL_REMOTE_MSG=HINT,
                               TENDRIL_REMOTE_RC="75")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
@@ -438,7 +462,27 @@ class SelectorLKey(LauncherEnv):
         self.assertEqual(self.am_calls(), [])
         mosh = [c for c in self.calls() if c.startswith("mosh ")]
         self.assertEqual(len(mosh), 1)
-        self.assertEqual(self.ssh_calls(), [])       # no ssh fallback here
+        # no ssh FALLBACK here — the only ssh is the flag consume, which
+        # (stub answers nothing) opens nothing: the hint is the UX.
+        consume = [c for c in self.ssh_calls() if "--link-open-request" in c]
+        self.assertEqual(len(consume), 1)
+
+    def test_over_mosh_the_flag_opens_the_app(self):
+        # The REAL mosh fix (v0.2.x): the selector leaves a host-side flag;
+        # the launcher consumes it with one BatchMode ssh and runs the fixed
+        # am start when the host answers `open`.
+        self.stub("ssh", FLAG_SSH_STUB)
+        p = self.run_launcher(["testhost"], TENDRIL_REMOTE_MSG=HINT,
+                              TENDRIL_REMOTE_RC="75", TENDRIL_FLAG_OPEN="1")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.am_calls(), [AM_LINE])
+
+    def test_over_mosh_no_flag_opens_nothing(self):
+        self.stub("ssh", FLAG_SSH_STUB)
+        p = self.run_launcher(["testhost"], TENDRIL_REMOTE_MSG=HINT,
+                              TENDRIL_REMOTE_RC="75")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertEqual(self.am_calls(), [])
 
     def test_over_mosh_exit_0_is_quiet(self):
         p = self.run_launcher(["testhost"])
@@ -459,14 +503,64 @@ class SelectorLKey(LauncherEnv):
     def test_selector_l_on_the_host_prints_the_hint_and_exits_75(self):
         ra = load_ra()
         out = io.StringIO()
-        with mock.patch.object(ra, "read_menu_action",
-                               return_value=("line", "l")):
-            with contextlib.redirect_stdout(out):
-                rc = ra.menu_loop([], tty_mode=True)
+        with mock.patch.dict(os.environ, {"HOME": self.tmp}):
+            with mock.patch.object(ra, "read_menu_action",
+                                   return_value=("line", "l")):
+                with contextlib.redirect_stdout(out):
+                    rc = ra.menu_loop([], tty_mode=True)
         self.assertEqual(rc, ra.LINK_OPEN_EXIT)
         self.assertEqual(rc, 75)
         self.assertIn("L opens TENDRIL Link", out.getvalue())
         self.assertIn("run: tendril link", out.getvalue())
+
+    def test_selector_l_without_ssh_leaves_the_flag_the_launcher_consumes(self):
+        # mosh/host-direct: the exit status cannot carry the request, so the
+        # selector leaves the flag file for the launcher's one ssh consume.
+        ra = load_ra()
+        flag = os.path.join(self.tmp, ".local", "state", "tendril",
+                            "link-open-request")
+        self.assertFalse(os.path.exists(flag))
+        with mock.patch.dict(os.environ, {"HOME": self.tmp}):
+            os.environ.pop("SSH_CONNECTION", None)
+            with mock.patch.object(ra, "read_menu_action",
+                                   return_value=("line", "l")):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    rc = ra.menu_loop([], tty_mode=True)
+        self.assertEqual(rc, 75)
+        with open(flag) as f:
+            self.assertEqual(f.read().strip(), "open")
+
+    def test_selector_l_over_ssh_leaves_no_flag_the_status_rides_instead(self):
+        ra = load_ra()
+        flag = os.path.join(self.tmp, ".local", "state", "tendril",
+                            "link-open-request")
+        with mock.patch.dict(os.environ, {"HOME": self.tmp,
+                                          "SSH_CONNECTION": "1 2 3 4"}):
+            with mock.patch.object(ra, "read_menu_action",
+                                   return_value=("line", "L")):
+                with contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(
+                        ra.menu_loop([], tty_mode=True), ra.LINK_OPEN_EXIT)
+        self.assertFalse(os.path.exists(flag))
+
+    def test_link_open_request_consumes_once(self):
+        # The verb: `open` exactly when the flag existed (and removes it —
+        # consume-once), silence otherwise; always exit 0.
+        ra = load_ra()
+        flag_dir = os.path.join(self.tmp, ".local", "state", "tendril")
+        os.makedirs(flag_dir, exist_ok=True)
+        flag = os.path.join(flag_dir, "link-open-request")
+        with open(flag, "w") as f:
+            f.write("open\n")
+        with mock.patch.dict(os.environ, {"HOME": self.tmp}):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ra._link_open_request(), 0)
+            self.assertEqual(out.getvalue(), "open\n")
+        self.assertFalse(os.path.exists(flag))       # consumed
+        with mock.patch.dict(os.environ, {"HOME": self.tmp}):
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ra._link_open_request(), 0)
+            self.assertEqual(out.getvalue(), "")      # silence without a flag
 
     def test_selector_quit_on_the_host_prints_no_hint(self):
         ra = load_ra()
@@ -477,6 +571,19 @@ class SelectorLKey(LauncherEnv):
                 rc = ra.menu_loop([], tty_mode=True)
         self.assertEqual(rc, 0)
         self.assertNotIn("tendril link", out.getvalue())
+
+    def test_selector_l_and_l_behave_identically(self):
+        for key in ("l", "L"):
+            ra = load_ra()
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, {"HOME": self.tmp}):
+                os.environ.pop("SSH_CONNECTION", None)
+                with mock.patch.object(ra, "read_menu_action",
+                                       return_value=("line", key)):
+                    with contextlib.redirect_stdout(out):
+                        rc = ra.menu_loop([], tty_mode=True)
+            self.assertEqual(rc, 75)
+            self.assertIn("L opens TENDRIL Link", out.getvalue())
 
 
 class LauncherHygiene(LauncherEnv):

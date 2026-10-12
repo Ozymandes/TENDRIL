@@ -33,6 +33,9 @@
 #                                 no Mosh): id is t-YYYYMMDD-8hex, payload is
 #                                 1..16384 base64url chars (A-Z a-z 0-9 _ -)
 #   tendril [<alias>] capacity   host capacity report (JSON) over plain SSH
+#   tendril [<alias>] link-manifest
+#                                the staged Link build's manifest over plain
+#                                SSH (read-only; the Link app's update check)
 #   tendril [<alias>] health     host health report (JSON) over plain SSH:
 #                                Herdr state + tendril/services — the Link
 #                                app's failure classifier (contract §6.3)
@@ -253,6 +256,9 @@ else
         snapshot)
             [ "$#" -eq 1 ] || { echo "usage: tendril [<alias>] snapshot"; exit 2; }
             MODE="snapshot"; ALIAS="$DEFAULT_ALIAS" ;;
+        link-manifest)
+            [ "$#" -eq 1 ] || { echo "usage: tendril [<alias>] link-manifest"; exit 2; }
+            MODE="link-manifest"; ALIAS="$DEFAULT_ALIAS" ;;
         capacity)
             [ "$#" -eq 1 ] || { echo "usage: tendril [<alias>] capacity"; exit 2; }
             MODE="capacity"; ALIAS="$DEFAULT_ALIAS" ;;
@@ -277,6 +283,9 @@ else
                 snapshot)
                     [ "$#" -eq 2 ] || { echo "usage: tendril [<alias>] snapshot"; exit 2; }
                     MODE="snapshot"; ALIAS="$1" ;;
+                link-manifest)
+                    [ "$#" -eq 2 ] || { echo "usage: tendril [<alias>] link-manifest"; exit 2; }
+                    MODE="link-manifest"; ALIAS="$1" ;;
                 capacity)
                     [ "$#" -eq 2 ] || { echo "usage: tendril [<alias>] capacity"; exit 2; }
                     MODE="capacity"; ALIAS="$1" ;;
@@ -301,6 +310,11 @@ REMOTE_CMD="$REMOTE_BIN"
 if [ "$MODE" = "snapshot" ]; then
     # snapshot takes NO session id: a fixed one-word remote command.
     REMOTE_CMD="$REMOTE_BIN snapshot"
+elif [ "$MODE" = "link-manifest" ]; then
+    # the staged Link build's manifest (v0.2.x update check): read-only,
+    # fixed one-word remote command, sh-parsable — the Link app compares
+    # the staged versionCode against its own. Nothing is installed.
+    REMOTE_CMD="$REMOTE_BIN --phone-manifest"
 elif [ "$MODE" = "capacity" ]; then
     # capacity is read-only and takes NO arguments: a fixed remote command.
     REMOTE_CMD="$REMOTE_BIN capacity --json"
@@ -398,7 +412,7 @@ case "$MODE" in
         _t_log transport-chosen-ssh
         _t_log ssh-exec
         exec ssh $SESSION_CM_OPTS "$ALIAS" "$REMOTE_CMD" ;;
-    snapshot | schedule | capacity | health | herdr)
+    snapshot | schedule | capacity | health | herdr | link-manifest)
         _t_log transport-chosen-ssh
         _t_log ssh-exec
         exec ssh -o BatchMode=yes -o ConnectTimeout=6 $BATCH_CM_OPTS \
@@ -448,6 +462,13 @@ if [ -z "$FORCE_SSH" ] && command -v mosh >/dev/null 2>&1; then
     _t_log mosh-exec
     if mosh --ssh="ssh $SESSION_CM_OPTS" "$ALIAS" \
         -- sh -lc "exec $REMOTE_CMD"; then
+        # mosh drops the selector's exit status, so an L request cannot ride
+        # it: the host selector leaves a flag file instead — consume it with
+        # one quick BatchMode ssh (warm master) and open the app when set.
+        if ssh -o BatchMode=yes $BATCH_CM_OPTS "$ALIAS" \
+            "remote-agents --link-open-request" 2>/dev/null | grep -q '^open$'; then
+            open_link_app
+        fi
         exit 0
     fi
     _t_log fallback
