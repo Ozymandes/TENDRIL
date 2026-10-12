@@ -30,6 +30,14 @@ session identity — transcript path or Claude UUID) and NEVER recomputed;
 only a manual label replaces it. Pane reuse can never inherit a title: the
 cache is keyed by the session identity, and every entry also stores the
 session's start time — a mismatched start invalidates the entry.
+
+Claude Code panes report agent_session {kind:"id", value:<uuid>} — no
+local path. Their transcript is located under ~/.claude/projects/*/<uuid>.jsonl
+(regular, under $HOME, bounded reads, mtime-memoized) and resolved through
+the same precedence: native summary / custom title entry, else the first
+meaningful user turn (meta, sidechain, command-wrapper and tool_result-only
+entries are never instructions), else the salient-term summary — else the
+workspace fallback, exactly as for Pi.
 """
 
 import json
@@ -916,10 +924,14 @@ def _iter_jsonl(path, tail=False, window=SCAN_WINDOW):
                 except Exception:
                     continue
                 if isinstance(d, dict):
+                    # identity dedupe ONLY for entries that carry one: Claude
+                    # custom-title rows (ai-title) have no id/timestamp, and
+                    # collapsing them would freeze the FIRST title forever.
                     key = d.get("id"), d.get("type"), d.get("timestamp")
-                    if key in seen:
-                        continue
-                    seen.add(key)
+                    if key[0] or key[2]:
+                        if key in seen:
+                            continue
+                        seen.add(key)
                     yield d
 
 
@@ -1008,6 +1020,149 @@ def _message_text(d):
                 parts.append(item["text"])
         return "\n".join(parts) if parts else None
     return None
+
+
+# ------------------------------------------------------------------------
+# Claude Code transcripts (~/.claude/projects/<project>/<uuid>.jsonl)
+# — read-only, bounded, same guards as the Pi path.
+
+# a slash-command expansion / injected context is orchestration, never an
+# instruction (string or text-block content alike)
+_CLAUDE_CMD_WRAP_RE = re.compile(
+    r"<command-|<local-command-stdout>|<system-reminder>")
+
+
+def claude_transcript_path(uuid, home=None):
+    """Locate one Claude Code transcript: ~/.claude/projects/<project>/
+    <uuid>.jsonl. Guards mirror the Pi path: the file must exist, be a
+    REGULAR file and resolve under $HOME; the directory walk is bounded and
+    memoized per process (positive hits only — a missing transcript is
+    re-probed, it may appear later). None when no transcript exists."""
+    home = home or HOME
+    if not isinstance(uuid, str) or not UUID_RE.match(uuid):
+        return None
+    mkey = ("cllocate", home, uuid)
+    hit = _memo_get(mkey)
+    if hit is not None:
+        return hit.get("path")
+    root = os.path.join(home, ".claude", "projects")
+    path = None
+    try:
+        entries = os.listdir(root)[:512]
+    except OSError:
+        entries = []
+    target = uuid + ".jsonl"
+    for entry in entries:
+        d = os.path.join(root, entry)
+        if not os.path.isdir(d):
+            continue
+        p = os.path.join(d, target)
+        if not _is_regular(p):
+            continue
+        rp = os.path.realpath(p)
+        if not _under_home(rp, home):
+            continue
+        path = p
+        break
+    return _memo_put(mkey, {"path": path}).get("path")
+
+
+def _claude_session_start(path):
+    """The transcript's own start epoch: the first line's timestamp, else
+    the file mtime — the pane-reuse pin for UUID-keyed sessions (stable as
+    the transcript grows). Cached per mtime."""
+    key = (path, _safe_mtime(path), "clstart")
+    hit = _memo_get(key)
+    if hit is not None and "start" in hit:
+        return hit["start"]
+    start = None
+    try:
+        with open(path, "rb") as f:
+            head = f.read(HEADER_BYTES)
+    except OSError:
+        head = b""
+    line = head.split(b"\n", 1)[0][:HEADER_BYTES]
+    try:
+        d = json.loads(line)
+    except Exception:
+        d = None
+    if isinstance(d, dict):
+        start = _iso_to_epoch(d.get("timestamp"))
+    if not start:
+        start = _safe_mtime(path)
+    return _memo_put(key, {"start": start}).get("start")
+
+
+def claude_native_title(path):
+    """The newest native title in a Claude transcript — a `summary` entry
+    (compaction) or the custom-title entry (ai-title) — sanitized, or None.
+    JSONL is append-ordered, so the LAST non-empty candidate wins. Cached
+    per mtime."""
+    key = (path, _safe_mtime(path), "clnat")
+    hit = _memo_get(key)
+    if hit is not None and "name" in hit:
+        return hit["name"]
+    best = None
+    for d in _iter_jsonl(path, tail=True):
+        t = d.get("type")
+        if t == "summary":
+            v = d.get("summary")
+        elif t == "ai-title":
+            v = d.get("aiTitle")
+        else:
+            continue
+        if isinstance(v, str) and v.strip():
+            best = v.strip()
+    name = sanitize_title(best, WIRE_TITLE_CAP)
+    return _memo_put(key, {"name": name}).get("name")
+
+
+def _claude_user_text(d):
+    """One Claude entry's user-instruction text, or None. Skips non-user
+    rows, isMeta, isSidechain, tool_result-only bodies and command
+    wrappers; text blocks are joined when present."""
+    if d.get("type") != "user":
+        return None
+    if d.get("isMeta") or d.get("isSidechain"):
+        return None
+    m = d.get("message")
+    if not isinstance(m, dict) or m.get("role") != "user":
+        return None
+    c = m.get("content")
+    if isinstance(c, str):
+        text = c
+    elif isinstance(c, list):
+        parts = []
+        for item in c:
+            if isinstance(item, dict) and item.get("type") == "text" \
+                    and isinstance(item.get("text"), str):
+                parts.append(item["text"])
+        text = "\n".join(parts) if parts else None
+    else:
+        return None
+    if not text or not text.strip():
+        return None
+    if _CLAUDE_CMD_WRAP_RE.search(text):
+        return None                     # a command wrapper, never a topic
+    return text.strip()[:INSTRUCTION_CAP]
+
+
+def claude_first_instructions(path, max_turns=3, window=SCAN_MAX):
+    """The first <= max_turns meaningful Claude user instructions, oldest
+    first, each capped. Cached per mtime."""
+    key = (path, _safe_mtime(path), "clinstr", window)
+    hit = _memo_get(key)
+    if hit is not None and "turns" in hit:
+        return hit["turns"]
+    turns = []
+    for d in _iter_jsonl(path, tail=False, window=window):
+        if len(turns) >= max_turns:
+            break
+        text = _claude_user_text(d)
+        if not text:
+            continue
+        turns.append(text)
+    return _memo_put(key, {"turns": turns}).get("turns") or []
 
 
 def first_instructions(path, max_turns=3, window=SCAN_MAX):
@@ -1140,7 +1295,8 @@ def _store(titles, key, title, source, start, pane=None):
 
 
 def _native_title(agent, key, titles, now, home=None):
-    """Level 2: Pi session_info name, else the Herdr agent name when it is
+    """Level 2: the Pi session_info name, the Claude transcript's native
+    summary / custom title, or else the Herdr agent name when it is
     not a scheduler routing token (`-<hash>` stripped). A machine-assigned
     role id (`general-purpose#20894abc`) is NEVER shown raw: it is the
     child's ROLE — humanized, plus the short task label from the session's
@@ -1158,6 +1314,12 @@ def _native_title(agent, key, titles, now, home=None):
             if name.strip().lower().replace("_", " ") in _ROLE_ONLY:
                 return _role_native_title(key, name, home, total_cap=32)
             return name, "native"
+    elif key and UUID_RE.match(key):
+        cl = claude_transcript_path(key, home)
+        if cl:
+            name = claude_native_title(cl)
+            if name:
+                return name, "native"
     name = agent.get("name")
     if isinstance(name, str) and name.strip() \
             and not SCHEDULER_NAME_RE.match(name.strip()):
@@ -1231,7 +1393,11 @@ def resolve_agent(agent, workspace_label, schedule_tasks,
     harness = str(agent.get("agent") or "").strip().lower() or "agent"
     pane = agent.get("pane_id")
     key = session_key(agent, home)
+    claude_tx = claude_transcript_path(key, home) \
+        if key and UUID_RE.match(key) else None
     start = _start_of(agent, key)
+    if start is None and claude_tx:
+        start = _claude_session_start(claude_tx)
 
     cached = titles.get(key) if key else None
     if _cache_valid(cached, start):
@@ -1252,25 +1418,30 @@ def resolve_agent(agent, workspace_label, schedule_tasks,
             _store(titles, key, sched, "scheduler", start, pane)
         return sched, "scheduler"
 
-    # 4 instruction / 5 summary — only from a local transcript we may read
+    # 4 instruction / 5 summary — only from a local transcript we may read:
+    # a Pi JSONL path, or the located transcript of a Claude session UUID
+    tx_path = None
+    tx_turns = []
     if key and os.path.isabs(key) and key.endswith(".jsonl") \
             and _is_regular(key) and _under_home(os.path.realpath(key), home):
-        turns = first_instructions(key)
-        if turns:
-            t4 = derive_title(turns[0])
+        tx_path = key
+        tx_turns = first_instructions(key)
+    elif claude_tx:
+        tx_path = claude_tx
+        tx_turns = claude_first_instructions(claude_tx)
+    if tx_turns:
+        t4 = derive_title(tx_turns[0])
+        if t4:
+            t4 = sanitize_title(t4, WIRE_TITLE_CAP)
             if t4:
-                t4 = sanitize_title(t4, WIRE_TITLE_CAP)
-                if t4:
-                    if key:
-                        _store(titles, key, t4, "instruction", start, pane)
-                    return t4, "instruction"
-            t5 = derive_summary(turns)
+                _store(titles, key, t4, "instruction", start, pane)
+                return t4, "instruction"
+        t5 = derive_summary(tx_turns)
+        if t5:
+            t5 = sanitize_title(t5, WIRE_TITLE_CAP)
             if t5:
-                t5 = sanitize_title(t5, WIRE_TITLE_CAP)
-                if t5:
-                    if key:
-                        _store(titles, key, t5, "summary", start, pane)
-                    return t5, "summary"
+                _store(titles, key, t5, "summary", start, pane)
+                return t5, "summary"
 
     # 6 workspace fallback (deterministic; not persisted)
     wl = sanitize_title(workspace_label, 24) if workspace_label else None
@@ -1494,18 +1665,54 @@ def _root_pi_sessions(home=None):
     return out
 
 
+def _root_claude_sessions(home=None):
+    """Bounded newest-first [(path, uuid, mtime)] of Claude Code
+    transcripts: ~/.claude/projects/<project>/<uuid>.jsonl, regular files
+    under $HOME only."""
+    home = home or HOME
+    root = os.path.join(home, ".claude", "projects")
+    out = []
+    if not os.path.isdir(root):
+        return out
+    for entry in os.listdir(root)[:512]:
+        d = os.path.join(root, entry)
+        if not os.path.isdir(d):
+            continue
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for n in names:
+            if not n.endswith(".jsonl"):
+                continue
+            uuid = n[:-len(".jsonl")]
+            if not UUID_RE.match(uuid):
+                continue
+            p = os.path.join(d, n)
+            mt = _safe_mtime(p)
+            if mt is not None and _is_regular(p) \
+                    and _under_home(os.path.realpath(p), home):
+                out.append((p, uuid, mt))
+    out.sort(key=lambda x: x[2], reverse=True)
+    return out
+
+
 def backfill(dry_run=False, home=None, cache_path=None, limit=512,
              now=None, report_samples=15):
-    """One-shot migration (§11): derive titles for root sessions that have
-    no session_info name and no cache entry, and persist level 4-5 titles
-    in the host cache ONLY — existing JSONL files are never appended to.
-    Idempotent: a second run is a no-op. Returns a report dict."""
+    """One-shot migration (§11): derive titles for root Pi sessions and
+    Claude Code transcripts that have no native title and no cache entry,
+    and persist level 4-5 titles in the host cache ONLY — existing JSONL
+    files are never appended to. Idempotent: a second run is a no-op.
+    Returns a report dict."""
     home = home or HOME
     now = now if now is not None else time.time()
     cache_path = cache_path or CACHE_FILE
     titles = load_cache(cache_path)
     derived = {"instruction": 0, "summary": 0}
     skipped = {"named": 0, "child": 0, "cached": 0, "underived": 0}
+    claude = {"scanned": 0,
+              "derived": {"instruction": 0, "summary": 0},
+              "skipped": {"native": 0, "cached": 0, "underived": 0}}
     samples = []
     scanned = 0
     for path, _mt in _root_pi_sessions(home)[:limit]:
@@ -1539,13 +1746,46 @@ def backfill(dry_run=False, home=None, cache_path=None, limit=512,
             samples.append(title)
         if not dry_run:
             _store(titles, path, title, source, h.get("ts") or _safe_mtime(path))
-    if not dry_run and (derived["instruction"] or derived["summary"]):
+    # Claude Code transcripts: same migration, keyed by the session UUID
+    # (the identity live panes carry), guarded the same way, cache-only.
+    for path, uuid, _mt in _root_claude_sessions(home)[:limit]:
+        claude["scanned"] += 1
+        if uuid in titles:
+            claude["skipped"]["cached"] += 1
+            continue
+        native = claude_native_title(path)
+        if native:
+            claude["skipped"]["native"] += 1
+            continue
+        turns = claude_first_instructions(path)
+        title = derive_title(turns[0]) if turns else None
+        source = "instruction" if title else None
+        if not title:
+            title = derive_summary(turns)
+            source = "summary" if title else None
+        if not title:
+            claude["skipped"]["underived"] += 1
+            continue
+        title = sanitize_title(title, WIRE_TITLE_CAP)
+        if not title:
+            claude["skipped"]["underived"] += 1
+            continue
+        claude["derived"][source] += 1
+        if len(samples) < report_samples:
+            samples.append(title)
+        if not dry_run:
+            _store(titles, uuid, title, source,
+                   _claude_session_start(path))
+    if not dry_run and (derived["instruction"] or derived["summary"]
+                        or claude["derived"]["instruction"]
+                        or claude["derived"]["summary"]):
         _save_cache(titles, cache_path)
     return {
         "dry_run": bool(dry_run),
         "scanned": scanned,
         "derived": derived,
         "skipped": skipped,
+        "claude": claude,
         "cache_entries": len(load_cache(cache_path)),
         "samples": samples,
     }
