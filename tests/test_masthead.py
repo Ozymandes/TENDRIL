@@ -413,6 +413,9 @@ class Launcher(unittest.TestCase):
         r = subprocess.run(["sh", os.path.join(self.home_bin, name), *args],
                            capture_output=True, text=True, env=e, timeout=20)
         calls = read(self.log, "r") if os.path.exists(self.log) else ""
+        # the per-launch link-open nonce is random by design
+        calls = re.sub(r"(TENDRIL_LINK_NONCE=|--link-open-request )[0-9a-f]{16}",
+                       r"\1<nonce>", calls)
         return r.returncode, calls, r.stdout
 
     def test_agent_alias_runs_exactly_what_tendril_runs(self):

@@ -47,6 +47,9 @@
 #                                (Termux: am start; LOCAL ONLY — no ssh, no
 #                                alias, no args, never a URI from input)
 #   tendril --upgrade     refresh the launchers + TENDRIL Link from the host
+#                         (typed in Termux: opens the Android installer;
+#                         from the Link app - no terminal - it only parks the
+#                         verified APK and the app opens the installer)
 #   tendril --version     print the launcher build id (tendril-phone <sha12>)
 #
 # <id> is anything `remote-agents attach`/`enter` resolves on the host: the canonical
@@ -59,8 +62,8 @@
 # The selector's L key ends the remote session with this status: the phone
 # launcher launched ssh and turns it into a local
 # `am start -n app.tendril.link/.MainActivity`. 75 = EX_TEMPFAIL; ssh
-# propagates it, mosh does not — over mosh the host selector prints its
-# own one-line hint instead (LINK-CONTRACT-0.2 §4).
+# propagates it, mosh does not — over mosh the request rides a host-side
+# file named by this launch's nonce instead (see link_nonce below).
 LINK_OPEN_STATUS=75
 
 # ---------- RC2 perf: launch trace + SSH connection reuse ----------------
@@ -151,12 +154,27 @@ open_link_app() {
     "$_am" start -n app.tendril.link/.MainActivity
 }
 
+# link_nonce - 16 lowercase hex from /dev/urandom (empty when unavailable).
+# Names THIS launch's link-open request on the host: the selector writes
+# it on L, the post-mosh consume reads + removes exactly that one, so no
+# request can ever outlive its own session or open the app after a Q.
+link_nonce() {
+    _ln=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    case "$_ln" in
+        *[!0-9a-f]* | "") return 0 ;;
+    esac
+    [ "${#_ln}" -eq 16 ] && printf '%s' "$_ln"
+    return 0
+}
+
 # finish_interactive <rc> - end an interactive session: the selector's Link
 # key (LINK_OPEN_STATUS) opens the app here on the phone; every other
 # status passes through untouched.
 finish_interactive() {
     if [ "$1" -eq "$LINK_OPEN_STATUS" ]; then
+        _t_log link-open
         open_link_app
+        _t_log link-open-done "$?"
         exit 0
     fi
     exit "$1"
@@ -502,14 +520,30 @@ if [ -z "$FORCE_SSH" ] && command -v mosh >/dev/null 2>&1; then
     # --ssh (same ControlPath as every other launcher ssh).
     _t_log transport-chosen-mosh
     _t_log mosh-exec
+    NONCE=$(link_nonce)
+    if [ -n "$NONCE" ]; then
+        MOSH_CMD="export TENDRIL_LINK_NONCE=$NONCE; exec $REMOTE_CMD"
+    else
+        MOSH_CMD="exec $REMOTE_CMD"
+    fi
     if mosh --ssh="ssh $SESSION_CM_OPTS" "$ALIAS" \
-        -- sh -lc "exec $REMOTE_CMD"; then
+        -- sh -lc "$MOSH_CMD"; then
         # mosh drops the selector's exit status, so an L request cannot ride
-        # it: the host selector leaves a flag file instead — consume it with
-        # one quick BatchMode ssh (warm master) and open the app when set.
-        if ssh -o BatchMode=yes $BATCH_CM_OPTS "$ALIAS" \
-            "remote-agents --link-open-request" 2>/dev/null | grep -q '^open$'; then
-            open_link_app
+        # it: the host selector leaves a request named by THIS launch's
+        # nonce — consume it with one quick BatchMode ssh and open the app
+        # when it was there. No nonce, no request, no consume.
+        _t_log mosh-done
+        if [ -n "$NONCE" ]; then
+            _t_log link-consume
+            if ssh -o BatchMode=yes -o ConnectTimeout=6 $BATCH_CM_OPTS "$ALIAS" \
+                "$REMOTE_BIN --link-open-request $NONCE" 2>/dev/null \
+                | grep -q '^open$'; then
+                _t_log link-open
+                open_link_app
+                _t_log link-open-done "$?"
+            else
+                _t_log link-none
+            fi
         fi
         exit 0
     fi

@@ -138,8 +138,11 @@ class TraceOn(TraceEnv):
         p = self.run_launcher([], TENDRIL_ALIAS="secrethost")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         stages, stamps = self.log_stages()
+        # after the session: the one nonce-scoped L consume (the stub host
+        # answers nothing, so no app open)
         self.assertEqual(stages, ["start", "args-validated",
-                                  "transport-chosen-mosh", "mosh-exec"])
+                                  "transport-chosen-mosh", "mosh-exec",
+                                  "mosh-done", "link-consume", "link-none"])
         self.assertEqual(stamps, sorted(stamps))
         # verb names only: no hostname, no remote command, no id anywhere
         with open(self.log_path()) as f:

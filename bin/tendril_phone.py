@@ -296,6 +296,7 @@ def _script_values():
     vals["APK_NAME"] = apk["versionName"] if apk else ""
     vals["APK_SHA"] = apk["sha256"] if apk else ""
     vals["APK_SIZE"] = str(apk["size"]) if apk else ""
+    vals["APK_SIGNER"] = apk["signer_sha256"] if apk else ""
     # Belt and braces: every embedded value must be quote-safe. A value
     # that is not falls back to a safe placeholder (the phone-side sha256
     # check then refuses anything it cannot trust).
@@ -330,6 +331,7 @@ APK_CODE='@APK_CODE@'           # empty: no TENDRIL Link APK staged on the host
 APK_NAME='@APK_NAME@'
 APK_SHA='@APK_SHA@'
 APK_SIZE='@APK_SIZE@'
+APK_SIGNER='@APK_SIGNER@'       # host-pinned signing-cert sha256 (the Link app re-checks it)
 
 command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || {
     echo "PHONE // neither sha256sum nor shasum found - refusing to install unverified." >&2
@@ -587,7 +589,20 @@ if [ "$MODE" = setup ]; then
 fi
 echo "  TENDRIL Link   $LINK_ROW"
 
-if [ -n "$PENDING_APK" ]; then
+if [ -n "$PENDING_APK" ] && [ ! -t 0 ]; then
+    # HEADLESS (stdin is not a terminal): the TENDRIL Link app's background
+    # RUN_COMMAND. Nothing here may prompt or open an activity: Termux keeps
+    # a background command's stdin open until the process exits (a `read`
+    # would hang forever), and Termux is not the foreground app, so Android
+    # suppresses its activity starts (termux-open would silently do
+    # nothing). The verified APK stays parked; the Link app - foreground -
+    # reads it through Termux's RUN_COMMAND-gated file provider, re-verifies
+    # sha256/size/package/versionCode/signer itself, and opens the system
+    # installer (whose confirmation always stays).
+    echo "  APK saved: $PENDING_APK"
+    echo "  APK verified: $APK_CODE $APK_SHA $APK_SIZE $APK_SIGNER"
+    echo "  handoff: app"
+elif [ -n "$PENDING_APK" ]; then
     if command -v termux-open >/dev/null 2>&1; then
         # Termux's content provider refuses APK opens unless external apps
         # are allowed - ensure the property (same idempotent logic as setup)

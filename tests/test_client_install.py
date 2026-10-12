@@ -8,6 +8,7 @@ resolve/focus/link verbs (one plain SSH round trip, no key check, no Mosh).
 HOME is a temp dir with a space in its name; the real home is never touched.
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -37,6 +38,9 @@ MOSH_STUB = ('printf \'mosh %s\\n\' "$*" >> "$TENDRIL_RECORD"\n'
              'exit "${TENDRIL_MOSH_RC:-0}"\n')
 REMOTE_STUB = 'printf \'remote-agents %s\\n\' "$*" >> "$TENDRIL_RECORD"\n'
 
+
+
+NONCE_RE = re.compile(r"(TENDRIL_LINK_NONCE=|--link-open-request )[0-9a-f]{16}")
 
 class ClientEnv(unittest.TestCase):
     """Temp HOME + stub bin dir shared by installer and launcher tests."""
@@ -85,9 +89,12 @@ class ClientEnv(unittest.TestCase):
                               capture_output=True, text=True, timeout=120)
 
     def calls(self):
+        # the per-launch link-open nonce is random by design: normalized so
+        # two launches compare equal on everything else
         try:
             with open(self.record) as f:
-                return f.read().splitlines()
+                return [NONCE_RE.sub(r"\1<nonce>", c)
+                        for c in f.read().splitlines()]
         except OSError:
             return []
 

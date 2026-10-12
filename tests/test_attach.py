@@ -376,8 +376,10 @@ class PhoneLauncher(unittest.TestCase):
         mosh = [c for c in self.calls() if c.startswith("mosh ")]
         self.assertEqual(len(mosh), 1)
         # the remote command is `exec remote-agents enter '<id>'`, so the
-        # selector's Quit ends the session (no orphan mosh)
-        self.assertIn("sh -lc exec remote-agents enter 'w15:p1'", mosh[0])
+        # selector's Quit ends the session (no orphan mosh); this launch's
+        # link-open nonce is exported first (selector L over mosh)
+        self.assertRegex(mosh[0], r"sh -lc export TENDRIL_LINK_NONCE=[0-9a-f]{16}; "
+                                  r"exec remote-agents enter 'w15:p1'$")
         # the remote shell receives the quoted id as one argument
         self.assertIn("remote-agents enter w15:p1", self.calls())
 

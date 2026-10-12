@@ -31,6 +31,7 @@ import contextlib
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from importlib.machinery import SourceFileLoader
@@ -530,54 +531,96 @@ class SelectorLKey(LauncherEnv):
         self.assertIn("L opens TENDRIL Link", out.getvalue())
         self.assertIn("run: tendril link", out.getvalue())
 
-    def test_selector_l_without_ssh_leaves_the_flag_the_launcher_consumes(self):
-        # mosh/host-direct: the exit status cannot carry the request, so the
-        # selector leaves the flag file for the launcher's one ssh consume.
-        ra = load_ra()
-        flag = os.path.join(self.tmp, ".local", "state", "tendril",
-                            "link-open-request")
-        self.assertFalse(os.path.exists(flag))
-        with mock.patch.dict(os.environ, {"HOME": self.tmp}):
-            os.environ.pop("SSH_CONNECTION", None)
+    NONCE = "0123456789abcdef"
+
+    def request_path(self, nonce=None):
+        return os.path.join(self.tmp, ".local", "state", "tendril",
+                            "link-open", nonce or self.NONCE)
+
+    def press(self, ra, key, **env):
+        base = {"HOME": self.tmp}
+        base.update(env)
+        with mock.patch.dict(os.environ, base):
+            for k in ("SSH_CONNECTION", "TENDRIL_LINK_NONCE"):
+                if k not in env:
+                    os.environ.pop(k, None)
             with mock.patch.object(ra, "read_menu_action",
-                                   return_value=("line", "l")):
+                                   return_value=("line", key)):
                 with contextlib.redirect_stdout(io.StringIO()):
-                    rc = ra.menu_loop([], tty_mode=True)
-        self.assertEqual(rc, 75)
-        with open(flag) as f:
+                    return ra.menu_loop([], tty_mode=True)
+
+    def test_selector_l_over_mosh_writes_the_request_despite_ssh_connection(self):
+        # PHYSICAL S21 ROOT CAUSE (build 158): mosh-server inherits
+        # SSH_CONNECTION from its ssh bootstrap (verified on this host:
+        # `mosh omarchy -- env` shows SSH_CONNECTION=...), so the old
+        # "SSH_CONNECTION set => ssh transport" gate skipped the flag on
+        # EVERY mosh session and L behaved exactly like Q.
+        ra = load_ra()
+        rc = self.press(ra, "l", SSH_CONNECTION="100.78.155.82 34062 100.78.155.82 22",
+                        TENDRIL_LINK_NONCE=self.NONCE)
+        self.assertEqual(rc, ra.LINK_OPEN_EXIT)
+        with open(self.request_path()) as f:
             self.assertEqual(f.read().strip(), "open")
 
-    def test_selector_l_over_ssh_leaves_no_flag_the_status_rides_instead(self):
+    def test_selector_l_without_a_nonce_writes_nothing(self):
+        # host desktop / ssh transport / old launcher: no nonce, no request
+        # (nothing anyone could consume later); exit 75 still rides ssh.
         ra = load_ra()
-        flag = os.path.join(self.tmp, ".local", "state", "tendril",
-                            "link-open-request")
-        with mock.patch.dict(os.environ, {"HOME": self.tmp,
-                                          "SSH_CONNECTION": "1 2 3 4"}):
-            with mock.patch.object(ra, "read_menu_action",
-                                   return_value=("line", "L")):
-                with contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(
-                        ra.menu_loop([], tty_mode=True), ra.LINK_OPEN_EXIT)
-        self.assertFalse(os.path.exists(flag))
+        for env in ({}, {"SSH_CONNECTION": "1 2 3 4"}):
+            self.assertEqual(self.press(ra, "L", **env), ra.LINK_OPEN_EXIT)
+        d = os.path.join(self.tmp, ".local", "state", "tendril", "link-open")
+        self.assertEqual(os.listdir(d) if os.path.isdir(d) else [], [])
 
-    def test_link_open_request_consumes_once(self):
-        # The verb: `open` exactly when the flag existed (and removes it —
-        # consume-once), silence otherwise; always exit 0.
+    def test_selector_l_malformed_nonce_writes_nothing(self):
         ra = load_ra()
-        flag_dir = os.path.join(self.tmp, ".local", "state", "tendril")
-        os.makedirs(flag_dir, exist_ok=True)
-        flag = os.path.join(flag_dir, "link-open-request")
-        with open(flag, "w") as f:
-            f.write("open\n")
+        for bad in ("../../x", "ABCDEF0123456789", "0123", "0123456789abcdef;rm"):
+            self.assertEqual(self.press(ra, "l", TENDRIL_LINK_NONCE=bad),
+                             ra.LINK_OPEN_EXIT)
+        d = os.path.join(self.tmp, ".local", "state", "tendril", "link-open")
+        self.assertEqual(os.listdir(d) if os.path.isdir(d) else [], [])
+
+    def test_selector_q_writes_no_request(self):
+        ra = load_ra()
+        for key in ("q", "Q"):
+            self.assertEqual(self.press(ra, key, TENDRIL_LINK_NONCE=self.NONCE), 0)
+        self.assertFalse(os.path.exists(self.request_path()))
+
+    def test_link_open_request_consumes_once_for_its_own_nonce_only(self):
+        ra = load_ra()
+        self.press(ra, "l", TENDRIL_LINK_NONCE=self.NONCE)
+        other = "fedcba9876543210"
         with mock.patch.dict(os.environ, {"HOME": self.tmp}):
             with contextlib.redirect_stdout(io.StringIO()) as out:
-                self.assertEqual(ra._link_open_request(), 0)
+                self.assertEqual(ra._link_open_request(other), 0)
+            self.assertEqual(out.getvalue(), "")        # not its request
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ra._link_open_request(None), 0)
+            self.assertEqual(out.getvalue(), "")        # no nonce, nothing
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                self.assertEqual(ra._link_open_request(self.NONCE), 0)
             self.assertEqual(out.getvalue(), "open\n")
-        self.assertFalse(os.path.exists(flag))       # consumed
-        with mock.patch.dict(os.environ, {"HOME": self.tmp}):
+            self.assertFalse(os.path.exists(self.request_path()))  # consumed
             with contextlib.redirect_stdout(io.StringIO()) as out:
-                self.assertEqual(ra._link_open_request(), 0)
-            self.assertEqual(out.getvalue(), "")      # silence without a flag
+                self.assertEqual(ra._link_open_request(self.NONCE), 0)
+            self.assertEqual(out.getvalue(), "")        # consume-once
+
+    def test_unconsumed_requests_are_swept_after_the_ttl(self):
+        ra = load_ra()
+        self.press(ra, "l", TENDRIL_LINK_NONCE=self.NONCE)
+        old = os.path.getmtime(self.request_path()) - ra.LINK_REQUEST_TTL_S - 5
+        os.utime(self.request_path(), (old, old))
+        with mock.patch.dict(os.environ, {"HOME": self.tmp}):
+            with contextlib.redirect_stdout(io.StringIO()):
+                ra._link_open_request("fedcba9876543210")
+        self.assertFalse(os.path.exists(self.request_path()))
+
+    def test_cli_verb_takes_the_nonce_argument(self):
+        ra = load_ra()
+        self.press(ra, "l", TENDRIL_LINK_NONCE=self.NONCE)
+        p = subprocess.run([sys.executable, RA, "--link-open-request", self.NONCE],
+                           env=dict(os.environ, HOME=self.tmp),
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual((p.returncode, p.stdout), (0, "open\n"), p.stderr)
 
     def test_selector_quit_on_the_host_prints_no_hint(self):
         ra = load_ra()
@@ -601,6 +644,92 @@ class SelectorLKey(LauncherEnv):
                         rc = ra.menu_loop([], tty_mode=True)
             self.assertEqual(rc, 75)
             self.assertIn("L opens TENDRIL Link", out.getvalue())
+
+
+# The REAL round trip of the selector's L key over mosh, across processes:
+# the real phone launcher -> a mosh stub that, like real mosh-server,
+# hands the session an inherited SSH_CONNECTION -> the REAL remote-agents
+# selector (only the keypress is injected) -> the launcher's post-session
+# consume over an ssh stub that runs the REAL `remote-agents
+# --link-open-request <nonce>` -> am. Nothing in between is mocked.
+REAL_MOSH_STUB = (
+    'printf \'mosh %s\\n\' "$*" >> "$TENDRIL_RECORD"\n'
+    'while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done\n'
+    '[ $# -gt 0 ] && shift\n'
+    '[ "$1" = "sh" ] && shift\n'
+    '[ "$1" = "-lc" ] && shift\n'
+    'SSH_CONNECTION="100.124.189.87 42108 100.78.155.82 22" sh -c "$1"\n'
+    'exit 0\n')
+REAL_SSH_STUB = (
+    'printf \'ssh %s\\n\' "$*" >> "$TENDRIL_RECORD"\n'
+    'for last; do :; done\n'
+    'case "$last" in *"--link-open-request"*) sh -c "$last" ;; esac\n'
+    'exit 0\n')
+SELECTOR_SIM = r"""
+import os, sys
+from importlib.machinery import SourceFileLoader
+import importlib.util
+if "--link-open-request" in sys.argv:
+    os.execv(sys.executable, [sys.executable, os.environ["TENDRIL_RA"]] + sys.argv[1:])
+loader = SourceFileLoader("ra_sim", os.environ["TENDRIL_RA"])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+ra = importlib.util.module_from_spec(spec)
+loader.exec_module(ra)
+ra.read_menu_action = lambda *a, **k: ("line", os.environ["TENDRIL_KEY"])
+sys.exit(ra.menu_loop([], tty_mode=True))
+"""
+
+
+class SelectorLRoundTrip(LauncherEnv):
+    """L/l open TENDRIL Link exactly once over mosh; Q/q never do."""
+
+    def setUp(self):
+        super().setUp()
+        sim = os.path.join(self.tmp, "selector_sim.py")
+        with open(sim, "w") as f:
+            f.write(SELECTOR_SIM)
+        self.stub("mosh", REAL_MOSH_STUB)
+        self.stub("ssh", REAL_SSH_STUB)
+        self.stub("remote-agents",
+                  'exec "%s" "%s" "$@"\n' % (sys.executable, sim))
+
+    def round_trip(self, key):
+        self.clear()
+        p = self.run_launcher(["testhost"], TENDRIL_KEY=key, TENDRIL_RA=RA)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        return p
+
+    def requests_left(self):
+        d = os.path.join(self.home, ".local", "state", "tendril", "link-open")
+        return [n for n in os.listdir(d)] if os.path.isdir(d) else []
+
+    def test_l_and_L_open_link_exactly_once(self):
+        for key in ("l", "L"):
+            p = self.round_trip(key)
+            self.assertEqual(self.am_calls(), [AM_LINE], key + p.stdout)
+            # one mosh session, one consume, carrying the SAME nonce
+            mosh = [c for c in self.calls() if c.startswith("mosh ")]
+            consume = [c for c in self.ssh_calls() if "--link-open-request" in c]
+            self.assertEqual((len(mosh), len(consume)), (1, 1))
+            nonce = consume[0].rsplit(" ", 1)[1]
+            self.assertRegex(nonce, r"^[0-9a-f]{16}$")
+            self.assertIn("TENDRIL_LINK_NONCE=%s;" % nonce, mosh[0])
+            self.assertEqual(self.requests_left(), [])     # consumed, no stale
+
+    def test_q_and_Q_never_open_link_and_leave_nothing(self):
+        for key in ("q", "Q"):
+            self.round_trip(key)
+            self.assertEqual(self.am_calls(), [], key)
+            self.assertEqual(self.requests_left(), [])
+
+    def test_a_q_after_an_l_never_reopens(self):
+        self.round_trip("l")
+        self.round_trip("q")
+        self.assertEqual(self.am_calls(), [])           # only the q launch logged
+
+    def test_the_selector_hint_is_shown_in_band(self):
+        p = self.round_trip("l")
+        self.assertIn("L opens TENDRIL Link", p.stdout)
 
 
 class LauncherHygiene(LauncherEnv):
