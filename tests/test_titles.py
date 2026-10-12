@@ -16,6 +16,13 @@ Under test here:
   recomputed (a changed transcript does not move it; only manual does);
 - the PANE-REUSE guard: cache entries pin the session's own start — a
   reused pane (new transcript in the same pane id) never inherits;
+- CLAUDE CODE panes (agent_session {kind:"id", value:<uuid>}): the
+  transcript is located under ~/.claude/projects/<project>/<uuid>.jsonl and
+  resolved through the same precedence — a native summary / custom-title
+  entry wins (sanitized, latest-in-file), else the first meaningful user
+  message derives (isMeta, isSidechain, command-wrapper and tool_result-only
+  entries are skipped), else the salient-term summary, else the workspace
+  fallback; backfill covers Claude transcripts too (cache-only);
 - rename validation (bad pane, blind pane, long title, control chars,
   --clear) and the pending-native queue (TTL, pane filter, consumption);
 - backfill: one-shot idempotence, --dry-run writes nothing, named and
@@ -93,6 +100,18 @@ def _cl_session(ts_epoch, instr):
     }) + "\n"
 
 
+def _cl_ts(ts_epoch):
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(ts_epoch))
+
+
+def _cl_user(ts_epoch, content, uuid="cu", meta=False, side=False):
+    """One Claude Code user entry (string or block content)."""
+    return {"parentUuid": None, "isSidechain": side, "type": "user",
+            "message": {"role": "user", "content": content},
+            "uuid": uuid, "timestamp": _cl_ts(ts_epoch), "isMeta": meta,
+            "userType": "external", "cwd": "/home/x", "version": "1.0.0"}
+
+
 class TitlesTestBase(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp(prefix="titles-home-")
@@ -121,6 +140,18 @@ class TitlesTestBase(unittest.TestCase):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
             f.write(body)
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def write_claude(self, uuid, entries, proj="proj-x", mtime=None):
+        """One synthetic Claude Code transcript under the temp HOME."""
+        path = os.path.join(self.home, ".claude", "projects", proj,
+                            uuid + ".jsonl")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
         if mtime is not None:
             os.utime(path, (mtime, mtime))
         return path
@@ -395,6 +426,254 @@ class PaneReuseGuard(TitlesTestBase):
             [{"label": "ws", "agents": [agent]}],
             home=self.home, cache_path=self.cache)
         self.assertEqual(stat.S_IMODE(os.stat(self.cache).st_mode), 0o600)
+
+
+class ClaudeTitles(TitlesTestBase):
+    """Claude Code panes: agent_session {kind:"id", value:<uuid>} — the
+    transcript under ~/.claude/projects resolves through the SAME §11
+    precedence as a Pi path (spec §11: the precedence applies to every
+    harness)."""
+
+    U1 = "11111111-2222-3333-4444-555566667777"
+    U2 = "22222222-3333-4444-5555-666677778888"
+    U3 = "33333333-4444-5555-6666-777788889999"
+    INSTR = "Audit the capacity adapter math"
+    T_INSTR = "Audit the capacity adapter math"
+
+    def _agent(self, uuid, pane="w9:pA"):
+        return {"pane_id": pane, "agent": "claude", "agent_status": "idle",
+                "agent_session": {"agent": "claude", "kind": "id",
+                                  "source": "herdr:claude",
+                                  "value": uuid}}
+
+    def _user(self, ts, content, uuid="cu", **kw):
+        return _cl_user(ts, content, uuid=uuid, **kw)
+
+    def test_native_summary_entry_wins(self):
+        self.write_claude(self.U1, [
+            self._user(1_800_000_000, self.INSTR, uuid="c1"),
+            {"type": "summary", "summary": "Capacity audit session",
+             "leafUuid": "leaf-1"},
+        ])
+        title, source = tt.resolve_agent(self._agent(self.U1), "tendril",
+                                         [], titles={}, home=self.home)
+        self.assertEqual((title, source), ("Capacity audit session", "native"))
+
+    def test_native_custom_title_latest_in_file_wins(self):
+        self.write_claude(self.U1, [
+            self._user(1_800_000_000, self.INSTR, uuid="c1"),
+            {"type": "ai-title", "aiTitle": "First attempt",
+             "sessionId": self.U1},
+            {"type": "ai-title", "aiTitle": "Second attempt",
+             "sessionId": self.U1},
+        ])
+        title, source = tt.resolve_agent(self._agent(self.U1), "tendril",
+                                         [], titles={}, home=self.home)
+        self.assertEqual((title, source), ("Second attempt", "native"))
+
+    def test_native_title_is_sanitized(self):
+        self.write_claude(self.U1, [
+            self._user(1_800_000_000, self.INSTR, uuid="c1"),
+            {"type": "ai-title", "aiTitle": "  bad\x01title\u202e ",
+             "sessionId": self.U1},
+        ])
+        title, source = tt.resolve_agent(self._agent(self.U1), "tendril",
+                                         [], titles={}, home=self.home)
+        self.assertEqual((title, source), ("badtitle", "native"))
+
+    def test_first_user_message_derives_string_content(self):
+        self.write_claude(self.U1, [
+            self._user(1_800_000_000, self.INSTR, uuid="c1"),
+        ])
+        title, source = tt.resolve_agent(self._agent(self.U1), "tendril",
+                                         [], titles={}, home=self.home)
+        self.assertEqual((title, source), (self.T_INSTR, "instruction"))
+
+    def test_first_user_message_derives_text_block_content(self):
+        self.write_claude(self.U1, [
+            self._user(1_800_000_000,
+                       [{"type": "text", "text": self.INSTR}], uuid="c1"),
+        ])
+        title, source = tt.resolve_agent(self._agent(self.U1), "tendril",
+                                         [], titles={}, home=self.home)
+        self.assertEqual((title, source), (self.T_INSTR, "instruction"))
+
+    def test_meta_command_sidechain_toolresult_skipped(self):
+        """Only the first MEANINGFUL user message can name the session:
+        meta rows, slash-command wrappers, sidechains and tool_result-only
+        bodies never become the title."""
+        self.write_claude(self.U1, [
+            self._user(1_800_000_000, "Earlier unrelated meta content",
+                       uuid="c-meta", meta=True),
+            self._user(1_800_000_010,
+                       "<command-name>/clear</command-name>\n"
+                       "<local-command-stdout>cleared</local-command-stdout>",
+                       uuid="c-cmd"),
+            self._user(1_800_000_020, "Sidechain diversion content here",
+                       uuid="c-side", side=True),
+            self._user(1_800_000_030,
+                       [{"type": "tool_result", "tool_use_id": "t1",
+                         "content": "42"}], uuid="c-tool"),
+            self._user(1_800_000_040,
+                       [{"type": "text", "text": self.INSTR}],
+                       uuid="c-real"),
+        ])
+        title, source = tt.resolve_agent(self._agent(self.U1), "tendril",
+                                         [], titles={}, home=self.home)
+        self.assertEqual((title, source), (self.T_INSTR, "instruction"))
+
+    def test_uuid_lookup_across_project_dirs(self):
+        """The project dir encodes the pane's cwd, unknown here: the
+        transcript must be found in WHICHEVER project dir holds it."""
+        self.write_claude(self.U1, [
+            self._user(1_800_000_000, self.INSTR, uuid="c1"),
+        ], proj="-home-seeno-Projects-somewhere-else")
+        # an unrelated project dir exists too
+        self.write_claude(self.U3, [], proj="-home-seeno-other")
+        title, source = tt.resolve_agent(self._agent(self.U1), "tendril",
+                                         [], titles={}, home=self.home)
+        self.assertEqual((title, source), (self.T_INSTR, "instruction"))
+
+    def test_missing_transcript_falls_to_workspace(self):
+        title, source = tt.resolve_agent(self._agent(self.U2), "tendril",
+                                         [], titles={}, home=self.home)
+        self.assertEqual((title, source), ("tendril · Claude", "workspace"))
+
+    def test_summary_over_first_three_turns_when_instruction_rejects(self):
+        self.write_claude(self.U1, [
+            self._user(1_800_000_000, "ok", uuid="c1"),
+            self._user(1_800_000_100,
+                       "the CA field density drops near meters", uuid="c2"),
+        ])
+        title, source = tt.resolve_agent(self._agent(self.U1), "tendril",
+                                         [], titles={}, home=self.home)
+        self.assertEqual(source, "summary")
+        self.assertTrue(title)
+
+    def test_pane_reuse_guard_and_start_pin(self):
+        old_start = 1_800_000_000
+        self.write_claude(self.U1, [
+            self._user(old_start, "Old session subject line", uuid="c1"),
+        ])
+        agent = self._agent(self.U1, pane="w9:pA")
+        titles = {}
+        t_old, s_old = tt.resolve_agent(agent, "Leviathan", [],
+                                        titles=titles, home=self.home)
+        self.assertEqual(s_old, "instruction")
+        tt._save_cache(titles, self.cache)
+        # the pane is REUSED: a new Claude session (new UUID) replaces it
+        new_start = old_start + 9_000
+        self.write_claude(self.U2, [
+            self._user(new_start, "Brand new era of work", uuid="c1"),
+        ])
+        titles = tt.load_cache(self.cache)
+        entry = titles[self.U1]
+        self.assertEqual(entry.get("session_start"), old_start)
+        t_new, s_new = tt.resolve_agent(
+            self._agent(self.U2, pane="w9:pA"),
+            "Leviathan", [], titles=titles, home=self.home)
+        self.assertNotEqual(t_new, t_old)
+        self.assertEqual(s_new, "instruction")
+        # the OLD session's title never moves, even as its transcript grows
+        path = os.path.join(self.home, ".claude", "projects", "proj-x",
+                            self.U1 + ".jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(self._user(
+                old_start + 5_000, "Totally other words now",
+                uuid="c-late")) + "\n")
+        tt._MEMO.clear()
+        titles = tt.load_cache(self.cache)
+        t_again, s_again = tt.resolve_agent(self._agent(self.U1),
+                                            "Leviathan", [], titles=titles,
+                                            home=self.home)
+        self.assertEqual((t_again, s_again), (t_old, "instruction"))
+
+    def test_manual_override_beats_claude_levels(self):
+        self.write_claude(self.U1, [
+            self._user(1_800_000_000, self.INSTR, uuid="c1"),
+            {"type": "ai-title", "aiTitle": "Machine title",
+             "sessionId": self.U1},
+        ])
+        agent = self._agent(self.U1)
+        ok, phrase = tt.rename_session("w9:pA", "Chosen by me", agent=agent,
+                                       home=self.home)
+        self.assertTrue(ok)
+        titles = tt.load_cache(self.cache)
+        self.assertIn(self.U1, titles)          # keyed by the session UUID
+        title, source = tt.resolve_agent(agent, "tendril", [],
+                                         titles=titles, home=self.home)
+        self.assertEqual((title, source), ("Chosen by me", "manual"))
+
+    def test_annotate_document_wires_claude_row(self):
+        self.write_claude(self.U1, [
+            self._user(1_800_000_000, self.INSTR, uuid="c1"),
+        ])
+        raw = self._agent(self.U1, pane="w9:pB")
+        doc = {"workspaces": [{"label": "Leviathan", "agents": [
+                {"pane_id": "w9:pB", "agent": "claude"}]}],
+               "schedule": None}
+        tt.annotate_document(doc, [{"label": "Leviathan", "agents": [raw]}],
+                             home=self.home, cache_path=self.cache)
+        a = doc["workspaces"][0]["agents"][0]
+        self.assertEqual((a["title"], a["title_source"]),
+                         (self.T_INSTR, "instruction"))
+        self.assertLessEqual(len(a["title"]), 48)
+        self.assertIn(self.U1, tt.load_cache(self.cache))
+
+
+class ClaudeBackfill(TitlesTestBase):
+    U1 = "aaaa1111-2222-3333-4444-555566667777"
+    U2 = "bbbb2222-3333-4444-5555-666677778888"
+    U3 = "cccc3333-4444-5555-6666-777788889999"
+
+    def _write(self):
+        p1 = None
+        return (
+            self.write_claude(self.U1, [
+                _cl_user(1_800_000_000, "Filler instruction words here",
+                         uuid="c1"),
+                {"type": "ai-title", "aiTitle": "Native already",
+                 "sessionId": self.U1},
+            ]),
+            self.write_claude(self.U2, [
+                _cl_user(1_800_010_000, "Backfill the old sessions tonight",
+                         uuid="c1"),
+            ]),
+            self.write_claude(self.U3, [
+                _cl_user(1_800_020_000, "ok", uuid="c1"),
+            ]),
+        )
+
+    def test_backfill_caches_claude_transcripts_only(self):
+        paths = self._write()
+        sizes = [os.path.getsize(p) for p in paths]
+        rep1 = tt.backfill(dry_run=False, home=self.home,
+                           cache_path=self.cache)
+        self.assertEqual(rep1["claude"]["scanned"], 3)
+        self.assertEqual(rep1["claude"]["skipped"]["native"], 1)
+        self.assertEqual(rep1["claude"]["derived"]["instruction"], 1)
+        self.assertEqual(rep1["claude"]["skipped"]["underived"], 1)
+        titles = tt.load_cache(self.cache)
+        self.assertIn(self.U2, titles)              # keyed by the UUID
+        self.assertNotIn(self.U1, titles)
+        self.assertNotIn(self.U3, titles)
+        self.assertEqual(titles[self.U2]["source"], "instruction")
+        # transcripts are NEVER touched
+        self.assertEqual(sizes, [os.path.getsize(p) for p in paths])
+        # idempotent: the second run re-derives nothing
+        rep2 = tt.backfill(dry_run=False, home=self.home,
+                           cache_path=self.cache)
+        self.assertEqual(rep2["claude"]["derived"],
+                         {"instruction": 0, "summary": 0})
+        self.assertEqual(rep2["claude"]["skipped"]["cached"], 1)
+
+    def test_backfill_dry_run_writes_nothing(self):
+        self._write()
+        rep = tt.backfill(dry_run=True, home=self.home,
+                          cache_path=self.cache)
+        self.assertTrue(rep["dry_run"])
+        self.assertEqual(rep["claude"]["derived"]["instruction"], 1)
+        self.assertFalse(os.path.exists(self.cache))
 
 
 class Rename(TitlesTestBase):
