@@ -127,13 +127,13 @@ class Selector(unittest.TestCase):
         bottom = next(i for i, line in enumerate(lines) if line.startswith("\u2514"))
         return [line[2:-1].rstrip() for line in lines[dividers[-1] + 1:bottom]]
 
-    def test_footer_has_exactly_the_five_supported_actions(self):
+    def test_footer_lists_the_interactive_actions_including_link(self):
         wide = frame(self.new, 48, 50, 0)
         narrow = frame(self.new, 34, 50, 0)
         self.assertEqual(self.footer_items(wide), [
-            "N New   I Info   ? Help   R Refresh   Q Quit"])
+            "N New   I Info   R Refresh   Q Quit   L Link"])
         self.assertEqual(self.footer_items(narrow), [
-            "N New   I Info   ? Help", "R Refresh   Q Quit"])
+            "N New   I Info   R Refresh", "Q Quit   L Link"])
         for text in (wide, narrow):
             for removed in ("P Project", "S Shell", "L Last", "T TestPush"):
                 self.assertNotIn(removed, text)

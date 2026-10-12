@@ -196,8 +196,13 @@ class InstalledLauncher(ClientEnv):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         calls = self.calls()
         # RC2 fast path: the alias file dials the alias via mosh directly —
-        # no synchronous key probe before the transport, no ssh anywhere.
-        self.assertFalse(any(c.startswith("ssh ") for c in calls))
+        # no synchronous key probe before the transport. The ONE ssh after
+        # the session is the L-flag consume, and it uses the SAME alias from
+        # the file (proving the file fed the whole launcher, not just mosh).
+        ssh_calls = [c for c in calls if c.startswith("ssh ")]
+        self.assertEqual(len(ssh_calls), 1)
+        self.assertIn("--link-open-request", ssh_calls[0])
+        self.assertIn("testhost", ssh_calls[0])
         mosh = [c for c in calls if c.startswith("mosh ")]
         self.assertEqual(len(mosh), 1)
         self.assertIn("testhost", mosh[0])

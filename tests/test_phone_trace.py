@@ -186,13 +186,16 @@ class FastPath(TraceEnv):
     def test_healthy_interactive_path_is_exactly_one_transport_invocation(self):
         p = self.run_launcher([], TENDRIL_ALIAS="testhost")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        # ONE transport invocation: exactly one mosh dial, zero ssh of any
-        # kind (no preflight, no probe). The payload's remote-agents line
-        # is the stub running the command, not a transport.
-        transports = [c for c in self.calls()
-                      if c.startswith("mosh ") or c.startswith("ssh ")]
+        # ONE interactive transport invocation: exactly one mosh dial, no
+        # preflight, no probe. The ONE ssh after the session is not a
+        # transport — it is the L-flag consume (mosh drops exit statuses);
+        # with the stub answering silence it opens nothing.
+        transports = [c for c in self.calls() if c.startswith("mosh ")]
         self.assertEqual(len(transports), 1)
         self.assertTrue(transports[0].startswith("mosh "))
+        ssh_calls = [c for c in self.calls() if c.startswith("ssh ")]
+        self.assertEqual(len(ssh_calls), 1)
+        self.assertIn("--link-open-request", ssh_calls[0])
         self.assertNotIn("key-auth check failed", p.stdout)
 
     def test_forced_ssh_failure_probes_only_then_degrades(self):

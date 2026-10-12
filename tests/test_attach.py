@@ -345,17 +345,21 @@ class PhoneLauncher(unittest.TestCase):
                               capture_output=True, text=True, timeout=60)
 
     def test_no_args_opens_the_selector_via_mosh(self):
-        # RC2 fast path: EXACTLY ONE transport invocation — the old
-        # synchronous `ssh … true` preflight is gone from the healthy
-        # path (no ssh call may appear before or alongside the mosh dial).
+        # RC2 fast path: exactly ONE interactive transport invocation — the
+        # old synchronous `ssh … true` preflight is gone from the healthy
+        # path. After the session ends, ONE BatchMode ssh consumes the
+        # selector's L flag (mosh drops exit statuses) — and opens nothing
+        # when the host answers silence.
         p = self.run_launcher([])
         self.assertEqual(p.returncode, 0)
-        self.assertFalse(any(c.startswith("ssh ") for c in self.calls()))
         mosh = [c for c in self.calls() if c.startswith("mosh ")]
         self.assertEqual(len(mosh), 1)
         self.assertIn("testhost", mosh[0])
         self.assertNotIn("attach", mosh[0])
         self.assertTrue(any(c.rstrip() == "remote-agents" for c in self.calls()))
+        ssh_calls = [c for c in self.calls() if c.startswith("ssh ")]
+        self.assertEqual(len(ssh_calls), 1)
+        self.assertIn("--link-open-request", ssh_calls[0])
 
     def test_attach_uses_default_alias_and_quotes_the_id(self):
         p = self.run_launcher(["attach", "w15"])
