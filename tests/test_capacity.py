@@ -214,7 +214,9 @@ class TestTokenAccounting(Base):
         self.assertEqual(days[-1],
                          {"date": tc._local_date(NOW), "tokens": 1600,
                           "input": 1000, "output": 500, "cache_write": 100,
-                          "cache_read": 900000})
+                          "cache_read": 900000,
+                          "by_model": [{"model": "claude-opus-4-8",
+                                        "tokens": 1600}]})
         self.assertEqual(rec["by_model"],
                          [{"model": "claude-opus-4-8", "tokens": 11200,
                            "input": 7000, "output": 3500,
@@ -397,6 +399,75 @@ class TestByModelWindowAndProvenance(Base):
         provs = {p["id"]: p for p in
                  tc._assemble(cache, NOW, enabled=[])["providers"]}
         return provs
+
+    def test_each_day_carries_its_own_model_split(self):
+        """§12 data honesty: tokens_by_day[i].by_model speaks for THAT day
+        from its own per-model buckets — the rows are headline tokens,
+        largest first, and sum to the day's tokens exactly (a UI may
+        colour the day per model and trust the sum)."""
+        today = tc._local_date(NOW)
+        yday = tc._local_date(NOW - 86400)
+        provs = self.models(self.cache_with_mday({
+            "m-big": {today: {"tok": 700, "in": 700},
+                      yday: {"tok": 100, "in": 100}},
+            "m-small": {today: {"tok": 300, "out": 300},
+                        yday: {"tok": 900, "cw": 900}},
+        }, days={today: {"tok": 1000, "in": 700, "out": 300},
+                 yday: {"tok": 1000, "in": 100, "cw": 900}}))
+        claude = provs["claude"]
+        days = {d["date"]: d for d in claude["tokens_by_day"]}
+        self.assertEqual(
+            days[today]["by_model"],
+            [{"model": "m-big", "tokens": 700},
+             {"model": "m-small", "tokens": 300}],
+        )
+        self.assertEqual(
+            days[yday]["by_model"],
+            [{"model": "m-small", "tokens": 900},
+             {"model": "m-big", "tokens": 100}],
+        )
+        for d in claude["tokens_by_day"]:
+            if "by_model" in d:
+                self.assertEqual(sum(m["tokens"] for m in d["by_model"]),
+                                 d["tokens"])
+            else:
+                self.assertEqual(0, d["tokens"])
+
+    def test_per_day_split_excludes_stale_models(self):
+        """A model recorded only outside the window never colours any day:
+        no day's by_model may name it."""
+        today = tc._local_date(NOW)
+        day8 = tc._local_date(NOW - 8 * 86400)
+        provs = self.models(self.cache_with_mday({
+            "m-stale": {day8: {"tok": 999, "in": 999}},
+            "m-now": {today: {"tok": 40, "in": 40}},
+        }, days={today: {"tok": 40, "in": 40}}))
+        for d in provs["claude"]["tokens_by_day"]:
+            for m in d.get("by_model", []):
+                self.assertNotEqual("m-stale", m["model"])
+            if d["date"] == day8:
+                self.assertNotIn("by_model", d)
+
+    def test_day_without_attribution_omits_by_model(self):
+        """Tokens without per-model attribution (codex rollouts): the day
+        carries NO by_model key — never an invented or empty split. The
+        provider-level list stays the §12 null + reason."""
+        today = tc._local_date(NOW)
+        provs = self.models(self.cache_with_mday(
+            {}, days={today: {"tok": 10, "in": 10}}, kind="codex"))
+        codex = provs["codex"]
+        self.assertEqual(10, codex["tokens_by_day"][-1]["tokens"])
+        self.assertNotIn("by_model", codex["tokens_by_day"][-1])
+        self.assertIsNone(codex["by_model"])
+
+    def test_zero_token_day_carries_no_split(self):
+        today = tc._local_date(NOW)
+        provs = self.models(self.cache_with_mday({
+            "m-now": {today: {"tok": 40, "in": 40}},
+        }, days={today: {"tok": 40, "in": 40}}))
+        for d in provs["claude"]["tokens_by_day"][:-1]:
+            self.assertEqual(0, d["tokens"])
+            self.assertNotIn("by_model", d)
 
     def test_stale_model_outside_the_window_is_excluded(self):
         """A model the source recorded only on day-8 must not appear as

@@ -32,7 +32,11 @@ By-model fidelity (§12): `by_model` covers EXACTLY the same 7 host-local
 days as `tokens_by_day` (`by_model_window_days: 7`) — models a harness
 recorded only outside the window (stale weeks) are excluded, and models
 with zero tokens in the window are excluded. `today_by_model` covers
-today only. Model ids pass through verbatim (sanitized for the wire
+today only. Each day of `tokens_by_day` carries its OWN split,
+`by_model: [{model, tokens}]` (headline semantics, uncapped, largest
+first — the rows sum to that day's `tokens`; a day with tokens but no
+per-model attribution omits the key rather than inventing a split, so a
+UI never colours a day from the week's shares). Model ids pass through verbatim (sanitized for the wire
 only — no remapping, no family folding). When the labelled source
 cannot attribute tokens per model at all, `by_model` is null +
 `by_model_unavailable_reason`. Every list carries its provenance:
@@ -1381,6 +1385,21 @@ def _model_window_row(model, per, dates):
             "cache_read": tcr}
 
 
+def _model_day_rows(mday, date):
+    """One day's `by_model` wire rows (§12 data honesty): headline tokens
+    per model for EXACTLY that local date, largest first, UNCAPPED so the
+    rows sum to the day's `tokens` — a UI may colour the day per model and
+    trust the sum. Empty when no source recorded anything for the day:
+    the key is omitted, never an empty list dressed as a split."""
+    rows = []
+    for model, per in (mday or {}).items():
+        row = _model_window_row(model, per, (date,))
+        if row:
+            rows.append({"model": row["model"], "tokens": row["tokens"]})
+    rows.sort(key=lambda r: -r["tokens"])
+    return rows
+
+
 def _assemble(cache, now, enabled=None):
     today = _local_date(now)
     groups = {}
@@ -1518,11 +1537,19 @@ def _assemble(cache, now, enabled=None):
             days = []
             for d in day_keys:                # all 7 days: stable chart
                 b = g["days"].get(d) or {}
-                days.append({"date": d, "tokens": int(b.get("tok") or 0),
-                             "input": int(b.get("in") or 0),
-                             "output": int(b.get("out") or 0),
-                             "cache_write": int(b.get("cw") or 0),
-                             "cache_read": int(b.get("cr") or 0)})
+                day = {"date": d, "tokens": int(b.get("tok") or 0),
+                       "input": int(b.get("in") or 0),
+                       "output": int(b.get("out") or 0),
+                       "cache_write": int(b.get("cw") or 0),
+                       "cache_read": int(b.get("cr") or 0)}
+                # §12: the day's OWN model split, from the same per-model
+                # day buckets as by_model — never the week's shares. A day
+                # without attribution carries no key: the UI falls back
+                # to one ink rather than inventing a per-day split.
+                day_rows = _model_day_rows(g["mday"], d)
+                if day_rows:
+                    day["by_model"] = day_rows
+                days.append(day)
             days.reverse()                    # oldest first
             rec["tokens_by_day"] = days
             rec["tokens_today"] = days[-1]["tokens"]
