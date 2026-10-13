@@ -53,6 +53,20 @@ Three surfaces carry most of the day:
 - **CAPACITY** is provider usage and limits: session and weekly windows,
   when they reset, tokens today and metered spend.
 
+And the control plane is only ever one tap from the terminal it watches:
+pick a session in the selector and TENDRIL attaches you to that exact
+Herdr pane — not a lookalike, not a transcript, the session itself.
+
+<p align="center">
+  <img src="docs/assets/readme/board-05-exact-session-entry.png"
+       alt="The TENDRIL selector opening the exact Herdr session from the control plane"
+       width="100%">
+</p>
+
+<p align="center">
+  <em>TENDRIL does not replace your terminal.<br>It gets you to the right one.</em>
+</p>
+
 ## Why TENDRIL exists
 
 Starting an agent is the easy part. Keeping a handful of them honest over
@@ -102,6 +116,21 @@ silently launched twice.
 of the context window it has used, output tokens, cost where the harness
 reports it, and its subagents. Then **Open session** — TENDRIL focuses that
 exact workspace, tab and pane and attaches you over Mosh.
+
+The session lives on the host, so both of you are always looking at the
+same thing — start a job on the laptop, check it from the phone on the
+train, finish it at the desk. Nothing is mirrored or synced; there is one
+session and you are simply where it is.
+
+<p align="center">
+  <img src="docs/assets/readme/board-06-same-session-anywhere.png"
+       alt="The same Herdr session open on a phone and on a laptop"
+       width="100%">
+</p>
+
+<p align="center">
+  <em>The session doesn't move. You do.</em>
+</p>
 
 ## What it does
 
@@ -250,52 +279,40 @@ without it.
 ## Quick start
 
 You'll need a Linux machine running [Herdr](https://herdr.dev) 0.9.3 or
-newer, OpenSSH (plus `mosh-server` if you can), Tailscale on the host and
-the phone, and [Termux from F-Droid](https://f-droid.org/packages/com.termux/)
-on an Android phone.
+newer, Tailscale on the host and the phone, and
+[Termux from F-Droid](https://f-droid.org/packages/com.termux/)
+on an Android phone. Two commands and one QR scan — no config files, no
+manual APK transfers, no dependency hunting.
 
-**1. Install TENDRIL on the host.** It's user-local, previews with
-`--dry-run`, and never uses `sudo`.
+**1. On the host — one command.** User-local, never uses `sudo`; installs
+Herdr if it's missing (asking first), configures notifications, and ends
+on a pairing QR:
 
 ```sh
-git clone https://github.com/Ozymandes/TENDRIL.git
-cd TENDRIL
-./install --doctor     # read-only check
-./install
+curl -fsSL https://raw.githubusercontent.com/Ozymandes/TENDRIL/main/setup.sh | sh
 ```
 
 On a server, also run `sudo loginctl enable-linger $USER` so the timers
 keep running after you log out.
 
-**2. Confirm Herdr is visible.**
+**2. On the phone — one command** (in Termux). Installs SSH + Mosh, the
+launchers, and the release-verified TENDRIL Link app, then opens it:
 
 ```sh
-tendril                # the workspace selector
-tendril health --json  # "herdr":{"state":"running"…}
+curl -fsSL https://raw.githubusercontent.com/Ozymandes/TENDRIL/main/phone/setup.sh | sh
 ```
 
-**3. Set up the phone.** On the host:
+**3. Scan the QR.** Point TENDRIL Link's **Scan QR** at the code on your
+host. The one scan installs your phone's SSH key on the host, brings your
+private notification topic along, and lands you in HOME. Run `tendril
+--pair` on the host any time to show the QR again. HOME should read
+**LINK READY** — tap **Open Tendril** for the console, or type `tendril`
+in Termux.
 
-```sh
-tendril --pair --manual
-```
-
-It prints one command with your real host filled in. Paste it into Termux.
-It installs SSH and Mosh, creates a phone key, copies it to the host (you
-type your host password once), installs the launchers, enables Termux's
-external-apps setting, and installs TENDRIL Link if the host has a build
-staged.
-
-**4. Pair TENDRIL Link.** Run `tendril --pair` on the host and scan the QR
-(or paste the code) in the app. Allow it to run commands in Termux when
-Android asks. The pairing also brings your notification settings along.
-
-**5. Open the control plane.** HOME should read **LINK READY**. Tap
-**Open Tendril** for the console, or just type `tendril` in Termux.
-
-Doing it by hand, or something went sideways? See the
-[Android guide](docs/ANDROID.md) and the
-[step-by-step setup guide](docs/TENDRIL-SETUP-GUIDE.md).
+Behind a weird network, or prefer to do it by hand? `tendril --pair
+--manual` prints the password-based bootstrap, and the
+[Android guide](docs/ANDROID.md) and
+[step-by-step setup guide](docs/TENDRIL-SETUP-GUIDE.md) cover every path.
 
 ## Day to day
 
