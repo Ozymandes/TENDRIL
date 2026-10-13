@@ -49,10 +49,14 @@ mkdir -p "$LOGDIR" 2>/dev/null || LOG=/dev/null
 
 printf '\n%sTENDRIL%s\n%sInstalling control plane...%s\n\n' "$G" "$N" "$D" "$N"
 
+# have_tty - a controlling terminal that can really be opened (curl | sh
+# keeps one; ssh without -t, cron and CI have the node but no terminal)
+have_tty() { (exec 3<>/dev/tty) 2>/dev/null; }
+
 # ask <question> - one yes/no question on the terminal even under curl | sh
 ask() {
     [ "${TENDRIL_YES:-}" = 1 ] && return 0
-    if [ -r /dev/tty ] && [ -w /dev/tty ]; then
+    if have_tty; then
         printf '%s [Y/n] ' "$1" > /dev/tty
         ans=""
         read -r ans < /dev/tty || ans=n
@@ -262,7 +266,7 @@ if [ "$FIRST" = 0 ] && grep -q 'tendril-phone:' "$HOME/.ssh/authorized_keys" 2>/
     printf '%sHost ready.%s A phone is already linked. Pair another:  tendril --pair\n' "$G" "$N"
     exit 0
 fi
-if [ -r /dev/tty ]; then
+if have_tty; then
     exec "$BIN/tendril" --pair < /dev/tty
 fi
 "$BIN/tendril" --pair --no-wait
