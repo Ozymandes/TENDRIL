@@ -7,6 +7,8 @@
 #   install --doctor              read-only system check (no fixes)
 #   install --yes                 accept the discovered host identity, ssh
 #                                 target and project roots without asking
+#   install --auto                --yes + the recommended default for every
+#                                 optional step (what setup.sh runs)
 #   install --upgrade             non-interactive refresh (what `tendril --upgrade`
 #                                 runs): binaries, symlink, PATH block, watcher
 #                                 unit; never touches config or notify.env
@@ -27,10 +29,12 @@ HOST_HELPER="$PKG_DIR/bin/tendril_host.py"
 MODE=install
 DRY_RUN=0
 ASSUME_YES=0
+AUTO=0      # --auto: every optional step takes its recommended default (setup.sh)
 for arg in "$@"; do
     case $arg in
         --dry-run) DRY_RUN=1 ;;
         --yes)     ASSUME_YES=1 ;;
+        --auto)    ASSUME_YES=1; AUTO=1 ;;
         --doctor)  MODE=doctor ;;
         --client)  MODE=client ;;
         --upgrade) MODE=upgrade ;;
@@ -44,9 +48,18 @@ say() { printf '%s\n' "$*"; }
 hr()  { say "------------------------------------------------------------"; }
 row() { printf '%-14s %s\n' "$1" "$2"; }
 ask() { printf '%s [%s] ' "$1" "$2" >&2; ans=""; read -r ans || :; [ -n "$ans" ] && printf '%s' "$ans" || printf '%s' "$2"; }
-confirm() { printf '%s [y/N] ' "$1"; ans=""; read -r ans || :; [ "$ans" = "y" ] || [ "$ans" = "Y" ]; }
+# --auto (the public setup command): the recommended answer is yes for every
+# optional step (notifications, watcher, timers, PATH block, keybinding merge)
+# and KEEP for existing state (confirm_keep) - a topic is never rotated here.
+confirm() {
+    if [ "$AUTO" = 1 ]; then printf '%s yes (auto)\n' "$1"; return 0; fi
+    printf '%s [y/N] ' "$1"; ans=""; read -r ans || :; [ "$ans" = "y" ] || [ "$ans" = "Y" ]
+}
 # confirm with the default on ENTER: keeps existing state (confirm() defaults to no)
-confirm_keep() { printf '%s [Y/n] ' "$1"; ans=""; read -r ans || :; case $ans in y | Y | "") return 0 ;; *) return 1 ;; esac; }
+confirm_keep() {
+    if [ "$AUTO" = 1 ]; then printf '%s yes (auto)\n' "$1"; return 0; fi
+    printf '%s [Y/n] ' "$1"; ans=""; read -r ans || :; case $ans in y | Y | "") return 0 ;; *) return 1 ;; esac
+}
 # value of KEY= in an env-style file: first match, unquoted; empty when absent
 env_val() {
     [ -f "$1" ] || return 0
@@ -757,7 +770,8 @@ NOTIFY="$CONF_DIR/notify.env"
 CUR_URL=$(env_val "$NOTIFY" NTFY_URL)
 CUR_TOKEN=$(env_val "$NOTIFY" NTFY_TOKEN)
 CUR_TOPIC=$(env_val "$NOTIFY" NTFY_TOPIC)
-new_topic() { python3 -c 'import secrets; print("tendril-" + secrets.token_urlsafe(12))'; }
+# 128 bits of randomness: on a public ntfy server the topic must be unguessable
+new_topic() { python3 -c 'import secrets; print("tendril-" + secrets.token_urlsafe(16))'; }
 write_notify() {  # $1: topic; carries over any existing NTFY_URL / NTFY_TOKEN
     if [ "$DRY_RUN" = "1" ]; then
         say "  [dry-run] write $NOTIFY (chmod 600) with NTFY_URL/NTFY_TOPIC"
@@ -771,6 +785,11 @@ write_notify() {  # $1: topic; carries over any existing NTFY_URL / NTFY_TOKEN
     fi
 }
 show_subscribe() {
+    if [ "$AUTO" = 1 ]; then    # zero-config: Link subscribes from the pairing QR
+        say "  notifications ready - a private topic was generated (never printed);"
+        say "  TENDRIL Link subscribes to it when it scans the pairing QR"
+        return 0
+    fi
     say ""
     say "  Your private topic name:  $1"
     say "  On Android: install the ntfy app -> Subscribe to topic -> enter exactly:"
@@ -794,7 +813,8 @@ restart_watcher_if_running() {
 if [ -n "$CUR_TOPIC" ]; then
     say ""
     say "  Existing ntfy configuration found:"
-    say "    topic: $CUR_TOPIC"
+    # the topic is a credential on a public server: never echoed in full
+    say "    topic: $(printf '%s' "$CUR_TOPIC" | cut -c1-12)… (kept private)"
     if confirm_keep "Keep existing notification configuration?"; then
         say "  kept - notify.env unchanged; subscribed phones keep working"
     elif confirm "Rotate notification topic? Existing subscribers will need to resubscribe."; then

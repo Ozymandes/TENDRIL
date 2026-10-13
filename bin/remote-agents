@@ -113,6 +113,14 @@ try:
     import tendril_herdr         # the ONE §7.4 herdr binary resolver
 except ImportError:              # stale install: the selector keeps working
     tendril_herdr = None
+try:
+    import tendril_enroll        # v0.2.1 one-shot phone enrollment (pairing v3)
+except ImportError:
+    tendril_enroll = None
+try:
+    import tendril_qr            # v0.2.1 built-in pairing QR (no qrencode needed)
+except ImportError:
+    tendril_qr = None
 
 # Canonical host identity (binding contract): config TENDRIL_HOST -> legacy
 # TAILSCALE_HOST (lowercased) -> short hostname, HOST_RE-gated, sanitized —
@@ -2245,6 +2253,12 @@ def _health_cmd(args):
         summary = tendril_health.run_tick(host=HOST_LABEL, herdr=HERDR,
                                           run=run,
                                           notifier=_health_notifier())
+        # v0.2.1: finish a phone enrollment nobody is waiting for in a
+        # terminal (the QR stays valid 10 min). Silent; never fails a tick.
+        if tendril_enroll is not None:
+            enroll = tendril_enroll.tick()
+            if enroll.get("state") == "enrolled":
+                summary["enrolled"] = enroll.get("label")
         print(json.dumps({"ok": True, "tick": summary},
                          separators=(",", ":")))
         return 0
@@ -2642,36 +2656,48 @@ def _pair_qr(code, indent=2):
     fits the terminal (minus the indent); one plain hint line when it is
     too narrow, nothing at all without qrencode. Garnish — never a
     failure. Returns True when anything was printed."""
-    qrencode = shutil.which("qrencode")
-    if not qrencode:
-        return False
-    try:
-        qr = subprocess.run([qrencode, "-t", "ansiutf8", "-m", "1", code],
-                            capture_output=True, text=True, timeout=15)
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-    if qr.returncode != 0 or not qr.stdout:
-        return False
-    lines = qr.stdout.rstrip("\n").splitlines()
+    lines = None
+    if tendril_qr is not None:
+        try:
+            lines = tendril_qr.render(code)
+        except Exception:
+            lines = None
+    if lines is None:
+        qrencode = shutil.which("qrencode")
+        if not qrencode:
+            return False
+        try:
+            qr = subprocess.run([qrencode, "-t", "ansiutf8", "-m", "1", code],
+                                capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if qr.returncode != 0 or not qr.stdout:
+            return False
+        lines = qr.stdout.rstrip("\n").splitlines()
     width = max((len(ln) for ln in lines), default=0)
     if width + indent > shutil.get_terminal_size(fallback=(80, 24)).columns:
         print(" " * indent
-              + "(terminal too narrow for QR — widen it or use the code)")
+              + "(widen the terminal to see the QR)")
         return True
     for ln in lines:
         print(" " * indent + ln)
     return True
 
 
-def _pair_print(mode, code, host, target, user, notify_ready):
-    """`tendril --pair` output. --code: only the code line, nothing else
-    (for scripts). --manual: the header, the ONE new-phone bootstrap
-    command and a three-line explanation — no wall of steps. Default: the
-    identity summary, the optional QR, and the pairing code as one
-    unwrapped line (the ntfy token travels only inside it; there is no
-    subscribe-URL line — Link subscribes itself)."""
+PHONE_SETUP_COMMAND = ("curl -fsSL https://raw.githubusercontent.com/"
+                       "Ozymandes/TENDRIL/main/phone/setup.sh | sh")
+
+
+def _pair_print(mode, code, host, target, user, notify_ready,
+                show_code=False, enroll=False):
+    """`tendril --pair` output. --manual: the header and the ONE
+    password-based bootstrap command (for hosts without a notification
+    server to carry enrollment). Default: the identity summary and the QR.
+    The code text — which carries the one-time enrollment secret (v3) and
+    the read-only ntfy token — is printed only with --show-code, so
+    screenshots and scrollback stay clean."""
     reach = f"{user}@{target}"
-    print(f"{C_LIME}TENDRIL // PAIR DEVICE{C_RESET}")
+    print(f"{C_LIME}TENDRIL // PAIR YOUR PHONE{C_RESET}")
     print("")
     if mode == "manual":
         print(f"{C_GRAY}  1.{C_RESET} Install Termux from F-Droid (not the Play Store build).")
@@ -2686,43 +2712,94 @@ def _pair_print(mode, code, host, target, user, notify_ready):
     rows = [
         ("HOST", host),
         ("REACH", _pair_reach(target)),
-        ("LINK", "ready"),
-        ("NOTIFY", "ready" if notify_ready else "not configured — run ./install"),
+        ("NOTIFY", "ready" if notify_ready else "not configured — re-run the host setup"),
     ]
     for label, value in rows:
-        print(f"{C_GRAY}  {label:<11}{C_RESET}{value}")
+        print(f"{C_GRAY}  {label:<9}{C_RESET}{value}")
     print("")
     if _pair_qr(code):
         print("")
-    print(f"{C_GRAY}  Scan with TENDRIL Link{C_RESET}")
-    print(f"{C_GRAY}  or paste the pairing code{C_RESET}")
+    print(f"  Scan with {C_LIME}TENDRIL Link{C_RESET}.")
+    if enroll:
+        print(f"{C_GRAY}  One phone, valid 10 minutes.{C_RESET}")
     print("")
-    print(f"{C_GRAY}  Pairing code{C_RESET}")
-    print(f"  {code}")
-    print("")
-    print(f"{C_GRAY}  New phone?{C_RESET}  tendril --pair --manual")
+    print(f"{C_GRAY}  Phone not set up yet? In Termux:{C_RESET}")
+    print(f"    {PHONE_SETUP_COMMAND}")
+    if show_code:
+        print("")
+        print(f"{C_GRAY}  Pairing code (secret: never share){C_RESET}")
+        print(f"  {code}")
+    else:
+        print(f"{C_GRAY}  No camera? tendril --pair --show-code{C_RESET}")
     return 0
 
 
+def _pair_wait(session, interval=2.0):
+    """Wait for the phone to enroll (v3): poll the one-time topic until the
+    key is installed or the QR expires. Ctrl+C stops waiting only — the
+    guardian timer finishes a late enrollment in the background."""
+    tty = sys.stdout.isatty()
+    unreachable = 0
+    print("")
+    try:
+        while True:
+            res = tendril_enroll.process_once(session)
+            state = res.get("state")
+            if state == "enrolled":
+                if tty:
+                    sys.stdout.write("\r\033[K")
+                fp = res.get("fingerprint") or ""
+                print(f"  {C_LIME}\u2713{C_RESET} Phone enrolled \u00b7 {res.get('label')} "
+                      f"{C_GRAY}{fp}{C_RESET}")
+                print("")
+                print(f"  {C_LIME}Host ready.{C_RESET} TENDRIL Link finishes the link on the phone.")
+                return 0
+            if state in ("expired", "none"):
+                if tty:
+                    sys.stdout.write("\r\033[K")
+                print("  The pairing QR expired. Run  tendril --pair  for a new one.")
+                return 1
+            unreachable = unreachable + 1 if state == "unreachable" else 0
+            left = max(0, int(session["expires"] - time.time()))
+            word = ("notification server unreachable \u2014 retrying"
+                    if unreachable >= 3 else "waiting for your phone")
+            if tty:
+                sys.stdout.write(f"\r\033[K  {C_GRAY}{word} \u00b7 "
+                                 f"{left // 60}:{left % 60:02d} left \u00b7 Ctrl+C to stop{C_RESET}")
+                sys.stdout.flush()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        if tty:
+            sys.stdout.write("\r\033[K")
+        until = time.strftime("%H:%M", time.localtime(session["expires"]))
+        print(f"  Stopped waiting. The QR stays valid until {until}; "
+              "the host finishes the pairing in the background.")
+        return 0
+
+
 def _pair(args):
-    """`tendril --pair`: the phone pairing code for the TENDRIL Link app,
-    always contract v2 — with the ntfy keys n/t/k from notify.env when
-    they are usable, without them (NOTIFY shown "not configured") when
-    they are not: a bad ntfy value never blocks pairing. Modes: the
-    default pretty block, --code for scripts (only the code line),
-    --manual for the one-command new-phone bootstrap. Deliberately
-    flags-only like --upgrade — no bare `pair` word: a single word is a
-    session-token position and a workspace may legitimately be labeled
-    "pair". All payload values are validated; on any invalid value: one
-    clear error, no code."""
+    """`tendril --pair`: pair a phone with TENDRIL Link (v0.2.1).
+
+    Default (notifications configured): a v3 code — host, ssh target,
+    user, the ntfy config AND a one-shot enrollment session + the
+    host-key fingerprint — shown as a QR, then a live wait until the phone
+    has enrolled its SSH key. --code prints only the code (scripts),
+    --show-code also prints it under the QR, --no-wait returns at once
+    (the guardian finishes), --manual is the password-based bootstrap for
+    hosts without notifications. Flags-only like --upgrade: a bare word is
+    a session-token position. Invalid values: one clear error, no code."""
     rest = [a for a in args if a != "--pair"]
+    flags = {"--code", "--manual", "--show-code", "--no-wait"}
     code_only = "--code" in rest
     manual = "--manual" in rest
-    rest = [a for a in rest if a not in ("--code", "--manual")]
-    if rest or args.count("--pair") != 1 or (code_only and manual):
-        print("usage: tendril --pair [--code | --manual]", file=sys.stderr)
+    show_code = "--show-code" in rest
+    no_wait = "--no-wait" in rest
+    rest = [a for a in rest if a not in flags]
+    if rest or args.count("--pair") != 1 or (code_only + manual + show_code) > 1:
+        print("usage: tendril --pair [--code | --show-code | --manual] [--no-wait]",
+              file=sys.stderr)
         return 2
-    if tendril_link is None or not hasattr(tendril_link, "pairing_code_v2"):
+    if tendril_link is None or not hasattr(tendril_link, "pairing_code_v3"):
         print("tendril_link.py is missing or stale next to remote-agents; "
               "re-run ./install", file=sys.stderr)
         return 1
@@ -2732,28 +2809,44 @@ def _pair(args):
         user = getpass.getuser() or ""
     except Exception:
         user = ""
+    if manual:
+        return _pair_print("manual", "", host, target, user, False)
     url, topic, token = _notify_config()
-    notify_ready = False
-    try:
-        code = tendril_link.pairing_code_v2(host, target, user,
-                                            ntfy_url=url or None,
-                                            topic=topic or None,
-                                            token=token or None)
-        notify_ready = bool(url and topic)
-    except tendril_link.LinkError as exc:
-        if not (url or topic or token):
-            print(f"cannot pair: {exc}", file=sys.stderr)
-            return 1
-        try:                    # ntfy values out of grammar: pair anyway
+    session = None
+    code = None
+    if url and topic and tendril_enroll is not None:
+        session = tendril_enroll.start(url)
+        try:
+            code = tendril_link.pairing_code_v3(
+                host, target, user, url, topic, token=token or None,
+                enroll_topic=session["topic"], enroll_secret=session["secret"],
+                hostkey_fp=tendril_enroll.host_key_fingerprint())
+        except tendril_link.LinkError:
+            tendril_enroll.clear()
+            session = None
+    notify_ready = code is not None
+    if code is None:            # no usable ntfy: a v2 code, enrollment by hand
+        try:
             code = tendril_link.pairing_code_v2(host, target, user)
-        except tendril_link.LinkError as exc2:
-            print(f"cannot pair: {exc2}", file=sys.stderr)
+        except tendril_link.LinkError as exc:
+            print(f"cannot pair: {exc}", file=sys.stderr)
             return 1
     if code_only:
         print(code)
         return 0
-    return _pair_print("manual" if manual else "pretty",
-                       code, host, target, user, notify_ready)
+    _pair_print("pretty", code, host, target, user, notify_ready,
+                show_code=show_code, enroll=session is not None)
+    if session is None:
+        print("")
+        print(f"{C_GRAY}  This code cannot enroll the phone's SSH key (no notification"
+              f" server).{C_RESET}")
+        print(f"{C_GRAY}  Use  tendril --pair --manual  for the password-based setup.{C_RESET}")
+        return 0
+    # wait only in front of a person: scripts and pipes get the code and
+    # return (the guardian timer finishes the enrollment in the background)
+    if no_wait or not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return 0
+    return _pair_wait(session)
 
 
 HELP = """\
@@ -2814,12 +2907,13 @@ persistent AI agents.
                               cache, never the transcripts. Idempotent
   tendril service status|start|stop|restart|logs
                               the notification watcher, on launchd or systemd
-  tendril --pair [--code | --manual]
-                              the phone pairing code for the TENDRIL Link
-                              app — scan or paste; ntfy config rides inside
-                              the code. --code prints only the code (for
-                              scripting), --manual prints the one-command
-                              Termux bootstrap for a new phone
+  tendril --pair [--code | --show-code | --manual] [--no-wait]
+                              pair a phone with TENDRIL Link: a one-time QR
+                              (host, notifications and a 10-minute, one-phone
+                              SSH-key enrollment), then waits until the phone
+                              is linked. --show-code also prints the code to
+                              paste, --code prints only the code, --manual is
+                              the password-based Termux bootstrap
   tendril --upgrade [--verbose]
                               self-update: fetch + fast-forward the recorded
                               source checkout, then ./install --upgrade
@@ -2835,6 +2929,9 @@ persistent AI agents.
                               one phone launch: prints `open` once, then clears
   tendril --link-stage <path> stage a built TENDRIL Link APK (tendril-link.apk
                               + tendril-link.json) so phones can pick it up
+  tendril --link-fetch [<tag>] stage the OFFICIAL release of TENDRIL Link from
+                              GitHub (pinned release signer, sha256, size) so
+                              phones discover and install updates from the app
   tendril --version           the installed version and commit
   tendril --help              this help
 
@@ -2868,7 +2965,7 @@ def _upgrade(args):
 
 
 PHONE_FLAGS = ("--phone-manifest", "--phone-asset", "--phone-script",
-               "--link-stage")
+               "--link-stage", "--link-fetch")
 PHONE_USAGE = ("usage: tendril --phone-manifest\n"
                "       tendril --phone-asset "
                "<tendril|termux-url-opener|agent|link-apk>\n"

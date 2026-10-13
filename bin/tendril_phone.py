@@ -32,11 +32,27 @@ import os
 import re
 import sys
 import tempfile
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import tendril_apk           # v0.2.1: read the APK's real signer
+except ImportError:              # stale install: manifest-only checks
+    tendril_apk = None
 
 USAGE = ("usage: tendril --phone-manifest\n"
          "       tendril --phone-asset <tendril|termux-url-opener|agent|link-apk>\n"
          "       tendril --phone-script <setup|upgrade>\n"
-         "       tendril --link-stage <path>")
+         "       tendril --link-stage <path>\n"
+         "       tendril --link-fetch [<release-tag>]")
+
+# The PRODUCTION signing certificate of TENDRIL Link (SHA-256 of the DER
+# certificate, lowercase hex) - the same value as config/link-signer.sha256
+# and the pin in phone/setup.sh (tests keep all three identical). Empty
+# until the release key exists: then --link-fetch refuses and --link-stage
+# keeps the per-host first-stage pin (development builds).
+LINK_RELEASE_SIGNER = ""
+LINK_RELEASE_BASE = "https://github.com/Ozymandes/TENDRIL/releases"
 
 MANIFEST_HEADER = "tendril-phone-manifest 1"
 PHONE_ASSETS = ("tendril", "termux-url-opener", "agent")
@@ -752,6 +768,21 @@ def link_stage(path):
                          % problems[0])
         return 1
 
+    # v0.2.1: the APK's ACTUAL signer must be the manifest's - a manifest
+    # can say anything; the signing block cannot be faked without the key
+    if tendril_apk is not None:
+        try:
+            actual = tendril_apk.signer_sha256s(apk_path)
+        except (OSError, tendril_apk.ApkError) as exc:
+            sys.stderr.write("tendril --link-stage: refusing to stage: "
+                             "cannot read the APK signer (%s)\n" % exc)
+            return 1
+        if doc["signer_sha256"] not in actual:
+            sys.stderr.write("tendril --link-stage: refusing to stage: the "
+                             "APK is signed by %s, not the manifest's %s\n"
+                             % (actual[0][:12], doc["signer_sha256"][:12]))
+            return 1
+
     link = link_dir()
     pin_path = os.path.join(link, "signer.sha256")
     old_pin = None
@@ -760,10 +791,22 @@ def link_stage(path):
             old_pin = f.read().strip()
     except OSError:
         old_pin = None
+    rotated = False
     if old_pin and old_pin != doc["signer_sha256"]:
-        sys.stderr.write("tendril --link-stage: refusing to stage: signing "
-                         "key changed - Android would refuse an in-place "
-                         "update\n")
+        # the ONE allowed change: a development pin -> the official release
+        # key (pinned in this file). Phones on the old key must reinstall
+        # once; Android refuses an in-place update across signers.
+        if LINK_RELEASE_SIGNER and doc["signer_sha256"] == LINK_RELEASE_SIGNER:
+            rotated = True
+        else:
+            sys.stderr.write("tendril --link-stage: refusing to stage: signing "
+                             "key changed - Android would refuse an in-place "
+                             "update\n")
+            return 1
+    if LINK_RELEASE_SIGNER and old_pin == LINK_RELEASE_SIGNER \
+            and doc["signer_sha256"] != LINK_RELEASE_SIGNER:
+        sys.stderr.write("tendril --link-stage: refusing to stage: not signed "
+                         "by the TENDRIL release key\n")
         return 1
 
     staged_json = os.path.join(link, "tendril-link.json")
@@ -773,7 +816,7 @@ def link_stage(path):
         prev_code = prev.get("versionCode") if isinstance(prev, dict) else None
     except (OSError, ValueError):
         prev_code = None
-    if type(prev_code) is int and doc["versionCode"] < prev_code:
+    if type(prev_code) is int and doc["versionCode"] < prev_code and not rotated:
         sys.stderr.write("tendril --link-stage: refusing to stage: "
                          "versionCode %d is lower than the staged %d\n"
                          % (doc["versionCode"], prev_code))
@@ -781,14 +824,94 @@ def link_stage(path):
 
     _atomic_copy(apk_path, os.path.join(link, "tendril-link.apk"))
     _atomic_write(json.dumps(doc, sort_keys=True) + "\n", staged_json)
-    if not old_pin:
+    if not old_pin or rotated:
         _atomic_write(doc["signer_sha256"] + "\n", pin_path)
 
+    if rotated:
+        print("  signer rotated to the TENDRIL release key - phones still on the "
+              "development build reinstall TENDRIL Link once")
     print("TENDRIL // LINK STAGED")
     print("  version   %s" % doc["versionName"])
     print("  build     %s" % doc["build"])
     print("  sha256    %s" % doc["sha256"][:12])
     return 0
+
+
+def link_fetch(tag=None, opener=None, out=sys.stdout):
+    """`tendril --link-fetch [<tag>]` (v0.2.1): stage the OFFICIAL TENDRIL
+    Link release for this host's phones - download the release manifest
+    and APK from GitHub (latest release, or <tag>), require the pinned
+    release signer in the manifest AND in the APK's signing block, the
+    sha256 + size, then stage it through link_stage (versionCode and pin
+    rules included). Idempotent: an already-staged build is a no-op.
+    Returns an exit code; one line on any refusal."""
+    if not LINK_RELEASE_SIGNER:
+        sys.stderr.write("tendril --link-fetch: no release signer is pinned in "
+                         "this TENDRIL version - nothing fetched\n")
+        return 1
+    if tag is not None and not TOKEN_RE.match(tag):
+        sys.stderr.write("tendril --link-fetch: bad release tag\n")
+        return 2
+    base = ("%s/download/%s" % (LINK_RELEASE_BASE, tag) if tag
+            else "%s/latest/download" % LINK_RELEASE_BASE)
+    open_ = opener or urllib.request.urlopen
+
+    def get(name, limit):
+        req = urllib.request.Request("%s/%s" % (base, name),
+                                     headers={"User-Agent": "tendril-link-fetch"})
+        with open_(req, timeout=60) as resp:
+            body = resp.read(limit + 1)
+        if len(body) > limit:
+            raise ValueError("%s is larger than expected" % name)
+        return body
+
+    try:
+        doc = json.loads(get("tendril-link.json", 64 * 1024).decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        sys.stderr.write("tendril --link-fetch: could not read the release "
+                         "manifest (%s)\n" % exc)
+        return 1
+    if not isinstance(doc, dict) or doc.get("signer_sha256") != LINK_RELEASE_SIGNER:
+        sys.stderr.write("tendril --link-fetch: refusing: the release manifest "
+                         "does not name the pinned TENDRIL release key\n")
+        return 1
+    staged = staged_manifest()
+    if staged and staged.get("sha256") == doc.get("sha256"):
+        out.write("TENDRIL Link %s (%s) already staged\n"
+                  % (doc.get("versionName"), doc.get("versionCode")))
+        return 0
+    size = doc.get("size")
+    if type(size) is not int or not 0 < size <= 200 * 1024 * 1024:
+        sys.stderr.write("tendril --link-fetch: refusing: implausible APK size\n")
+        return 1
+    workdir = tempfile.mkdtemp(prefix="tendril-link-fetch-")
+    try:
+        try:
+            apk = get("tendril-link.apk", size)
+        except (OSError, ValueError) as exc:
+            sys.stderr.write("tendril --link-fetch: could not download the APK "
+                             "(%s)\n" % exc)
+            return 1
+        with open(os.path.join(workdir, "tendril-link.apk"), "wb") as f:
+            f.write(apk)
+        with open(os.path.join(workdir, "tendril-link.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(doc, f)
+        if tendril_apk is None:
+            sys.stderr.write("tendril --link-fetch: tendril_apk.py is missing - "
+                             "re-run ./install\n")
+            return 1
+        return link_stage(workdir)        # sha256/size/schema/signer/pin rules
+    finally:
+        for name in ("tendril-link.apk", "tendril-link.json"):
+            try:
+                os.remove(os.path.join(workdir, name))
+            except OSError:
+                pass
+        try:
+            os.rmdir(workdir)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------- main
@@ -824,6 +947,11 @@ def main(argv=None):
             return refuse_snapshot()
         sys.stdout.write(phone_script(argv[1]))
         return 0
+    if head == "--link-fetch":
+        if len(argv) > 2:
+            sys.stderr.write(USAGE + "\n")
+            return 2
+        return link_fetch(argv[1] if len(argv) == 2 else None)
     if head == "--link-stage":
         if len(argv) != 2:
             sys.stderr.write(USAGE + "\n")

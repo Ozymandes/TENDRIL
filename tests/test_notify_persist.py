@@ -41,7 +41,8 @@ FRESH_YES = ["n", "y", "n", "n", ""]                     # first-run flow
 FRESH_NO = ["n", "n", "n", "n", ""]
 
 OLD_TOPIC = "tendril-lPD1ADyhP1iXjUGs"  # the topic from the real bug report
-NEW_TOPIC_RE = re.compile(r"^tendril-[A-Za-z0-9_-]{16}$")
+# 128-bit topics since v0.2.1 (token_urlsafe(16) = 22 chars)
+NEW_TOPIC_RE = re.compile(r"^tendril-[A-Za-z0-9_-]{22}$")
 
 notify_path = lambda self: os.path.join(  # noqa: E731
     self.home, ".config", "remote-agents", "notify.env")
@@ -87,7 +88,9 @@ class ReinstallKeepsTopic(FakeDarwin):
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
         self.assertIn("Existing ntfy configuration found:", out)
-        self.assertIn(f"topic: {OLD_TOPIC}", out)
+        # the topic is a credential: shown truncated, never in full
+        self.assertIn(f"topic: {OLD_TOPIC[:12]}… (kept private)", out)
+        self.assertNotIn(OLD_TOPIC, out)
         self.assertIn("Keep existing notification configuration? [Y/n]", out)
         self.assertIn("kept - notify.env unchanged", out)
         self.assertEqual(read(path), before)          # byte-for-byte
@@ -282,7 +285,9 @@ class MalformedExistingConfig(FakeDarwin):
         p = self.run_script(INSTALL, [], KEEP_ANSWERS)
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
-        self.assertIn(f"topic: {OLD_TOPIC}", out)     # unquoted for display
+        # the topic is a credential: shown truncated, never in full
+        self.assertIn(f"topic: {OLD_TOPIC[:12]}… (kept private)", out)
+        self.assertNotIn(OLD_TOPIC, out)
         self.assertEqual(read(path), before)          # and file untouched
 
 
@@ -304,7 +309,7 @@ class InjectionAttempts(FakeDarwin):
         p = self.run_script(INSTALL, [], KEEP_ANSWERS)
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
-        self.assertIn(f"topic: {self.HOSTILE}", out)
+        self.assertIn(f"topic: {self.HOSTILE[:12]}… (kept private)", out)
         self.assertEqual(read(path), before)
         self._assert_no_execution()
 
@@ -335,7 +340,9 @@ class DryRunKeepsWorking(FakeDarwin):
         p = self.run_script(INSTALL, ["--dry-run"], self.ANSWERS)
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
-        self.assertIn(f"topic: {OLD_TOPIC}", out)
+        # the topic is a credential: shown truncated, never in full
+        self.assertIn(f"topic: {OLD_TOPIC[:12]}… (kept private)", out)
+        self.assertNotIn(OLD_TOPIC, out)
         self.assertIn("kept - notify.env unchanged", out)
         self.assertEqual(self.walk_home(), walk_before)  # dry-run adds nothing
         self.assertEqual(read(path), before)

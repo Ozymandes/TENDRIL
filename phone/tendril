@@ -171,6 +171,80 @@ link_nonce() {
     return 0
 }
 
+# enroll_phone <user@host> <ntfy-url> <topic> <secret> <fp|-> - first-time
+# pairing (v0.2.1), run by TENDRIL Link after it scans the host's QR. Never
+# typed by hand. Pins the host key from the QR, writes the alias, publishes
+# this phone's PUBLIC key with a proof of the one-time secret, then waits
+# until the host has installed it. Last line: `ENROLL ok` or `ENROLL <why>`.
+enroll_fail() { echo "ENROLL $1"; [ -n "${2:-}" ] && echo "[tendril] $2" >&2; exit "$3"; }
+enroll_phone() {
+    _e_target=$1 _e_url=$2 _e_topic=$3 _e_secret=$4 _e_fp=$5
+    LC_ALL=C; export LC_ALL
+    printf '%s' "$_e_target" | grep -qE '^[A-Za-z0-9._-]{1,64}@[A-Za-z0-9._-]{1,253}$' \
+        || enroll_fail usage "bad ssh target" 2
+    printf '%s' "$_e_url" | grep -qE '^https?://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$' \
+        || enroll_fail usage "bad notification server url" 2
+    printf '%s' "$_e_topic" | grep -qE '^tendril-enroll-[A-Za-z0-9_-]{16,48}$' \
+        || enroll_fail usage "bad enrollment topic" 2
+    printf '%s' "$_e_secret" | grep -qE '^[A-Za-z0-9_-]{24,64}$' \
+        || enroll_fail usage "bad enrollment secret" 2
+    [ "$_e_fp" = "-" ] || printf '%s' "$_e_fp" | grep -qE '^SHA256:[A-Za-z0-9+/]{43}$' \
+        || enroll_fail usage "bad host key fingerprint" 2
+    command -v ssh >/dev/null 2>&1 && command -v ssh-keygen >/dev/null 2>&1 \
+        || enroll_fail openssh "openssh is missing - run the TENDRIL phone setup again" 3
+    _e_host=${_e_target#*@}
+    (umask 077 && mkdir -p "$HOME/.ssh") || enroll_fail ssh-dir "cannot create ~/.ssh" 3
+    if [ ! -f "$HOME/.ssh/id_ed25519" ]; then
+        ssh-keygen -q -t ed25519 -N '' -C termux -f "$HOME/.ssh/id_ed25519" </dev/null \
+            || enroll_fail keygen "could not create an SSH key" 3
+    fi
+    _e_known="-o StrictHostKeyChecking=yes"
+    if [ "$_e_fp" = "-" ]; then
+        _e_known="-o StrictHostKeyChecking=accept-new"   # host has no ed25519 key
+    else
+        _e_line=$(ssh-keyscan -t ed25519 -T 6 "$_e_host" 2>/dev/null | grep -v '^#' | head -n 1)
+        [ -n "$_e_line" ] || enroll_fail unreachable \
+            "cannot reach $_e_host - is Tailscale connected on this phone?" 4
+        _e_got=$(printf '%s\n' "$_e_line" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')
+        [ "$_e_got" = "$_e_fp" ] || enroll_fail hostkey \
+            "$_e_host presented a different host key than the pairing QR - refusing" 5
+        # the QR is the authority: drop any stale entry, pin the verified key
+        ssh-keygen -R "$_e_host" >/dev/null 2>&1
+        printf '%s\n' "$_e_line" >> "$HOME/.ssh/known_hosts"
+        chmod 600 "$HOME/.ssh/known_hosts" 2>/dev/null
+    fi
+    mkdir -p "$HOME/.config/tendril" || enroll_fail alias "cannot create ~/.config/tendril" 3
+    printf '%s\n' "$_e_target" > "$HOME/.config/tendril/alias.new.$$" \
+        && mv -f "$HOME/.config/tendril/alias.new.$$" "$HOME/.config/tendril/alias" \
+        || enroll_fail alias "cannot write ~/.config/tendril/alias" 3
+    # shellcheck disable=SC2086  # _e_known is a fixed option pair
+    if ssh -o BatchMode=yes -o ConnectTimeout=6 $_e_known "$_e_target" true 2>/dev/null; then
+        echo "ENROLL ok"; return 0            # already enrolled: nothing to publish
+    fi
+    _e_pub=$(cat "$HOME/.ssh/id_ed25519.pub" 2>/dev/null)
+    _e_type=$(printf '%s' "$_e_pub" | awk '{print $1}')
+    _e_b64=$(printf '%s' "$_e_pub" | awk '{print $2}')
+    [ "$_e_type" = "ssh-ed25519" ] && [ -n "$_e_b64" ] \
+        || enroll_fail keygen "the phone key id_ed25519.pub is not an ed25519 key" 3
+    _e_label=$(getprop ro.product.model 2>/dev/null | tr -c 'A-Za-z0-9._-' '-' | cut -c1-32)
+    _e_label=${_e_label%-}
+    [ -n "$_e_label" ] || _e_label=termux
+    _e_proof=$(printf '%s\n%s %s' "$_e_secret" "$_e_type" "$_e_b64" | sha256sum | cut -d ' ' -f1)
+    curl -fsS --max-time 15 -o /dev/null \
+        -d "tendril-enroll-1 $_e_type $_e_b64 $_e_label $_e_proof" "$_e_url/$_e_topic" \
+        || enroll_fail notify "could not reach the notification server $_e_url" 6
+    _e_n=0
+    while [ "$_e_n" -lt 45 ]; do          # ~90 s: the --pair waiter (2 s) or the guardian (30 s)
+        sleep 2
+        # shellcheck disable=SC2086
+        if ssh -o BatchMode=yes -o ConnectTimeout=6 $_e_known "$_e_target" true 2>/dev/null; then
+            echo "ENROLL ok"; return 0
+        fi
+        _e_n=$((_e_n + 1))
+    done
+    enroll_fail waiting "the host did not accept this phone - is the pairing QR still on screen? (tendril --pair)" 7
+}
+
 # finish_interactive <rc> - end an interactive session: the selector's Link
 # key (LINK_OPEN_STATUS) opens the app here on the phone; every other
 # status passes through untouched.
@@ -217,6 +291,10 @@ case "${1:-}" in
             echo "tendril-phone unknown"
         fi
         exit 0 ;;
+    enroll)
+        [ "$#" -eq 6 ] || { echo "usage: tendril enroll <user@host> <ntfy-url> <topic> <secret> <fp|->"; exit 2; }
+        enroll_phone "$2" "$3" "$4" "$5" "$6"
+        exit $? ;;
     link)
         # LINK-CONTRACT-0.2 §4: NO args = LOCAL ONLY - fixed component,
         # never a URI built from input, no ssh, no alias. `tendril link

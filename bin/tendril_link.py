@@ -108,6 +108,18 @@ NTFY_TOPIC_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 NTFY_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 NTFY_REDACTED = "<redacted>"
 
+# v0.2.1 "pairing code v3": v2 + one-shot phone enrollment. e = the
+# one-time enrollment topic on the same ntfy server (n), x = its secret
+# (the phone proves it with sha256(x + "\n" + pubkey)), f = the host's
+# OpenSSH ed25519 host-key fingerprint (the phone pins it — no blind
+# trust-on-first-use). e+x require n; f is optional (hosts without an
+# ed25519 host key). x is a SECRET: never printed outside the code.
+PAIRING_PREFIX_V3 = "TENDRIL3:"
+PAIRING_V3_MAX_LENGTH = 1024
+ENROLL_TOPIC_RE = re.compile(r"^tendril-enroll-[A-Za-z0-9_-]{16,48}$")
+ENROLL_SECRET_RE = re.compile(r"^[A-Za-z0-9_-]{24,64}$")
+HOSTKEY_FP_RE = re.compile(r"^SHA256:[A-Za-z0-9+/]{43}$")
+
 
 class LinkError(ValueError):
     """Malformed host, id, label, pane, payload or URI. Never a security event."""
@@ -274,9 +286,44 @@ def pairing_code_v2(host, ssh_target, user, ntfy_url=None, topic=None,
     return code
 
 
-# ---- pairing decode (strict, v1 and v2; the Link decoder's twin) ---------
+def pairing_code_v3(host, ssh_target, user, ntfy_url, topic, token=None,
+                    enroll_topic=None, enroll_secret=None, hostkey_fp=None):
+    """"pairing code v3" (v0.2.1): TENDRIL3:<base64url, no padding, of
+    compact sorted JSON {"v":3,"h","s","u","n","t"[,"k"],"e","x"[,"f"]}>.
+    The v2 keys keep their grammar; e/x/f are validated here (reject,
+    never sanitize). Raises LinkError on any invalid input."""
+    host, ssh_target, user = _pair_identity(host, ssh_target, user)
+    if not ntfy_url or not _valid_ntfy_url(ntfy_url):
+        raise LinkError(f"pairing ntfy url invalid (https://host[:port] only): {ntfy_url!r}")
+    if not isinstance(topic, str) or not NTFY_TOPIC_RE.match(topic):
+        raise LinkError(f"pairing ntfy topic invalid: {topic!r}")
+    if not isinstance(enroll_topic, str) or not ENROLL_TOPIC_RE.match(enroll_topic):
+        raise LinkError("pairing enrollment topic invalid")
+    if not isinstance(enroll_secret, str) or not ENROLL_SECRET_RE.match(enroll_secret):
+        raise LinkError("pairing enrollment secret invalid")
+    doc = {"v": 3, "h": host, "s": ssh_target, "u": user,
+           "n": ntfy_url, "t": topic, "e": enroll_topic, "x": enroll_secret}
+    if token:
+        if not NTFY_TOKEN_RE.match(token):
+            raise LinkError("pairing ntfy token invalid")
+        doc["k"] = token
+    if hostkey_fp is not None:
+        if not HOSTKEY_FP_RE.match(hostkey_fp):
+            raise LinkError("pairing host key fingerprint invalid")
+        doc["f"] = hostkey_fp
+    blob = json.dumps(doc, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True)
+    code = PAIRING_PREFIX_V3 + base64.urlsafe_b64encode(
+        blob.encode("utf-8")).decode("ascii").rstrip("=")
+    if len(code) > PAIRING_V3_MAX_LENGTH:
+        raise LinkError(
+            f"pairing code oversized ({len(code)} > {PAIRING_V3_MAX_LENGTH} chars)")
+    return code
 
-_PAIRING_KEYS = ("v", "h", "s", "u", "n", "t", "k")
+
+# ---- pairing decode (strict, v1-v3; the Link decoder's twin) -------------
+
+_PAIRING_KEYS = ("v", "h", "s", "u", "n", "t", "k", "e", "x", "f")
 _PAIRING_B64_RE = re.compile(r"[A-Za-z0-9_-]+")
 
 
@@ -383,12 +430,14 @@ def decode_pairing(code):
     Raises LinkError on anything out of grammar. URIs and bare payloads
     are not pairing codes."""
     text = str(code or "").strip()
-    if text.startswith(PAIRING_PREFIX_V2):
+    if text.startswith(PAIRING_PREFIX_V3):
+        prefix, version, max_len = PAIRING_PREFIX_V3, 3, PAIRING_V3_MAX_LENGTH
+    elif text.startswith(PAIRING_PREFIX_V2):
         prefix, version, max_len = PAIRING_PREFIX_V2, 2, PAIRING_V2_MAX_LENGTH
     elif text.startswith(PAIRING_PREFIX):
         prefix, version, max_len = PAIRING_PREFIX, 1, PAIRING_MAX_LENGTH
     else:
-        raise LinkError("not a pairing code (expected TENDRIL1: or TENDRIL2:)")
+        raise LinkError("not a pairing code (expected TENDRIL1:, TENDRIL2: or TENDRIL3:)")
     if len(text) > max_len:
         raise LinkError(f"pairing code oversized ({len(text)} > {max_len} chars)")
     payload = text[len(prefix):]
@@ -414,7 +463,24 @@ def decode_pairing(code):
     if not isinstance(user, str) or not PAIR_USER_RE.match(user):
         raise LinkError("pairing payload user invalid")
     out = {"v": version, "h": host, "s": target_, "u": user}
-    if version == 2:
+    if version == 1 and any(k in doc for k in ("n", "t", "k", "e", "x", "f")):
+        raise LinkError("pairing payload carries keys v1 does not know")
+    if version == 2 and any(k in doc for k in ("e", "x", "f")):
+        raise LinkError("pairing payload carries v3 keys under v2")
+    if version == 3:
+        if doc.get("n") is None or doc.get("t") is None:
+            raise LinkError("pairing payload v3 requires n and t")
+        enroll_topic, secret, fp = doc.get("e"), doc.get("x"), doc.get("f")
+        if not isinstance(enroll_topic, str) or not ENROLL_TOPIC_RE.match(enroll_topic):
+            raise LinkError("pairing payload enrollment topic invalid")
+        if not isinstance(secret, str) or not ENROLL_SECRET_RE.match(secret):
+            raise LinkError("pairing payload enrollment secret invalid")
+        out["e"], out["x"] = enroll_topic, secret
+        if fp is not None:
+            if not isinstance(fp, str) or not HOSTKEY_FP_RE.match(fp):
+                raise LinkError("pairing payload host key fingerprint invalid")
+            out["f"] = fp
+    if version in (2, 3):
         url, topic, token = doc.get("n"), doc.get("t"), doc.get("k")
         if (url is None) != (topic is None):
             raise LinkError("pairing payload n/t must appear together")

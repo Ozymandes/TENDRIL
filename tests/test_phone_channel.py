@@ -29,8 +29,17 @@ import tendril_phone as tp  # noqa: E402
 
 REMOTE_AGENTS = os.path.join(BIN, "remote-agents")
 LAUNCHER = os.path.join(REPO, "phone", "tendril")
-SIGNER = "d34e1f5aae91a43c5facef74886216d3389dbedb3b0850531747e97d0132c570"
-APK_BYTES = b"TENDRIL-LINK-APK-BYTES-" * 8
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if TESTS_DIR not in sys.path:
+    sys.path.insert(0, TESTS_DIR)
+from apkfixture import make_signed_apk, signer_of  # noqa: E402
+
+# a real APK-shaped zip with a real (v2-layout) signing block: --link-stage
+# reads the ACTUAL signer since v0.2.1, so fixtures must carry one
+CERT = b"TENDRIL-TEST-CERT"
+APK_BYTES = make_signed_apk(CERT, payload=b"TENDRIL-LINK-APK-BYTES-" * 8)
+SIGNER = signer_of(CERT)
+OTHER_CERT = b"SOMEONE-ELSES-CERT"
 LAUNCHERS = ("tendril", "termux-url-opener", "agent")
 
 LAUNCHER_BODIES = {
@@ -542,13 +551,52 @@ class LinkStage(PhoneEnv):
     def test_signer_change_refused(self):
         d, _ = self.pkg()
         self.assertEqual(self.run_cli("--link-stage", d)[0], 0)
-        d2, _ = self.pkg(doc_over={"signer_sha256": "e" * 64}, name="pkg2")
+        other = make_signed_apk(OTHER_CERT)
+        d2, _ = self.pkg(doc_over={"signer_sha256": signer_of(OTHER_CERT)},
+                         apk=other, name="pkg2")
         rc, out, err = self.run_cli("--link-stage", d2)
         self.assertNotEqual(rc, 0)
         self.assertIn("signing key changed", err)
         self.assertIn("Android would refuse an in-place update", err)
         with open(os.path.join(self.link(), "tendril-link.json")) as f:
             self.assertEqual(json.load(f)["signer_sha256"], SIGNER)
+
+    def test_manifest_lying_about_the_signer_is_refused(self):
+        # v0.2.1: the manifest names SIGNER, but the APK is signed by another
+        # key - the signing block decides, never the manifest
+        other = make_signed_apk(OTHER_CERT)
+        d, _ = self.pkg(apk=other)               # make_doc keeps SIGNER
+        rc, out, err = self.run_cli("--link-stage", d)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("the APK is signed by", err)
+        self.assertFalse(os.path.exists(self.link()))
+
+    def test_unsigned_or_non_apk_bytes_are_refused(self):
+        d, _ = self.pkg(apk=b"not an apk at all")
+        rc, _, err = self.run_cli("--link-stage", d)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("cannot read the APK signer", err)
+        self.assertFalse(os.path.exists(self.link()))
+
+    def test_rotation_to_the_release_key_is_the_one_allowed_change(self):
+        from unittest import mock
+        d, _ = self.pkg()
+        self.assertEqual(self.run_cli("--link-stage", d)[0], 0)   # dev pin
+        release_cert = b"TENDRIL-RELEASE-CERT"
+        rel = make_signed_apk(release_cert, payload=b"release build")
+        d2, _ = self.pkg(doc_over={"signer_sha256": signer_of(release_cert),
+                                   "versionCode": 43},
+                         apk=rel, name="pkg2")
+        with mock.patch.object(tp, "LINK_RELEASE_SIGNER", signer_of(release_cert)):
+            rc = self.call_tp(tp.link_stage, d2)
+            self.assertEqual(rc, 0)
+            with open(os.path.join(self.link(), "signer.sha256")) as f:
+                self.assertEqual(f.read().strip(), signer_of(release_cert))
+            # ...and once on the release key, nothing else is ever accepted
+            d3, _ = self.pkg(apk=make_signed_apk(OTHER_CERT),
+                             doc_over={"signer_sha256": signer_of(OTHER_CERT),
+                                       "versionCode": 44}, name="pkg3")
+            self.assertNotEqual(self.call_tp(tp.link_stage, d3), 0)
 
     def test_versioncode_downgrade_refused(self):
         d, _ = self.pkg()
