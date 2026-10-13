@@ -246,10 +246,16 @@ enroll_phone() {
 }
 
 # install_phone - `tendril install` in Termux (v0.2.1): THE phone install /
-# repair / update command. Fetches the current phone installer from the
-# TENDRIL repository (same trust as the first bootstrap) and runs it:
-# packages, launchers, deep links, phone key, the verified release-signed
-# TENDRIL Link APK and Android's installer. Idempotent.
+# repair / update command. A phone that knows its host takes the installer
+# from THAT host's own staged snapshot (`ssh <alias> remote-agents
+# --phone-script setup` - the same auditable script --upgrade runs): the
+# launchers, deep links, alias, the verified release-signed TENDRIL Link
+# APK and Android's installer, always in step with the release the host
+# actually runs, published or not. Only a phone with no host yet falls
+# back to the public bootstrap: ONE NAMED FILE on GitHub raw - a raw
+# DIRECTORY URL (ending in /phone) is always a 404 and is never
+# constructed here (tests/test_phone_install.py pins that forever).
+# Idempotent: re-running refreshes what moved and skips what is current.
 install_phone() {
     case "${PREFIX:-}" in
         */com.termux/*) ;;
@@ -259,11 +265,42 @@ install_phone() {
             echo "  On a Mac client:    ./install --client   (from the TENDRIL checkout)"
             exit 2 ;;
     esac
-    _i_raw=${TENDRIL_RAW:-https://raw.githubusercontent.com/Ozymandes/TENDRIL/${TENDRIL_REF:-main}/phone}
     _i_tmp="${TMPDIR:-$PREFIX/tmp}/tendril-setup.$$.sh"
-    if ! curl -fsSL --max-time 60 -o "$_i_tmp" "$_i_raw/setup.sh" || ! sh -n "$_i_tmp"; then
+    _i_alias=${TENDRIL_ALIAS:-${AGENT_ALIAS:-$CONF_ALIAS}}
+    if [ -n "$_i_alias" ]; then
+        case $_i_alias in
+            -*) echo "[tendril] '$_i_alias' is not an SSH alias (leading '-')"; exit 2 ;;
+        esac
+        if ! command -v ssh >/dev/null 2>&1; then
+            echo "[tendril] ssh is missing - run: pkg install -y openssh mosh, then tendril install again."
+            exit 1
+        fi
+        # HOST FIRST: the paired host is the authority on what this phone
+        # should run. Its installer is fetched fully, then run - never a
+        # partial stream piped into sh - and GitHub is never consulted
+        # behind the host's back.
+        if ssh -o BatchMode=yes -o ConnectTimeout=8 "$_i_alias" \
+            "remote-agents --phone-script setup" > "$_i_tmp" \
+           && [ -s "$_i_tmp" ] && sh -n "$_i_tmp"; then
+            sh "$_i_tmp"
+            _i_rc=$?
+            rm -f "$_i_tmp"
+            # Interactive only: Android suppresses activity starts from a
+            # background (headless RUN_COMMAND) context anyway.
+            if [ "$_i_rc" -eq 0 ] && [ -t 0 ]; then
+                open_link_app
+            fi
+            exit "$_i_rc"
+        fi
         rm -f "$_i_tmp"
-        echo "[tendril] could not download the phone installer from $_i_raw - is the phone online?"
+        echo "[tendril] could not fetch the installer from $_i_alias - is the host up and Tailscale connected?"
+        echo "  (a paired phone installs from its host; GitHub is used only before the first pairing)"
+        exit 1
+    fi
+    _i_url="${TENDRIL_RAW:-https://raw.githubusercontent.com/Ozymandes/TENDRIL/${TENDRIL_REF:-main}/phone}/setup.sh"
+    if ! curl -fsSL --max-time 60 -o "$_i_tmp" "$_i_url" || ! sh -n "$_i_tmp"; then
+        rm -f "$_i_tmp"
+        echo "[tendril] could not download the phone installer from $_i_url - is the phone online?"
         exit 1
     fi
     sh "$_i_tmp"
