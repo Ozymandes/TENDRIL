@@ -40,6 +40,8 @@ CERT = b"TENDRIL-TEST-CERT"
 APK_BYTES = make_signed_apk(CERT, payload=b"TENDRIL-LINK-APK-BYTES-" * 8)
 SIGNER = signer_of(CERT)
 OTHER_CERT = b"SOMEONE-ELSES-CERT"
+RELEASE_CERT = b"TENDRIL-RELEASE-CERT"
+RELEASE_SIGNER = signer_of(RELEASE_CERT)
 LAUNCHERS = ("tendril", "termux-url-opener", "agent")
 
 LAUNCHER_BODIES = {
@@ -614,6 +616,123 @@ class LinkStage(PhoneEnv):
         rc, _, err = self.run_cli("--link-stage", d)
         self.assertNotEqual(rc, 0)
         self.assertIn("tendril-link.apk", err)
+
+
+class LinkFetch(PhoneEnv):
+    """tendril --link-fetch: the OFFICIAL release path — pinned signer
+    only, everything re-verified by link_stage. Runs against a fake
+    opener; no test ever touches the network."""
+
+    def fake_release(self, apk=None, doc_over=None):
+        """A fake opener serving tendril-link.json + tendril-link.apk
+        exactly as the GitHub release would: the APK is signed by the
+        release key and the manifest names that signer."""
+        if apk is None:
+            apk = make_signed_apk(RELEASE_CERT, payload=b"release build")
+        doc = make_doc(apk=apk,
+                       **{"signer_sha256": RELEASE_SIGNER,
+                          **(doc_over or {})})
+
+        class Resp:
+            def __init__(self, body):
+                self.body = body
+
+            def read(self, limit=-1):
+                return self.body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        served = []
+
+        def opener(req, timeout=60):
+            name = req.full_url.rsplit("/", 1)[-1]
+            served.append(name)
+            if name == "tendril-link.json":
+                return Resp(json.dumps(doc).encode())
+            if name == "tendril-link.apk":
+                return Resp(apk)
+            raise OSError("404 " + name)
+
+        opener.served = served
+        return opener, doc
+
+    def fetch(self, opener, tag=None):
+        import io
+        out = io.StringIO()
+        rc = self.call_tp(lambda: tp.link_fetch(tag, opener=opener, out=out))
+        return rc, out.getvalue()
+
+    def pinned(self):
+        return mock.patch.object(tp, "LINK_RELEASE_SIGNER", RELEASE_SIGNER)
+
+    def test_unpinned_refuses_before_any_network(self):
+        # the pre-release truth: LINK_RELEASE_SIGNER == "" — nothing is
+        # fetched, nothing is staged
+        opener, _ = self.fake_release()
+        with mock.patch.object(tp, "LINK_RELEASE_SIGNER", ""):
+            rc, _ = self.fetch(opener)
+        self.assertEqual(rc, 1)
+        self.assertEqual(opener.served, [])          # never even looked
+        self.assertFalse(os.path.exists(self.link()))
+
+    def test_bad_tag_is_a_usage_error(self):
+        opener, _ = self.fake_release()
+        with self.pinned():
+            rc, _ = self.fetch(opener, tag="../evil")
+        self.assertEqual(rc, 2)
+        self.assertEqual(opener.served, [])
+
+    def test_manifest_naming_another_signer_is_refused(self):
+        opener, doc = self.fake_release(
+            apk=make_signed_apk(OTHER_CERT),
+            doc_over={"signer_sha256": signer_of(OTHER_CERT)})
+        with self.pinned():
+            rc, _ = self.fetch(opener)
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.exists(self.link()))
+
+    def test_implausible_size_refuses_before_the_download(self):
+        opener, _ = self.fake_release(doc_over={"size": 500 * 1024 * 1024})
+        with self.pinned():
+            rc, _ = self.fetch(opener)
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.exists(self.link()))
+
+    def test_happy_path_stages_the_release(self):
+        opener, doc = self.fake_release()
+        with self.pinned():
+            rc, out = self.fetch(opener)
+        self.assertEqual(rc, 0, out)
+        with open(os.path.join(self.link(), "tendril-link.json")) as f:
+            staged = json.load(f)
+        self.assertEqual(staged["sha256"], doc["sha256"])
+        self.assertEqual(staged["signer_sha256"], RELEASE_SIGNER)
+        with open(os.path.join(self.link(), "signer.sha256")) as f:
+            self.assertEqual(f.read().strip(), RELEASE_SIGNER)
+
+    def test_already_staged_is_a_no_op(self):
+        opener, doc = self.fake_release()
+        with self.pinned():
+            rc, _ = self.fetch(opener)
+            self.assertEqual(rc, 0)
+            opener.served.clear()
+            rc, out = self.fetch(opener)
+        self.assertEqual(rc, 0)
+        self.assertIn("already staged", out)
+
+    def test_lying_bytes_are_refused_by_link_stage(self):
+        garbage = b"not an apk at all"
+        opener, _ = self.fake_release(
+            apk=garbage,
+            doc_over={"sha256": sha_bytes(garbage), "size": len(garbage)})
+        with self.pinned():
+            rc, _ = self.fetch(opener)
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.exists(self.link()))
 
 
 class GeneratedScriptBasics(PhoneEnv):
