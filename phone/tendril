@@ -532,10 +532,13 @@ if [ -z "$FORCE_SSH" ] && command -v mosh >/dev/null 2>&1; then
     _t_log transport-chosen-mosh
     _t_log mosh-exec
     NONCE=$(link_nonce)
-    if [ -n "$NONCE" ]; then
-        MOSH_CMD="export TENDRIL_LINK_NONCE=$NONCE; exec $REMOTE_CMD"
-    else
-        MOSH_CMD="exec $REMOTE_CMD"
+    MOSH_CMD="exec $REMOTE_CMD"
+    [ -n "$NONCE" ] && MOSH_CMD="export TENDRIL_LINK_NONCE=$NONCE; $MOSH_CMD"
+    # Touch scrolling: Termux only tracks mouse modes 1000/1002 and Mosh
+    # forwards just Herdr's 1003, so swipes became arrow keys. Tell the
+    # host bridge this client is Termux; it then asks for 1002 instead.
+    if [ -n "${TERMUX_VERSION:-}" ] || case "${PREFIX:-}" in */com.termux/*) true ;; *) false ;; esac; then
+        MOSH_CMD="export TENDRIL_CLIENT=termux; $MOSH_CMD"
     fi
     if mosh --ssh="ssh $SESSION_CM_OPTS" "$ALIAS" \
         -- sh -lc "$MOSH_CMD"; then

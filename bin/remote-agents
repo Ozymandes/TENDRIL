@@ -651,6 +651,43 @@ def _detach_translate(data):
     return data[cut:], bytes(out)
 
 
+# ---------- touch scrolling for Termux over Mosh (v0.2.1) ----------
+# A finger swipe in Termux becomes mouse-WHEEL events only while the
+# terminal has mouse tracking on, and Termux implements tracking modes 1000
+# and 1002 only (TerminalEmulator.isMouseTrackingActive). Herdr asks for
+# 1000 + 1002 + 1003; Mosh keeps ONE mouse mode (last request wins) and
+# forwards just 1003, which Termux accepts but ignores — so Termux thought
+# tracking was off and turned every swipe into Up/Down ARROW keys that
+# edited the agent's prompt instead of scrolling. For a Termux client (the
+# phone launcher exports TENDRIL_CLIENT=termux) the bridge rewrites mode
+# 1003 (any-motion) to 1002 (button-event) on the way out: Mosh forwards
+# 1002, Termux sends SGR wheel events, Herdr scrolls natively (and hands
+# the wheel to pane apps that asked for the mouse, e.g. Pi). Only hover
+# motion is lost, which a touchscreen never produces.
+_DECMODE_RE = re.compile(rb"\x1b\[\?([0-9;]*)([hl])")
+_DECMODE_PARTIAL_RE = re.compile(rb"\x1b(?:\[(?:\?[0-9;]{0,24})?)?\Z")
+
+
+def _termux_client():
+    return os.environ.get("TENDRIL_CLIENT", "").strip().lower() == "termux"
+
+
+def _mouse_compat_translate(data):
+    """(tail, out): DEC private mode 1003 -> 1002 in every set/reset; hold a
+    trailing, possibly incomplete `ESC [ ? digits` run for the next read;
+    every other byte passes through unchanged."""
+    m = _DECMODE_PARTIAL_RE.search(data)
+    tail = b""
+    if m:
+        tail, data = data[m.start():], data[:m.start()]
+
+    def fix(mt):
+        params = [b"1002" if p == b"1003" else p for p in mt.group(1).split(b";")]
+        return b"\x1b[?" + b";".join(params) + mt.group(2)
+
+    return tail, _DECMODE_RE.sub(fix, data)
+
+
 def _write_all(fd, data):
     while data:
         data = data[os.write(fd, data):]
@@ -693,6 +730,8 @@ def _attach_session():
     resize()
     tty.setraw(fd)
     tail = b""
+    out_tail = b""
+    termux = _termux_client()
     reaped = False
     try:
         while True:
@@ -700,6 +739,9 @@ def _attach_session():
             if not r and tail:    # a cancelled combo must not hold bytes forever
                 _write_all(master, tail)
                 tail = b""
+            if not r and out_tail:
+                _write_all(out_fd, out_tail)
+                out_tail = b""
             if fd in r:
                 data = os.read(fd, 4096)
                 if not data:
@@ -714,6 +756,8 @@ def _attach_session():
                     break
                 if not data:
                     break
+                if termux:
+                    out_tail, data = _mouse_compat_translate(out_tail + data)
                 _write_all(out_fd, data)
             done, _ = os.waitpid(pid, os.WNOHANG)
             if done == pid:
@@ -723,6 +767,11 @@ def _attach_session():
         if tail:                      # flush a held partial sequence
             try:
                 _write_all(master, tail)
+            except OSError:
+                pass
+        if out_tail:
+            try:
+                _write_all(out_fd, out_tail)
             except OSError:
                 pass
         signal.signal(signal.SIGWINCH, old_winch)
