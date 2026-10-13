@@ -53,7 +53,10 @@ fixed-verb caller. Everything here is additive to snapshot v2; a 0.1.x phone
     "generated_at": 1791583000,
     "providers": [
       {"id": "claude", "label": "Claude", "harness": "claude",
-       "state": "ready|pressure|critical|exhausted|unknown",
+       "models": ["claude-opus-5-5"], "harnesses": ["claude","pi"],
+       "discovered_from": ["active_sessions","configured_adapter"],
+       "last_seen_at": 1791582990,
+       "state": "ready|pressure|critical|exhausted|unavailable|unknown",
        "windows": [{"kind": "session|weekly|daily", "used_pct": 91.0,
                     "resets_at": 1791592000, "window_min": 300}],
        "tokens_today": 1288000,
@@ -82,8 +85,9 @@ fixed-verb caller. Everything here is additive to snapshot v2; a 0.1.x phone
 
 Capacity state thresholds (worst window): ready < 70 · pressure 70–89 ·
 critical 90–97 · exhausted ≥ 98 or an active 429 with `resets_at` in the
-future · unknown when no trusted sample within the adapter's staleness bound
-(local transcripts: 6 h; network: 30 min).
+future · unavailable when a known adapter failed or its last authoritative
+sample is stale · unknown when the provider is known but no quota classification
+is available. Provider identity metadata may remain present in either state.
 
 Phase (host-classified, never shows a command): `tool` when a tool is open;
 `editing` for edit/write/apply_patch-class tools; `testing` when an open bash
@@ -92,13 +96,18 @@ cargo test, go test, make test, unittest, run_suite.py} (classified on the
 host, only the phase word leaves); `reviewing` for read/grep/find/ls-class
 tools; `thinking` when working with no open tool; absent otherwise.
 
-Hook signatures (host): `tendril_capacity.snapshot_section(budget_s)` and
+Hook signatures (host): `tendril_capacity.snapshot_section(budget_s, discovered=None)` and
 `tendril_schedule.snapshot_section()` both return `(section_dict | None,
 capability_string)`.
 
 ## 2 · Capacity (host)
 
-`bin/tendril_capacity.py`, stdlib. Adapters: `claude_local`, `codex_rollout`,
+`bin/tendril_capacity.py`, stdlib. A provider registry canonicalizes known
+aliases (Anthropic/Claude, OpenAI/Codex, Z.AI) and passes previously unseen
+provider ids through as generic records. Discovery uses already-sanitized
+current/recent session metadata, bounded local usage evidence and adapter
+configuration; credential-file presence is an identity signal only. A separate
+adapter registry supplies metrics through `claude_local`, `codex_rollout`,
 `pi_local` (default ON, no network, no secrets) and `claude_oauth`,
 `codex_wham`, `zai_quota` (default OFF; enabled with
 `tendril capacity enable <id>…`; read only the needed credential subtree into
@@ -293,7 +302,13 @@ Herdr binary: the installer resolves the user's real Herdr (`--detect`: protocol
 
 ### 7.5 Capacity provider status
 
-When `state = unknown`, a provider carries `"reason":"adapter_disabled|auth_error|network_error|no_data|feature_missing"` and, for disabled network adapters, `"enable":"claude_oauth"` (the adapter id the user can enable). The phone renders: adapter_disabled ⇒ "Enable secure host reporting" + the exact host command; feature_missing ⇒ "Update TENDRIL on the host"; auth_error / network_error / no_data ⇒ their own sentence.
+When metrics cannot be classified, a provider carries
+`"reason":"adapter_disabled|auth_error|network_error|stale|no_data|feature_missing"`.
+Known adapter failures and stale samples use `state = unavailable`; partial
+identity with no current quota uses `state = unknown`. For a disabled network
+adapter, `enable` names the exact registered adapter id. The phone keeps the
+provider, model, harness and last-seen facts visible, explains the unavailable/
+unknown reason, and never invents a percentage.
 
 ### 7.6 Notification-driven invalidation (phone)
 

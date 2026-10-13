@@ -25,8 +25,9 @@ on your own machine.
 Your agents run for hours in [Herdr](https://herdr.dev) on your
 workstation. From **TENDRIL Link** on your Android phone you can see which
 of them are working, which are idle, which failed and which are waiting
-for you — down to the subagents they spawned. You can see how much Claude
-and Z.AI capacity is left before the next reset, schedule the next job,
+for you — down to the subagents they spawned. You can inspect the providers
+actually seen on the host — including Claude, Z.AI and OpenAI / Codex — and
+see quota data where an authoritative adapter supplies it, schedule the next job,
 get told when something finishes or breaks, revive Herdr when it falls
 over, and drop straight into the exact terminal pane that needs you.
 
@@ -46,8 +47,9 @@ system you can hold in one hand.
 Three surfaces carry most of the day:
 
 - **HOME** is the whole system in one glance: link state, how many agents
-  and subagents are alive, the provider under the most pressure, anything
-  that needs you, and one button into the console.
+  and subagents are alive, anything that needs you, and the most recently
+  active session with a direct route to that exact dossier. Provider quota
+  pressure stays on CAPACITY instead of displacing live work.
 - **LIVE** is every session as it happens — working, idle, failed, needs
   input — with subagent trails, history, and a topology view.
 - **CAPACITY** is provider usage and limits: session and weekly windows,
@@ -142,9 +144,13 @@ rename from the phone, and one-tap entry into the exact pane.
 on-reset and when-available triggers; host-authoritative state that
 survives reboots.
 
-**Capacity.** Claude, Codex and Pi usage from your own local transcripts
-(no network, no credentials), plus opt-in provider usage APIs for Claude,
-Codex and Z.AI: quota windows, reset times, pressure, spend.
+**Capacity.** Provider identities are discovered from current/recent session
+metadata, local usage logs and configured adapters. Claude, Z.AI and
+OpenAI / Codex aliases fold into stable provider records; previously unseen
+providers remain visible with their models and harnesses. Local transcript
+usage needs no credentials. Opt-in, read-only provider adapters add
+quota windows and reset times when available; missing, stale or failed
+metrics remain explicit rather than becoming invented percentages.
 
 **Notifications.** An agent finished, an agent needs input, a scheduled
 task started or failed, Herdr went down or came back — delivered through
@@ -181,7 +187,8 @@ failure states apart, because they need different things from you:
   restart that is only reported as done once Herdr is verifiably serving
   again.
 - **Human attention comes first.** **NEEDS YOU** lists every agent
-  waiting on input, and how long it has waited.
+  waiting on input, and how long it has waited. Otherwise HOME shows the
+  most recently active session; tapping it opens that exact pane's dossier.
 - **Diagnostics show the real boundaries.** Termux, its permission, the
   launcher, the SSH alias, deep links, the notification bridge, the host,
   Herdr, TENDRIL and the notifier — each with its own state, so a broken
@@ -207,7 +214,9 @@ failure states apart, because they need different things from you:
    have to babysit.
 4. **Herdr** — the persistent runtime: workspaces, sessions, agents (Pi,
    Claude Code, Codex) and their subagents.
-5. **Model providers** — where capacity comes from: Claude, Z.AI, Codex.
+5. **Model providers** — identities discovered from current/recent host
+   activity; authoritative quota metrics appear only where a provider
+   adapter can report them.
 
 Three flows connect them: *control* (you direct the agents), *state*
 (live sessions and activity flow back), *notify / recovery* (events,

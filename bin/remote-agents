@@ -1636,7 +1636,7 @@ def _snapshot_agent(a, tele=None):
     return out
 
 
-def _optional_sections(snap=None):
+def _optional_sections(snap=None, provider_hints=None):
     """(extra top-level sections, extra capability strings) contributed by
     sibling host modules when they are installed (contract §1/§4). Each hook
     returns (section_dict | None, capability_string) — a bare section dict is
@@ -1663,7 +1663,8 @@ def _optional_sections(snap=None):
 
     try:
         import tendril_capacity
-        take("capacity", tendril_capacity.snapshot_section(budget_s=1.0))
+        take("capacity", tendril_capacity.snapshot_section(
+            budget_s=1.0, discovered=provider_hints or []))
     except Exception:
         pass
     try:
@@ -1777,8 +1778,27 @@ def _snapshot_doc():
         # get a tiny not-modified line for unchanged polls (D11 freshness).
         "capabilities": ["subagents", "etag"],
     }
+    # Provider discovery is independent from quota metrics. The already
+    # sanitized telemetry rows are enough to make an active/new provider
+    # visible immediately, even when it has no adapter or usage sample yet.
+    provider_hints = []
+    for ws in workspaces:
+        for agent in ws.get("agents", []):
+            provider = agent.get("provider")
+            if not provider:
+                continue
+            last = agent.get("last_event") or {}
+            provider_hints.append({
+                "provider": provider,
+                "model": agent.get("model"),
+                "harness": agent.get("harness"),
+                "source": "active_sessions" if agent.get("status") in
+                          ("working", "blocked") else "session_metadata",
+                "seen_at": last.get("at") or agent.get("started_at")
+                           or doc["generated_at"],
+            })
     try:
-        extra, caps = _optional_sections(snap)
+        extra, caps = _optional_sections(snap, provider_hints)
         doc.update(extra)
         doc["capabilities"] += [c for c in caps
                                 if c not in doc["capabilities"]]
