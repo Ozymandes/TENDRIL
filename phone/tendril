@@ -66,6 +66,10 @@
 # file named by this launch's nonce instead (see link_nonce below).
 LINK_OPEN_STATUS=75
 
+# Hex in `case` patterns is spelled out ([0123456789abcdef], never a-f):
+# bash 3.2 (macOS /bin/sh) matches bracket RANGES by locale collation, so
+# in a UTF-8 locale [0-9a-f] also admits A-E.
+
 # ---------- RC2 perf: launch trace + SSH connection reuse ----------------
 # Both switches are zero-cost when off: one env test and one stat, then
 # the trace helper returns before touching anything.
@@ -161,7 +165,7 @@ open_link_app() {
 link_nonce() {
     _ln=$(od -An -N8 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
     case "$_ln" in
-        *[!0-9a-f]* | "") return 0 ;;
+        *[!0123456789abcdef]* | "") return 0 ;;
     esac
     [ "${#_ln}" -eq 16 ] && printf '%s' "$_ln"
     return 0
@@ -339,7 +343,7 @@ if [ "$MODE" = "snapshot" ]; then
     # document is unchanged. Regex-validated here, single-quoted there.
     case "$SNAP_ETAG" in
         "") REMOTE_CMD="$REMOTE_BIN snapshot" ;;
-        [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f])
+        [0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef])
             REMOTE_CMD="$REMOTE_BIN snapshot --if-none-match '$SNAP_ETAG'" ;;
         *) echo "usage: tendril [<alias>] snapshot [etag]   (etag: 16 lowercase hex)"; exit 2 ;;
     esac
@@ -365,7 +369,7 @@ elif [ "$MODE" = "schedule" ]; then
     case "$SCHED_SUB" in
         show | cancel)
             case "$SCHED_ARG" in
-                t-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+                t-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]-[0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef][0123456789abcdef]) ;;
                 *)
                     echo "usage: tendril [<alias>] schedule $SCHED_SUB <id>   (id: t-YYYYMMDD-8 lowercase hex)"
                     exit 2 ;;
@@ -386,7 +390,14 @@ elif [ "$MODE" = "schedule" ]; then
             # dialed (pane ids are w<alnum>:p<alnum> — real hosts use
             # base-36-ish suffixes like w9:pB). Decode is best-effort:
             # no base64 on the phone → the host validates alone.
-            DECODED=$(printf '%s' "$SCHED_ARG" | tr '_-' '/+' \
+            # base64url drops its '=' padding; older coreutils (Ubuntu's
+            # 9.4) refuse unpadded input, so restore it before decoding
+            case $((${#SCHED_ARG} % 4)) in
+                2) SCHED_B64="$SCHED_ARG==" ;;
+                3) SCHED_B64="$SCHED_ARG=" ;;
+                *) SCHED_B64="$SCHED_ARG" ;;
+            esac
+            DECODED=$(printf '%s' "$SCHED_B64" | tr '_-' '/+' \
                 | base64 -d 2>/dev/null) || DECODED=""
             if [ -n "$DECODED" ] \
                     && printf '%s' "$DECODED" | grep -q '"target"'; then

@@ -156,6 +156,9 @@ def _is_regular(path):
 
 
 def _under_home(realpath, home):
+    # Both sides resolved: a home reached through a symlink (macOS /var ->
+    # /private/var, /home -> /var/home) must not make every file an "escape".
+    home = os.path.realpath(home)
     return realpath.startswith(home.rstrip(os.sep) + os.sep)
 
 

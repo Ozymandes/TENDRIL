@@ -348,7 +348,7 @@ write_service_env() {
     SVC_PATH=""
     add_svc_dir() {
         [ -n "$1" ] && [ -d "$1" ] || return 0
-        case ":$SVC_PATH:" in *":$1:*") ;; *) SVC_PATH="${SVC_PATH:+$SVC_PATH:}$1" ;; esac
+        case ":$SVC_PATH:" in *":$1:"*) ;; *) SVC_PATH="${SVC_PATH:+$SVC_PATH:}$1" ;; esac
     }
     add_svc_dir "$(dirname -- "${HERDR_BIN:-}" 2>/dev/null)"
     add_svc_dir "$HOME/.local/bin"
