@@ -556,7 +556,7 @@ class SelectorLKey(LauncherEnv):
         # "SSH_CONNECTION set => ssh transport" gate skipped the flag on
         # EVERY mosh session and L behaved exactly like Q.
         ra = load_ra()
-        rc = self.press(ra, "l", SSH_CONNECTION="100.78.155.82 34062 100.78.155.82 22",
+        rc = self.press(ra, "l", SSH_CONNECTION="100.64.0.1 34062 100.64.0.1 22",
                         TENDRIL_LINK_NONCE=self.NONCE)
         self.assertEqual(rc, ra.LINK_OPEN_EXIT)
         with open(self.request_path()) as f:
@@ -658,7 +658,7 @@ REAL_MOSH_STUB = (
     '[ $# -gt 0 ] && shift\n'
     '[ "$1" = "sh" ] && shift\n'
     '[ "$1" = "-lc" ] && shift\n'
-    'SSH_CONNECTION="100.124.189.87 42108 100.78.155.82 22" sh -c "$1"\n'
+    'SSH_CONNECTION="100.64.0.2 42108 100.64.0.1 22" sh -c "$1"\n'
     'exit 0\n')
 REAL_SSH_STUB = (
     'printf \'ssh %s\\n\' "$*" >> "$TENDRIL_RECORD"\n'
