@@ -37,6 +37,13 @@ Highlights:
   them across failed checks, and installs through `tendril --upgrade` →
   in-app re-verification → Android's installer (confirmation always
   stays). Headless `--upgrade` never prompts.
+- **Portability fixes found by clean CI runners**: the installer's
+  service PATH de-duplication now matches; the phone launcher's local
+  schedule-target and hex-id checks now run on older coreutils and on
+  macOS bash 3.2 (the host always re-validated); telemetry and session
+  titles work when `$HOME` sits behind a symlink (macOS `/private/var`,
+  Silverblue `/var/home`). The suite no longer depends on the developer
+  machine's Herdr, harnesses or tool layout.
 - **Security model** moved to the root [SECURITY.md](SECURITY.md) and
   extended for TENDRIL Link, pairing codes, updates and capacity
   credentials.
