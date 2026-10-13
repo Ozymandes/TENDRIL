@@ -150,9 +150,13 @@ sys.exit(0 if a >= b else 1)' "$1" "$2" 2>/dev/null
 HERDR=$(herdr_bin || true)
 if [ -z "$HERDR" ]; then
     if ask "Herdr (the persistent agent runtime) is not installed. Install it now with its official installer (user-local, no sudo)?"; then
-        if curl -fsSL https://herdr.dev/install.sh 2>>"$LOG" | sh >>"$LOG" 2>&1; then
-            HERDR=$(herdr_bin || true)
-        fi
+        note "installing Herdr (about a minute)..."
+        for _try in 1 2; do         # one retry: a slow first download is common
+            if curl -fsSL https://herdr.dev/install.sh 2>>"$LOG" | sh >>"$LOG" 2>&1; then
+                HERDR=$(herdr_bin || true)
+            fi
+            [ -n "$HERDR" ] && break
+        done
         [ -n "$HERDR" ] || fail "Herdr installation failed" "See $LOG, or install it yourself: https://herdr.dev"
     else
         fail "Herdr is required" "Install it (user-local):  curl -fsSL https://herdr.dev/install.sh | sh" \
