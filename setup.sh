@@ -175,6 +175,10 @@ ok "Herdr $HV"
 # ---------------------------------------------------------------- source
 FIRST=1
 [ -f "$HOME/.config/remote-agents/install.json" ] && FIRST=0
+# a re-run follows the branch the managed checkout is on (TENDRIL_REF wins)
+if [ -z "${TENDRIL_REF:-}" ] && [ -d "$SRC/.git" ]; then
+    REF=$(git -C "$SRC" symbolic-ref --short -q HEAD 2>/dev/null || echo "$REF")
+fi
 if [ "${TENDRIL_SRC_PINNED:-}" = 1 ] && [ -f "$SRC/install" ]; then
     :   # tendril install from a developer checkout: use it exactly as it is
 elif [ -d "$SRC/.git" ]; then
