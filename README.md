@@ -288,40 +288,40 @@ without it.
 ## Quick start
 
 You'll need a Linux machine running [Herdr](https://herdr.dev) 0.9.3 or
-newer, Tailscale on the host and the phone, and
-[Termux from F-Droid](https://f-droid.org/packages/com.termux/)
-on an Android phone. Two commands and one QR scan — no config files, no
-manual APK transfers, no dependency hunting.
+newer (installed for you if missing), Tailscale on the host and the phone,
+and [Termux from F-Droid](https://f-droid.org/packages/com.termux/) on an
+Android phone.
 
-**1. On the host — one command.** User-local, never uses `sudo`; installs
-Herdr if it's missing (asking first), configures notifications, and ends
-on a pairing QR:
+**Host**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Ozymandes/TENDRIL/main/setup.sh | sh
+tendril install
 ```
 
+**Phone (Termux)**
+
+```sh
+tendril install
+```
+
+**Scan the QR.** Done.
+
+The host command sets up Herdr, the runtime, the scheduler, the guardian,
+private notifications and Capacity, then shows the pairing QR. The phone
+command installs SSH + Mosh and the launcher, prepares the phone's key, and
+downloads, verifies and installs the release-signed TENDRIL Link. Scanning
+the QR in Link enrolls the phone's key on the host and brings your
+notifications along — HOME reads **LINK READY**. `tendril --pair` shows a
+new QR (and the same code as text for **Paste code instead**) any time.
 On a server, also run `sudo loginctl enable-linger $USER` so the timers
 keep running after you log out.
 
-**2. On the phone — one command** (in Termux). Installs SSH + Mosh, the
-launchers, and the release-verified TENDRIL Link app, then opens it:
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/Ozymandes/TENDRIL/main/phone/setup.sh | sh
-```
-
-**3. Scan the QR.** Point TENDRIL Link's **Scan QR** at the code on your
-host. The one scan installs your phone's SSH key on the host, brings your
-private notification topic along, and lands you in HOME. Run `tendril
---pair` on the host any time to show the QR again. HOME should read
-**LINK READY** — tap **Open Tendril** for the console, or type `tendril`
-in Termux.
-
-Behind a weird network, or prefer to do it by hand? `tendril --pair
---manual` prints the password-based bootstrap, and the
-[Android guide](docs/ANDROID.md) and
-[step-by-step setup guide](docs/TENDRIL-SETUP-GUIDE.md) cover every path.
+<sub>**First bootstrap** — before `tendril` exists on a machine, run this
+once instead (it installs `tendril`, then does exactly `tendril install`):
+host `curl -fsSL https://raw.githubusercontent.com/Ozymandes/TENDRIL/main/setup.sh | sh` ·
+phone `curl -fsSL https://raw.githubusercontent.com/Ozymandes/TENDRIL/main/phone/setup.sh | sh`.
+Other paths: [Android guide](docs/ANDROID.md),
+[step-by-step setup guide](docs/TENDRIL-SETUP-GUIDE.md).</sub>
 
 ## Day to day
 
@@ -334,7 +334,8 @@ tendril schedule list         # scheduled tasks, newest first
 tendril health --json         # Herdr, TENDRIL and service states (no secrets)
 tendril herdr restart         # the verified revive
 tendril herdr stop | start    # intentional stop (sets the guard) / start (clears it)
-tendril --pair                # pairing code + QR for TENDRIL Link
+tendril install               # install / repair (host or phone)
+tendril --pair                # pairing QR + the same code as text for TENDRIL Link
 tendril --upgrade             # update (host: TENDRIL itself · phone: launchers + Link)
 herdr-notify --test           # send a test notification
 ```

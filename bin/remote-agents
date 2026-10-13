@@ -2706,20 +2706,20 @@ def _pair_qr(code, indent=2):
 
 PHONE_SETUP_COMMAND = ("curl -fsSL https://raw.githubusercontent.com/"
                        "Ozymandes/TENDRIL/main/phone/setup.sh | sh")
+PHONE_INSTALL_COMMAND = "tendril install"
 
 
-def _pair_print(mode, code, host, target, user, notify_ready,
-                show_code=False, enroll=False):
-    """`tendril --pair` output. --manual: the header and the ONE
-    password-based bootstrap command (for hosts without a notification
-    server to carry enrollment). Default: the identity summary and the QR.
-    The code text — which carries the one-time enrollment secret (v3) and
-    the read-only ntfy token — is printed only with --show-code, so
-    screenshots and scrollback stay clean."""
+def _pair_print(mode, code, host, target, user, notify_ready, enroll=False):
+    """`tendril --pair` output (v0.2.1). Default: the identity summary, the
+    QR and — under it — the SAME pairing code as text for Link's "Paste
+    code instead" (one session, one TTL, one set of trust data). --manual:
+    the code without the QR (no camera). --legacy: the old password-based
+    SSH bootstrap, for hosts without a notification server only."""
     reach = f"{user}@{target}"
     print(f"{C_LIME}TENDRIL // PAIR YOUR PHONE{C_RESET}")
     print("")
-    if mode == "manual":
+    if mode == "legacy":
+        print(f"{C_GRAY}  Compatibility setup (no notification server on this host).{C_RESET}")
         print(f"{C_GRAY}  1.{C_RESET} Install Termux from F-Droid (not the Play Store build).")
         print(f"{C_GRAY}  2.{C_RESET} Paste this one command into Termux:")
         print("")
@@ -2732,25 +2732,29 @@ def _pair_print(mode, code, host, target, user, notify_ready,
     rows = [
         ("HOST", host),
         ("REACH", _pair_reach(target)),
-        ("NOTIFY", "ready" if notify_ready else "not configured — re-run the host setup"),
+        ("NOTIFY", "ready" if notify_ready else "not configured — run  tendril install"),
     ]
     for label, value in rows:
         print(f"{C_GRAY}  {label:<9}{C_RESET}{value}")
     print("")
-    if _pair_qr(code):
+    if mode != "manual" and _pair_qr(code):
         print("")
-    print(f"  Scan with {C_LIME}TENDRIL Link{C_RESET}.")
+    if mode == "manual":
+        print(f"  In {C_LIME}TENDRIL Link{C_RESET}: Pair → {C_LIME}Paste code instead{C_RESET}.")
+    else:
+        print(f"  Scan with {C_LIME}TENDRIL Link{C_RESET}.")
     if enroll:
         print(f"{C_GRAY}  One phone, valid 10 minutes.{C_RESET}")
     print("")
+    # The text twin of the QR: the same code, on a line of its own so a
+    # terminal copy yields exactly the code. It carries the one-time
+    # enrollment secret: shown like the QR, on your own screen only.
+    print(f"{C_GRAY}  Manual code (Paste code instead):{C_RESET}")
+    print(code)
+    print("")
     print(f"{C_GRAY}  Phone not set up yet? In Termux:{C_RESET}")
-    print(f"    {PHONE_SETUP_COMMAND}")
-    if show_code:
-        print("")
-        print(f"{C_GRAY}  Pairing code (secret: never share){C_RESET}")
-        print(f"  {code}")
-    else:
-        print(f"{C_GRAY}  No camera? tendril --pair --show-code{C_RESET}")
+    print(f"    {PHONE_INSTALL_COMMAND}")
+    print(f"{C_GRAY}  (first time on a new phone: {PHONE_SETUP_COMMAND}){C_RESET}")
     return 0
 
 
@@ -2797,6 +2801,39 @@ def _pair_wait(session, interval=2.0):
         return 0
 
 
+MANAGED_SRC = os.path.join(os.path.expanduser("~"), ".local", "share",
+                           "tendril", "src")
+
+
+def _install_cmd(rest):
+    """`tendril install` — THE host install/repair command (v0.2.1): the
+    same product flow as the first bootstrap (setup.sh): platform, Herdr,
+    runtime, scheduler, guardian, notifications (zero-config private
+    topic), capacity, health — ending on the pairing QR when no phone is
+    linked yet. Idempotent. A developer checkout recorded in install.json
+    is used as it is (never fetched or switched); only the managed
+    checkout (~/.local/share/tendril/src) fast-forwards."""
+    flags = {"--no-pair"}
+    if any(a not in flags for a in rest):
+        print("usage: tendril install [--no-pair]", file=sys.stderr)
+        return 2
+    src = _pair_source_dir()
+    setup = os.path.join(src, "setup.sh") if src else None
+    if not setup or not os.path.isfile(setup):
+        print("tendril install: cannot find the TENDRIL source (setup.sh). "
+              "Run the first bootstrap again:", file=sys.stderr)
+        print("  curl -fsSL https://raw.githubusercontent.com/Ozymandes/"
+              "TENDRIL/main/setup.sh | sh", file=sys.stderr)
+        return 1
+    env = dict(os.environ, TENDRIL_SRC=src)
+    if os.path.realpath(src) != os.path.realpath(MANAGED_SRC):
+        env["TENDRIL_SRC_PINNED"] = "1"
+    if "--no-pair" in rest:
+        env["TENDRIL_NO_PAIR"] = "1"
+    sh = shutil.which("sh") or "/bin/sh"
+    os.execve(sh, [sh, setup], env)
+
+
 def _pair(args):
     """`tendril --pair`: pair a phone with TENDRIL Link (v0.2.1).
 
@@ -2809,14 +2846,17 @@ def _pair(args):
     hosts without notifications. Flags-only like --upgrade: a bare word is
     a session-token position. Invalid values: one clear error, no code."""
     rest = [a for a in args if a != "--pair"]
-    flags = {"--code", "--manual", "--show-code", "--no-wait"}
+    # --show-code: accepted for compatibility (the code is always shown now)
+    flags = {"--code", "--manual", "--legacy", "--show-code", "--no-wait"}
     code_only = "--code" in rest
     manual = "--manual" in rest
+    legacy = "--legacy" in rest
     show_code = "--show-code" in rest
     no_wait = "--no-wait" in rest
     rest = [a for a in rest if a not in flags]
-    if rest or args.count("--pair") != 1 or (code_only + manual + show_code) > 1:
-        print("usage: tendril --pair [--code | --show-code | --manual] [--no-wait]",
+    if rest or args.count("--pair") != 1 \
+            or (code_only + manual + legacy + show_code) > 1:
+        print("usage: tendril --pair [--code | --manual | --legacy] [--no-wait]",
               file=sys.stderr)
         return 2
     if tendril_link is None or not hasattr(tendril_link, "pairing_code_v3"):
@@ -2829,8 +2869,8 @@ def _pair(args):
         user = getpass.getuser() or ""
     except Exception:
         user = ""
-    if manual:
-        return _pair_print("manual", "", host, target, user, False)
+    if legacy:
+        return _pair_print("legacy", "", host, target, user, False)
     url, topic, token = _notify_config()
     session = None
     code = None
@@ -2854,13 +2894,14 @@ def _pair(args):
     if code_only:
         print(code)
         return 0
-    _pair_print("pretty", code, host, target, user, notify_ready,
-                show_code=show_code, enroll=session is not None)
+    _pair_print("manual" if manual else "pretty", code, host, target, user,
+                notify_ready, enroll=session is not None)
     if session is None:
         print("")
         print(f"{C_GRAY}  This code cannot enroll the phone's SSH key (no notification"
               f" server).{C_RESET}")
-        print(f"{C_GRAY}  Use  tendril --pair --manual  for the password-based setup.{C_RESET}")
+        print(f"{C_GRAY}  Run  tendril install  to set notifications up, or use"
+              f"  tendril --pair --legacy  (password-based).{C_RESET}")
         return 0
     # wait only in front of a person: scripts and pipes get the code and
     # return (the guardian timer finishes the enrollment in the background)
@@ -2927,13 +2968,18 @@ persistent AI agents.
                               cache, never the transcripts. Idempotent
   tendril service status|start|stop|restart|logs
                               the notification watcher, on launchd or systemd
-  tendril --pair [--code | --show-code | --manual] [--no-wait]
+  tendril install [--no-pair]  install / repair this host: Herdr, runtime,
+                              scheduler, guardian, notifications, capacity,
+                              health — then the phone pairing QR (first time)
+  tendril --pair [--code | --manual | --legacy] [--no-wait]
                               pair a phone with TENDRIL Link: a one-time QR
                               (host, notifications and a 10-minute, one-phone
                               SSH-key enrollment), then waits until the phone
-                              is linked. --show-code also prints the code to
-                              paste, --code prints only the code, --manual is
-                              the password-based Termux bootstrap
+                              is linked. The same code is printed under the
+                              QR for Link's "Paste code instead"; --manual
+                              shows only that code, --code prints the bare
+                              code, --legacy is the old password-based Termux
+                              bootstrap (hosts without notifications)
   tendril --upgrade [--verbose]
                               self-update: fetch + fast-forward the recorded
                               source checkout, then ./install --upgrade
@@ -3051,6 +3097,8 @@ def main():
                   "[--if-none-match <etag>]", file=sys.stderr)
             return 2
         return _snapshot_cmd(if_none_match=inm)
+    if args[:1] == ["install"]:
+        return _install_cmd(args[1:])
     if args[:1] == ["capacity"]:
         return _capacity_cmd(args[1:])
     if args[:1] == ["schedule"]:
@@ -3088,7 +3136,8 @@ def main():
               "| titles backfill [--dry-run]", file=sys.stderr)
         print("       remote-agents capacity enable|disable "
               "<claude_oauth|codex_wham|zai_quota>", file=sys.stderr)
-        print("       remote-agents --pair [--code | --manual] | --upgrade [--verbose]",
+        print("       remote-agents install [--no-pair] | --pair [--code | --manual | --legacy] "
+              "| --upgrade [--verbose]",
               file=sys.stderr)
         print("       remote-agents --phone-manifest | --phone-asset <name> "
               "| --phone-script <setup|upgrade> | --link-stage <path>",

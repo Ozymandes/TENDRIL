@@ -1,5 +1,7 @@
 #!/bin/sh
-# TENDRIL host setup - the one public install command (v0.2.1):
+# TENDRIL host install (v0.2.1). Public command:  tendril install
+# First bootstrap on a machine without TENDRIL (installs `tendril`, then
+# runs exactly this flow):
 #
 #     curl -fsSL https://raw.githubusercontent.com/Ozymandes/TENDRIL/main/setup.sh | sh
 #
@@ -13,8 +15,10 @@
 # ~/.cache/tendril/setup.log
 #
 # Environment (advanced): TENDRIL_REF (git ref, default main),
-# TENDRIL_SRC (checkout dir), TENDRIL_REPO_URL, TENDRIL_YES=1 (answer yes
-# to the Herdr install question without a terminal), TENDRIL_NO_PAIR=1.
+# TENDRIL_SRC (checkout dir), TENDRIL_SRC_PINNED=1 (use TENDRIL_SRC as it
+# is - never fetch/switch it; `tendril install` sets this for developer
+# checkouts), TENDRIL_REPO_URL, TENDRIL_YES=1 (answer yes to the Herdr
+# install question without a terminal), TENDRIL_NO_PAIR=1.
 
 set -u
 
@@ -43,7 +47,7 @@ fail() {
 mkdir -p "$LOGDIR" 2>/dev/null || LOG=/dev/null
 : > "$LOG" 2>/dev/null || LOG=/dev/null
 
-printf '\n%sTENDRIL%s\n%sInstalling host...%s\n\n' "$G" "$N" "$D" "$N"
+printf '\n%sTENDRIL%s\n%sInstalling control plane...%s\n\n' "$G" "$N" "$D" "$N"
 
 # ask <question> - one yes/no question on the terminal even under curl | sh
 ask() {
@@ -163,7 +167,9 @@ ok "Herdr $HV"
 # ---------------------------------------------------------------- source
 FIRST=1
 [ -f "$HOME/.config/remote-agents/install.json" ] && FIRST=0
-if [ -d "$SRC/.git" ]; then
+if [ "${TENDRIL_SRC_PINNED:-}" = 1 ] && [ -f "$SRC/install" ]; then
+    :   # tendril install from a developer checkout: use it exactly as it is
+elif [ -d "$SRC/.git" ]; then
     if [ -z "$(git -C "$SRC" status --porcelain 2>/dev/null)" ]; then
         git -C "$SRC" fetch --quiet origin "$REF" >>"$LOG" 2>&1 \
             && git -C "$SRC" checkout --quiet "$REF" >>"$LOG" 2>&1 \
@@ -185,7 +191,7 @@ if ! sh "$SRC/install" --auto </dev/null >>"$LOG" 2>&1; then
     fail "Install failed" "Full log: $LOG"
 fi
 VERSION=$("$BIN/tendril" --version 2>/dev/null | awk '{print $2}')
-ok "Control plane" "tendril ${VERSION:-installed}"
+ok "Runtime" "tendril ${VERSION:-installed}"
 
 # Herdr must be serving for LIVE, scheduling and recovery: start it once
 HEALTH=$("$BIN/tendril" health --json 2>/dev/null || true)
@@ -199,7 +205,7 @@ if [ "$(hstate herdr.state)" != running ] && [ "$(hstate herdr.state)" != stoppe
     HEALTH=$("$BIN/tendril" health --json 2>/dev/null || true)
 fi
 case $(hstate herdr.state) in
-    running) ok "Herdr serving" ;;
+    running) ;;
     stopped) note "Herdr was stopped on purpose - start it with:  tendril herdr start" ;;
     *) note "Herdr is not serving yet - start it with:  tendril herdr start" ;;
 esac
@@ -214,12 +220,22 @@ done
 if grep -q '^NTFY_TOPIC=..*' "$HOME/.config/remote-agents/notify.env" 2>/dev/null; then
     ok "Notifications" "private topic"
 else
-    note "Notifications are not configured (re-run this command to set them up)"
+    note "Notifications are not configured (run  tendril install  again)"
 fi
 case $(hstate notify.state) in
     active) ;;
     *) note "Notification watcher: $(hstate notify.state) - check: tendril service status" ;;
 esac
+case $(hstate capacity.state) in
+    available) ok "Capacity" ;;
+    adapters_disabled | absent) ok "Capacity" "local usage logs" ;;
+    *) note "Capacity: not reporting yet - check: tendril capacity status" ;;
+esac
+if "$BIN/tendril" --phone-manifest 2>/dev/null | tail -n 1 | grep -qx end; then
+    ok "Link services" "pairing · enrollment · updates"
+else
+    note "Link services: the phone channel did not answer - run  tendril install  again"
+fi
 
 # keep the user services alive after logout on headless hosts
 if [ "$OS" = Linux ] && command -v loginctl >/dev/null 2>&1; then

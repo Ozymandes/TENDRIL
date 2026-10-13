@@ -7,7 +7,9 @@ install, no real Tailscale, and no real qrencode is ever touched:
 - the default block shows host/reach/link/notify, the optional QR and the
   pairing code as one unwrapped line — no ntfy subscribe URL (Link
   subscribes itself), no scp, no wall of steps;
-- `--pair --manual` prints the one-command new-phone bootstrap;
+- the default block prints the SAME code as text under the QR (Link's
+  "Paste code instead"); `--manual` prints that code without the QR;
+- `--pair --legacy` prints the old password-based bootstrap (compatibility);
 - notify.env rides inside the code: NTFY_URL + NTFY_TOPIC + a subscribe
   token (NTFY_SUBSCRIBE_TOKEN preferred over NTFY_TOKEN). A bad ntfy value
   never blocks pairing: v2 without n/t/k, NOTIFY shown not configured;
@@ -72,7 +74,7 @@ V2_NTK_CODE = ("TENDRIL2:eyJoIjoib21hcmNoeSIsImsiOiJ0a19hYWFhYWFhYWFhYWFhYWF"
 # a real-shaped ed25519 host key (public; fingerprint pinned below)
 HOSTKEY_LINE = ("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHk7JzE4q2y5mX1cQ1nJ2b6v1W"
                 "0s9sYp8mE3Rk2xYf4a root@omarchy")
-USAGE = "usage: tendril --pair [--code | --show-code | --manual] [--no-wait]"
+USAGE = "usage: tendril --pair [--code | --manual | --legacy] [--no-wait]"
 
 
 def decode_v3(code):
@@ -359,7 +361,7 @@ class PairNotifyWiring(PairBase):
         for key in ("n", "t", "k"):
             self.assertNotIn(key, doc)
         self.assertIn("not configured", out)
-        self.assertIn("tendril --pair --manual", out)   # the enrollment-free path
+        self.assertIn("tendril --pair --legacy", out)   # the enrollment-free path
 
     def test_missing_notify_env_pairs_without_ntfy_keys(self):
         os.remove(self.notify)
@@ -392,26 +394,49 @@ class PairPrettyBlock(PairBase):
         self.assertIn("  NOTIFY   ready", lines)
         self.assertIn("  Scan with TENDRIL Link.", lines)
         self.assertIn("  One phone, valid 10 minutes.", lines)
-        self.assertIn("    curl -fsSL https://raw.githubusercontent.com/Ozymandes/"
-                      "TENDRIL/main/phone/setup.sh | sh", lines)
-        self.assertIn("  No camera? tendril --pair --show-code", lines)
+        self.assertIn("  Phone not set up yet? In Termux:", lines)
+        self.assertIn("    tendril install", lines)
         # the built-in QR is drawn (no qrencode needed) ...
         self.assertTrue(any("\u2588" in ln for ln in lines))
         self.assertNotIn("fake-qr-block", out)
-        # ... and the code itself — which carries the one-time secret — is
-        # NOT printed: screenshots and scrollback stay clean
-        for prefix in ("TENDRIL1:", "TENDRIL2:", "TENDRIL3:"):
-            self.assertNotIn(prefix, out)
-        self.assertNotIn(TOPIC, out)
+        # ... and the SAME code is printed once, alone on its line, for
+        # Link's "Paste code instead" (one session, one TTL)
+        self.assertIn("  Manual code (Paste code instead):", lines)
+        code = self.assertPairCode(out)
+        self.assertTrue(code.startswith("TENDRIL3:"))
+        self.assertIn(code, lines)
+        self.assertNotIn(TOPIC, out)                 # only inside the code
+        # never the old SSH ritual in the product flow
+        self.assertNotIn("ssh-copy-id", out)
         self.assertNotIn("~/.ssh", out)
 
-    def test_show_code_prints_the_code_once_under_the_qr(self):
-        p = self.run_pair("--pair", "--show-code", COLUMNS="80")
+    def test_manual_code_is_the_qr_code_and_the_live_session(self):
+        import tendril_qr
+        p = self.run_pair("--pair", COLUMNS="80")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        code = self.assertPairCode(p.stdout)
+        drawn = [ln[2:] for ln in p.stdout.splitlines() if ln.startswith("  \u2588")]
+        self.assertEqual(drawn, tendril_qr.render(code))      # same string
+        with open(os.path.join(self.home, ".local", "state", "tendril",
+                               "enroll.json"), encoding="utf-8") as f:
+            session = json.load(f)
+        doc = decode_v3(code)
+        self.assertEqual(doc["e"], session["topic"])          # same session
+        self.assertEqual(doc["x"], session["secret"])
+
+    def test_manual_flag_prints_the_code_without_the_qr(self):
+        p = self.run_pair("--pair", "--manual", COLUMNS="80")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         code = self.assertPairCode(p.stdout)
         self.assertTrue(code.startswith("TENDRIL3:"))
-        self.assertIn("  Pairing code (secret: never share)",
-                      p.stdout.splitlines())
+        self.assertFalse(any("\u2588" in ln for ln in p.stdout.splitlines()))
+        self.assertIn("Paste code instead", p.stdout)
+        self.assertNotIn("ssh-copy-id", p.stdout)
+
+    def test_show_code_is_still_accepted(self):
+        p = self.run_pair("--pair", "--show-code", COLUMNS="80")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertTrue(self.assertPairCode(p.stdout).startswith("TENDRIL3:"))
 
     def test_the_drawn_qr_is_the_code(self):
         # the rendered block is exactly tendril_qr.render(code): pair with
@@ -472,9 +497,9 @@ class PairPrettyBlock(PairBase):
                     self.assertEqual(m._pair_reach("omarchy.lan"), ts_target)
 
 
-class PairManualMode(PairBase):
-    def test_manual_prints_the_one_bootstrap_command(self):
-        p = self.run_pair("--pair", "--manual")
+class PairLegacyMode(PairBase):
+    def test_legacy_prints_the_one_bootstrap_command(self):
+        p = self.run_pair("--pair", "--legacy")
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
         self.assertNotIn("\x1b", out)
@@ -491,6 +516,7 @@ class PairManualMode(PairBase):
         self.assertIn("ssh-copy-id", out)
         self.assertIn("remote-agents --phone-script setup", out)
         self.assertIn("F-Droid", out)
+        self.assertIn("Compatibility setup", out)
         # no giant wall, no code, no scp
         self.assertNotIn("scp ", out)
         self.assertNotIn("TENDRIL2:", out)
@@ -498,12 +524,12 @@ class PairManualMode(PairBase):
         self.assertNotIn("chmod 700", out)
         self.assertNotIn("hash -r", out)
 
-    def test_manual_explains_the_password_prompt(self):
-        p = self.run_pair("--pair", "--manual")
+    def test_legacy_explains_the_password_prompt(self):
+        p = self.run_pair("--pair", "--legacy")
         self.assertIn("asks for your host password once", p.stdout)
 
-    def test_manual_hints_the_upgrade_path_for_already_set_up_phones(self):
-        p = self.run_pair("--pair", "--manual")
+    def test_legacy_hints_the_upgrade_path_for_already_set_up_phones(self):
+        p = self.run_pair("--pair", "--legacy")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertIn("Already set up?  in Termux:  tendril --upgrade",
                       p.stdout)

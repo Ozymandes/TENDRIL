@@ -1,5 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/sh
-# TENDRIL phone setup - the one public Termux command (v0.2.1):
+# TENDRIL phone install (v0.2.1). Public command, in Termux:  tendril install
+# First bootstrap on a phone without TENDRIL (installs `tendril`, then runs
+# exactly this flow):
 #
 #     curl -fsSL https://raw.githubusercontent.com/Ozymandes/TENDRIL/main/phone/setup.sh | sh
 #
@@ -14,18 +16,23 @@
 #
 # Trust: the launchers and the APK come from github.com/Ozymandes/TENDRIL
 # over HTTPS (the same trust as this script). The APK must match the
-# release manifest's sha256 + size, and the manifest's signer must equal
-# the production signing certificate pinned below (verified when the
-# release was built); Android then enforces that signer for every update.
+# release manifest's sha256 + size, and BOTH the manifest's signer and the
+# APK's actual signing certificate (read from its v3/v2 signature block)
+# must equal the production certificate pinned below; Android then
+# enforces that signer for every update.
 #
 # Environment (advanced): TENDRIL_REF (git ref for the launchers, default
-# main), TENDRIL_LINK_RELEASE (release tag for the APK, default: latest).
+# main), TENDRIL_RAW (launcher base URL), TENDRIL_LINK_RELEASE (release tag
+# for the APK, default: latest), TENDRIL_LINK_URL (APK + manifest base URL,
+# e.g. a local mirror - the pinned signer still decides).
 
 set -u
 
 REF=${TENDRIL_REF:-main}
-RAW="https://raw.githubusercontent.com/Ozymandes/TENDRIL/$REF/phone"
-if [ -n "${TENDRIL_LINK_RELEASE:-}" ]; then
+RAW=${TENDRIL_RAW:-https://raw.githubusercontent.com/Ozymandes/TENDRIL/$REF/phone}
+if [ -n "${TENDRIL_LINK_URL:-}" ]; then
+    LINK_BASE=$TENDRIL_LINK_URL
+elif [ -n "${TENDRIL_LINK_RELEASE:-}" ]; then
     LINK_BASE="https://github.com/Ozymandes/TENDRIL/releases/download/$TENDRIL_LINK_RELEASE"
 else
     LINK_BASE="https://github.com/Ozymandes/TENDRIL/releases/latest/download"
@@ -50,11 +57,8 @@ fail() {
     for line in "$@"; do printf '  %s\n' "$line"; done
     exit 1
 }
-tty_read() {   # wait for Enter on the real terminal, even under curl | sh
-    if [ -r /dev/tty ]; then read -r _ < /dev/tty; else sleep 20; fi
-}
 
-printf '\n%sTENDRIL LINK%s\n%sSetting up this phone...%s\n\n' "$G" "$N" "$D" "$N"
+printf '\n%sTENDRIL LINK%s\n%sPreparing Android...%s\n\n' "$G" "$N" "$D" "$N"
 
 # ---------------------------------------------------------------- termux
 case "${PREFIX:-}" in
@@ -87,7 +91,7 @@ if ! ssh -V >>"$LOG" 2>&1; then
     pkg upgrade $APT_OPTS >>"$LOG" 2>&1
     ssh -V >>"$LOG" 2>&1 || fail "ssh does not run" "Run  pkg upgrade  once, then this command again."
 fi
-ok "SSH + Mosh"
+ok "SSH / Mosh"
 
 # ---------------------------------------------------------------- launchers
 fetch() {   # fetch <url> <dest> - download fully, then replace atomically
@@ -106,7 +110,7 @@ done
 sh -n "$HOME/bin/tendril" || fail "The downloaded launcher is damaged" "Run this command again."
 grep -qF 'export PATH="$HOME/bin:$PATH"' "$HOME/.bashrc" 2>/dev/null \
     || printf '\nexport PATH="$HOME/bin:$PATH"\n' >> "$HOME/.bashrc"
-ok "Launcher" "tendril, agent, deep-link helper"
+ok "Launcher" "tendril · agent"
 
 # ---------------------------------------------------------------- integration
 PROPS="$HOME/.termux/termux.properties"
@@ -120,7 +124,56 @@ if ! grep -Eq '^[[:space:]]*allow-external-apps[[:space:]]*=[[:space:]]*true' "$
     fi
     termux-reload-settings >>"$LOG" 2>&1 || true
 fi
-ok "Termux integration" "TENDRIL Link may run its fixed commands"
+ok "Deep links" "TENDRIL Link may run its fixed commands"
+
+# ---------------------------------------------------------------- phone key
+# Prepared here, enrolled by pairing: TENDRIL Link scans the host QR and the
+# host installs this PUBLIC key (one-time, proof-checked). Never copied by hand.
+(umask 077 && mkdir -p "$HOME/.ssh")
+if [ ! -f "$HOME/.ssh/id_ed25519" ]; then
+    ssh-keygen -q -t ed25519 -N '' -C termux -f "$HOME/.ssh/id_ed25519" </dev/null >>"$LOG" 2>&1 \
+        || fail "Could not create this phone's SSH key" "See $LOG"
+fi
+ok "Phone key" "ed25519 · enrolled when you scan the QR"
+
+# >>> apk_signer (tests extract this block)
+# apk_signer <apk> - SHA-256 (lowercase hex) of the first signer certificate
+# in the APK's v3 (else v2) signature block; nothing + status 1 when the
+# block cannot be read. POSIX sh + od/tail/head/sha256sum (Termux coreutils).
+apk_u32() { od -An -tu4 -j "$2" -N4 "$1" 2>/dev/null | tr -d ' \n'; }
+apk_u64() {   # little-endian u64 below 2^32 only (APK offsets/lengths)
+    _lo=$(apk_u32 "$1" "$2"); _hi=$(apk_u32 "$1" $(($2 + 4)))
+    [ "$_hi" = 0 ] && [ -n "$_lo" ] && printf '%s' "$_lo"
+}
+apk_signer() {
+    _f=$1
+    _size=$(wc -c < "$_f" | tr -d ' ') || return 1
+    _eocd=$((_size - 22))
+    [ "$(apk_u32 "$_f" "$_eocd")" = 101010256 ] || return 1      # 0x06054b50, no zip comment
+    _cd=$(apk_u32 "$_f" $((_eocd + 16))); [ -n "$_cd" ] || return 1
+    [ "$(tail -c +$((_cd - 15)) "$_f" | head -c 16)" = "APK Sig Block 42" ] || return 1
+    _bs=$(apk_u64 "$_f" $((_cd - 24))) || return 1
+    _pos=$((_cd - _bs))                    # first pair (block start + 8)
+    _end=$((_cd - 24))
+    _v2="" _v3=""
+    while [ "$_pos" -lt "$_end" ]; do
+        _len=$(apk_u64 "$_f" "$_pos") || return 1
+        _id=$(apk_u32 "$_f" $((_pos + 8)))
+        case $_id in
+            4031998144) _v3=$((_pos + 12)) ;;  # 0xf05368c0 APK Signature Scheme v3
+            1896449818) _v2=$((_pos + 12)) ;;  # 0x7109871a APK Signature Scheme v2
+        esac
+        _pos=$((_pos + 8 + _len))
+    done
+    _v=${_v3:-$_v2}; [ -n "$_v" ] || return 1
+    # signers(len) > signer(len) > signed data(len) > digests(len+bytes) > certificates(len) > cert(len+bytes)
+    _sd=$((_v + 12))
+    _dl=$(apk_u32 "$_f" "$_sd"); [ -n "$_dl" ] || return 1
+    _certs=$((_sd + 4 + _dl))
+    _cl=$(apk_u32 "$_f" $((_certs + 4))); [ -n "$_cl" ] && [ "$_cl" -gt 0 ] || return 1
+    tail -c +$((_certs + 9)) "$_f" | head -c "$_cl" | sha256sum | cut -d ' ' -f1
+}
+# <<< apk_signer
 
 # ---------------------------------------------------------------- TENDRIL Link
 case $LINK_SIGNER in
@@ -144,7 +197,9 @@ M_SHA=$(mval sha256); M_SIZE=$(mval size); M_SIGNER=$(mval signer_sha256)
 NOW=$(installed_code)
 if [ -n "$NOW" ] && [ -n "$M_CODE" ] && [ "$NOW" -ge "$M_CODE" ] 2>/dev/null; then
     ok "TENDRIL Link $M_NAME" "already installed"
+    INSTALLED=1
 else
+    INSTALLED=0
     APK="$LOGDIR/tendril-link-$M_NAME-$M_CODE.apk"
     note "downloading TENDRIL Link $M_NAME..."
     fetch "$LINK_BASE/tendril-link.apk" "$APK" || fail "Could not download TENDRIL Link" "See $LOG"
@@ -154,21 +209,36 @@ else
         rm -f "$APK"
         fail "The download failed verification (sha256/size)" "Nothing was installed. Run this command again."
     fi
-    ok "APK verified" "$M_NAME ($M_CODE) · signer ${LINK_SIGNER%"${LINK_SIGNER#????????????}"}"
-    printf '%s→%s Android installer\n' "$G" "$N"
+    # the APK's REAL signing certificate, not just the manifest's word
+    GOT_SIGNER=$(apk_signer "$APK" || true)
+    if [ "$GOT_SIGNER" != "$LINK_SIGNER" ]; then
+        rm -f "$APK"
+        fail "The APK is not signed by the TENDRIL release key" "Nothing was installed (signer ${GOT_SIGNER:-unreadable})."
+    fi
+    ok "Link APK verified" "$M_NAME ($M_CODE) · sha256 · signer ${LINK_SIGNER%"${LINK_SIGNER#????????????}"}"
+    printf '\n%sOpening Android installer...%s\n' "$G" "$N"
     note "Tap Install. First time only: Android asks to allow Termux to"
     note "install apps - allow it, go back, then tap Install."
     termux-open --content-type application/vnd.android.package-archive "$APK" >>"$LOG" 2>&1 \
         || fail "Could not open the Android installer" "Open this file from a file manager: $APK"
-    printf '  %sWhen it says "App installed", come back and press Enter.%s ' "$D" "$N"
-    tty_read
-    NOW=$(installed_code)
-    if [ -n "$NOW" ] && [ "$NOW" -lt "$M_CODE" ] 2>/dev/null; then
-        note "TENDRIL Link does not look installed yet - run this command again after installing."
+    # wait for Android to finish (no Enter needed): poll the installed build
+    _w=0
+    while [ "$_w" -lt 300 ]; do
+        NOW=$(installed_code)
+        if [ -n "$NOW" ] && [ "$NOW" -ge "$M_CODE" ] 2>/dev/null; then INSTALLED=1; break; fi
+        sleep 2; _w=$((_w + 2))
+    done
+    if [ "$INSTALLED" = 1 ]; then
+        ok "TENDRIL Link $M_NAME" "installed"
+    else
+        note "TENDRIL Link is not installed yet - finish the Android installer, then run  tendril install  again."
     fi
 fi
 
-am start -n "$LINK_PACKAGE/.MainActivity" >>"$LOG" 2>&1 || true
-printf '\n%sPhone ready.%s In TENDRIL Link: tap %sScan QR%s and scan the code on your computer.\n' \
-    "$G" "$N" "$G" "$N"
-note "No QR on screen? On the computer run:  tendril --pair"
+printf '\n'
+if [ "$INSTALLED" = 1 ]; then
+    am start -n "$LINK_PACKAGE/.MainActivity" >>"$LOG" 2>&1 || true
+    printf '%sPhone ready.%s In TENDRIL Link: tap %sScan QR%s and scan the code on your computer.\n' \
+        "$G" "$N" "$G" "$N"
+    note "No QR on screen? On the computer run:  tendril --pair"
+fi

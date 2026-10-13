@@ -245,6 +245,33 @@ enroll_phone() {
     enroll_fail waiting "the host did not accept this phone - is the pairing QR still on screen? (tendril --pair)" 7
 }
 
+# install_phone - `tendril install` in Termux (v0.2.1): THE phone install /
+# repair / update command. Fetches the current phone installer from the
+# TENDRIL repository (same trust as the first bootstrap) and runs it:
+# packages, launchers, deep links, phone key, the verified release-signed
+# TENDRIL Link APK and Android's installer. Idempotent.
+install_phone() {
+    case "${PREFIX:-}" in
+        */com.termux/*) ;;
+        *)
+            echo "[tendril] 'tendril install' here sets up an Android phone and runs in Termux."
+            echo "  On a TENDRIL host:  tendril install   (the host command)"
+            echo "  On a Mac client:    ./install --client   (from the TENDRIL checkout)"
+            exit 2 ;;
+    esac
+    _i_raw=${TENDRIL_RAW:-https://raw.githubusercontent.com/Ozymandes/TENDRIL/${TENDRIL_REF:-main}/phone}
+    _i_tmp="${TMPDIR:-$PREFIX/tmp}/tendril-setup.$$.sh"
+    if ! curl -fsSL --max-time 60 -o "$_i_tmp" "$_i_raw/setup.sh" || ! sh -n "$_i_tmp"; then
+        rm -f "$_i_tmp"
+        echo "[tendril] could not download the phone installer from $_i_raw - is the phone online?"
+        exit 1
+    fi
+    sh "$_i_tmp"
+    _i_rc=$?
+    rm -f "$_i_tmp"
+    exit "$_i_rc"
+}
+
 # finish_interactive <rc> - end an interactive session: the selector's Link
 # key (LINK_OPEN_STATUS) opens the app here on the phone; every other
 # status passes through untouched.
@@ -273,7 +300,7 @@ no_alias_help() {
     echo "                  (or: echo 'export TENDRIL_ALIAS=<alias>' >> ~/.bashrc)"
     echo "usage: tendril [<alias>] [attach|enter|resolve|focus|link <session-id>|snapshot] | tendril ssh <alias>"
     echo "       tendril [<alias>] [schedule show|cancel <id> | schedule add <payload> | capacity | health | herdr restart | rename <pane> <title|--clear>] | tendril link"
-    echo "first time: see docs/ANDROID.md or docs/MACOS.md — create a key, then: ssh-copy-id <alias>"
+    echo "first time on a phone: tendril install, then scan the host's pairing QR in TENDRIL Link"
 }
 
 # --version / --upgrade are flags, never aliases: they are handled before
@@ -291,6 +318,9 @@ case "${1:-}" in
             echo "tendril-phone unknown"
         fi
         exit 0 ;;
+    install)
+        [ "$#" -eq 1 ] || { echo "usage: tendril install"; exit 2; }
+        install_phone ;;
     enroll)
         [ "$#" -eq 6 ] || { echo "usage: tendril enroll <user@host> <ntfy-url> <topic> <secret> <fp|->"; exit 2; }
         enroll_phone "$2" "$3" "$4" "$5" "$6"
