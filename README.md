@@ -38,6 +38,20 @@ system you can hold in one hand.
 
 > SSH gets you into the machine. TENDRIL tells you what the machine is doing.
 
+And the control plane is only ever one tap from the terminal it watches:
+pick a session in the selector and TENDRIL attaches you to that exact
+Herdr pane — not a lookalike, not a transcript, the session itself.
+
+<p align="center">
+  <img src="docs/assets/readme/board-05-exact-session-entry.png"
+       alt="The TENDRIL selector opening the exact Herdr session from the control plane"
+       width="100%">
+</p>
+
+<p align="center">
+  <em>TENDRIL does not replace your terminal.<br>It gets you to the right one.</em>
+</p>
+
 <p align="center">
   <img src="docs/assets/readme/board-01-control-plane.png"
        alt="TENDRIL Link: HOME, LIVE and CAPACITY on a real phone"
@@ -54,20 +68,6 @@ Three surfaces carry most of the day:
   input — with subagent trails, history, and a topology view.
 - **CAPACITY** is provider usage and limits: session and weekly windows,
   when they reset, tokens today and metered spend.
-
-And the control plane is only ever one tap from the terminal it watches:
-pick a session in the selector and TENDRIL attaches you to that exact
-Herdr pane — not a lookalike, not a transcript, the session itself.
-
-<p align="center">
-  <img src="docs/assets/readme/board-05-exact-session-entry.png"
-       alt="The TENDRIL selector opening the exact Herdr session from the control plane"
-       width="100%">
-</p>
-
-<p align="center">
-  <em>TENDRIL does not replace your terminal.<br>It gets you to the right one.</em>
-</p>
 
 ## Why TENDRIL exists
 
