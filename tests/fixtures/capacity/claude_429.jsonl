@@ -1,0 +1,1 @@
+{"type":"assistant","timestamp":"@TNOW@","isApiErrorMessage":true,"apiErrorStatus":429,"error":"rate_limit","message":{"model":"claude-opus-4-8","quotaLimits":{"resetsAt":@RESET@,"rateLimitType":"five_hour"}},"usage":{"input_tokens":10,"output_tokens":0}}

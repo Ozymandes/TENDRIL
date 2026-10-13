@@ -20,6 +20,37 @@ import sys
 import time
 import unicodedata
 
+# ---------- RC2 perf: launch trace ---------------------------------------
+# phone/tendril writes the SAME file name on the device, so both wall-clock
+# epoch_ms logs interleave into one merged timeline (docs/LATENCY.md).
+# ZERO cost when off: one env lookup + one stat at import, then an early
+# return per stage. Stages only — never hostnames, tokens or prompt text.
+_TRACE_ON = (os.environ.get("TENDRIL_TRACE") == "1"
+             or os.path.isfile(os.path.expanduser(
+                 "~/.config/remote-agents/trace")))
+
+
+def _trace(stage):
+    """Append `<epoch_ms> <stage>` to ~/.cache/tendril/launch.log (0600)."""
+    if not _TRACE_ON:
+        return
+    try:
+        d = os.path.expanduser("~/.cache/tendril")
+        os.makedirs(d, exist_ok=True)
+        fd = os.open(os.path.join(d, "launch.log"),
+                     os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            os.write(fd, ("%d %s\n" % (int(time.time() * 1000), stage))
+                    .encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+_trace("process-start")          # before the heavy imports below
+
 # ---------- portable configuration ----------
 CONFIG_SEARCH = [
     os.environ.get("REMOTE_AGENTS_CONFIG"),
@@ -74,6 +105,14 @@ try:
     import tendril_phone         # --phone-* / --link-stage (thin dispatch below)
 except ImportError:
     tendril_phone = None
+try:
+    import tendril_telemetry     # schema v2 per-agent telemetry (read-only)
+except ImportError:              # stale install: v2 shape, no telemetry
+    tendril_telemetry = None
+try:
+    import tendril_herdr         # the ONE §7.4 herdr binary resolver
+except ImportError:              # stale install: the selector keeps working
+    tendril_herdr = None
 
 # Canonical host identity (binding contract): config TENDRIL_HOST -> legacy
 # TAILSCALE_HOST (lowercased) -> short hostname, HOST_RE-gated, sanitized —
@@ -88,89 +127,50 @@ NOTIFY_ENV = (os.environ.get("NOTIFY_ENV")
               or os.path.expanduser("~/.config/remote-agents/notify.env"))
 
 
-# ---------- Herdr client detection (protocol-verified, newest-compatible) ----------
+# ---------- Herdr client resolution (ONE resolver, LINK-CONTRACT §7.4) ----------
+# Resolution order: recorded config HERDR_BIN → $HERDR_BIN → protocol-verified
+# newest-compatible detection (PATH, ~/.local/bin, mise, asdf, brew, /usr).
+# "First on PATH wins" is gone: that is how a stale /usr/bin/herdr ended up
+# driving a newer mise server. Services get the recorded path via the
+# installer-written service.env (see systemd/*.service + ./install).
 HERDR_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
 
-
-def _herdr_candidates():
-    out = []
-    override = CONFIG.get("HERDR_BIN") or os.environ.get("HERDR_BIN")
-    if override:
-        out.append(os.path.expanduser(override))
-    found = shutil.which("herdr")
-    if found:
-        out.append(found)
-    # install.sh (~/.local/bin) and Homebrew locations: SSH/launchd PATHs omit them
-    for d in HERDR_DIRS:
-        p = os.path.join(os.path.expanduser(d), "herdr")
-        if os.path.isfile(p):
-            out.append(p)
-    mise = os.path.expanduser("~/.local/share/mise/installs/herdr")
-    latest = os.path.join(mise, "latest", "herdr")
-    if os.path.isfile(latest):
-        out.append(latest)
-    if os.path.isdir(mise):
-        versions = []
-        for name in os.listdir(mise):
-            p = os.path.join(mise, name, "herdr")
-            if os.path.isfile(p):
-                versions.append((name, p))
-        versions.sort(key=lambda t: [int(x) if x.isdigit() else 0
-                                     for x in t[0].split(".")], reverse=True)
-        out += [p for _, p in versions]
-    seen, uniq = set(), []
-    for cand in out:
-        real = os.path.realpath(cand)
-        if real not in seen:
-            seen.add(real)
-            uniq.append(cand)
-    return uniq
-
-
-HERDR_VERDICTS = []
-
-
-def herdr_probe(path):
-    """(compatible, detail): client must match the running server's protocol."""
+if tendril_herdr is not None:
     try:
-        v = subprocess.run([path, "--version"], capture_output=True,
-                           text=True, timeout=6)
-        version = (v.stdout or v.stderr).strip() or "(no version output)"
-    except subprocess.TimeoutExpired:
-        return False, "no answer to --version (timeout)"
-    except OSError as e:
-        return False, f"not runnable: {e}"
-    try:
-        s = subprocess.run([path, "status"], capture_output=True,
-                           text=True, timeout=8)
-        txt = (s.stdout or "") + (s.stderr or "")
-    except subprocess.TimeoutExpired:
-        return False, f"{version}; status timed out"
-    except OSError as e:
-        return False, f"{version}; status failed: {e}"
-    running = re.search(r"status:\s*running", txt)
-    compatible = (re.search(r"endpoint_compatible:\s*yes", txt)
-                  or re.search(r"private_protocol_compatible:\s*yes", txt))
-    if running and compatible:
-        return True, f"{version} (protocol-compatible with running server)"
-    if running:
-        return False, f"{version} (INCOMPATIBLE with running server)"
-    return True, f"{version} (no running server detected)"
-
-
-def detect_herdr():
-    """First verified-protocol-compatible candidate wins."""
-    picked = None
-    for cand in _herdr_candidates():
-        ok, detail = herdr_probe(cand)
-        HERDR_VERDICTS.append((cand, ok, detail))
-        if ok:
-            picked = cand
-            break
-    return picked
-
-
-HERDR = detect_herdr()
+        _HERDR_RESOLVED = tendril_herdr.resolve(config=CONFIG,
+                                                env=os.environ)
+    except Exception:              # the selector must never die on resolve
+        _HERDR_RESOLVED = {"bin": None, "provenance": "missing",
+                           "version": None, "verdicts": [], "stale": False,
+                           "realpath": None}
+    HERDR = _HERDR_RESOLVED["bin"]
+    HERDR_VERDICTS = _HERDR_RESOLVED["verdicts"]
+    HERDR_PROVENANCE = _HERDR_RESOLVED["provenance"]  # recorded|detected|missing
+    HERDR_CLIENT_VERSION = _HERDR_RESOLVED["version"]  # resolved binary's own
+    # §7.4: a recorded value existed but was superseded (vanished path, or
+    # a newer running server) — health shows tendril degraded + hint.
+    HERDR_STALE = bool(_HERDR_RESOLVED.get("stale"))
+else:                            # stale install without the resolver module
+    def _stale_herdr():          # recorded → PATH → fixed dirs, first runnable
+        for cand in (CONFIG.get("HERDR_BIN"), os.environ.get("HERDR_BIN")):
+            cand = os.path.expanduser(cand or "")
+            if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+                return cand
+        found = shutil.which("herdr")
+        if found:
+            return found
+        for d in HERDR_DIRS:
+            p = os.path.join(os.path.expanduser(d), "herdr")
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+        return None
+    HERDR = _stale_herdr()
+    HERDR_VERDICTS = []
+    HERDR_PROVENANCE = "recorded" if CONFIG.get("HERDR_BIN") else (
+        "detected" if HERDR else "missing")
+    HERDR_CLIENT_VERSION = None
+    HERDR_STALE = HERDR_PROVENANCE == "detected" and bool(CONFIG.get("HERDR_BIN"))
+_trace("resolve-done")           # the §7.4 herdr resolver finished
 SESSION = "default"
 CACHE_DIR = os.path.expanduser("~/.cache/remote-agents")
 EXTRA_PATH = ":".join([
@@ -295,6 +295,10 @@ def masthead(width, body):
 
 
 def run(args, timeout=6):
+    if not args or args[0] is None:
+        # §7.4/§3: a None argv[0] means Herdr is unavailable — report it as
+        # the not-found rc instead of raising TypeError out of a tick.
+        return 127, "", "herdr unavailable"
     try:
         p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
         return p.returncode, p.stdout, p.stderr
@@ -322,6 +326,8 @@ def find_key(obj, key):
 
 
 def snapshot():
+    if not HERDR:
+        return None                  # Herdr unavailable: callers treat as down
     rc, out, _ = run([HERDR, "api", "snapshot"], 8)
     if rc != 0:
         return None
@@ -331,8 +337,12 @@ def snapshot():
         return None
 
 
-def collect():
-    snap = snapshot()
+def collect(snap=None):
+    """Selector rows from one `herdr api snapshot` payload. snap=None fetches
+    one; callers that already hold the payload (snapshot --json) pass it in
+    so a single herdr call feeds both the rows and the raw document."""
+    if snap is None:
+        snap = snapshot()
     if snap is None:
         return None
     pane_cwd = {}
@@ -370,6 +380,7 @@ def collect():
             "rank": best,
         })
     rows.sort(key=lambda r: (r["rank"], not r["focused"], r["number"]))
+    _trace("rows-done")
     return rows
 
 
@@ -434,7 +445,11 @@ def chip_parts(row, max_plain=40):
     return plain.rstrip(), colored.rstrip()
 
 
+_selector_painted = False        # first-paint trace fires once per process
+
+
 def render(rows, note="", selected=None):
+    global _selector_painted
     w = box_width()
     inner = w - 2
 
@@ -456,7 +471,7 @@ def render(rows, note="", selected=None):
         if cur:
             grouped.append(cur)
         return grouped
-    feet = foot_lines(["N New", "I Info", "? Help", "R Refresh", "Q Quit"])
+    feet = foot_lines(["N New", "I Info", "R Refresh", "Q Quit", "L Link"])
 
     compact = len(rows) > 6
     # Paths yield when needed to keep the menu and prompt on screen, or when
@@ -537,6 +552,9 @@ def render(rows, note="", selected=None):
     lines.append(bot)
     if note:
         lines.append(f"{C_GRAY}{fit(note, w)}{C_RESET}")
+    if not _selector_painted:
+        _selector_painted = True
+        _trace("selector-first-paint")
     print("\033[H\033[2J" + "\n".join(masthead(w, len(lines)) + lines), flush=True)
 
 
@@ -583,9 +601,11 @@ def attach(row, pane=None):
             return False
     else:
         run([HERDR, "workspace", "focus", row["id"]], 6)
+        _trace("focus-done")
     if os.environ.get("HERDR_ENV") == "1":
         input(f"already inside Herdr — workspace '{row['label']}' focused. Enter...")
         return True
+    _trace("attach-exec")
     if _bridge_enabled():
         print(f"{C_GRAY}attaching {row['label']} \u2014 detach: Ctrl+Home \u00b7 Alt+D \u00b7 Ctrl+B d - menu returns here{C_RESET}",
               flush=True)
@@ -1039,7 +1059,7 @@ def _read_tty_action(fd):
                 sys.stdout.flush()
             continue
         if key == "?" or (isinstance(key, str) and len(key) == 1
-                           and key.lower() in ("n", "i", "r", "q")):
+                           and key.lower() in ("l", "n", "i", "r", "q")):
             return "line", key
         if isinstance(key, str) and len(key) == 1 and key.isprintable():
             text += key
@@ -1126,6 +1146,7 @@ def help_screen():
         ("?", "show this help"),
         ("R", "refresh workspaces"),
         ("Q", "quit selector"),
+        ("L", "open Link app on the phone"),
         ("number + Enter", "attach workspace"),
         ("up/down + Enter", "select and attach"),
         ("Alt+D", "detach to selector"),
@@ -1252,7 +1273,8 @@ def menu_loop(rows, tty_mode=False, fd=None, note="", preferred_id=None):
     selector, and `enter` after its attach detaches). note is shown once
     above the footer (the enter verb's stale notice); preferred_id
     preselects a workspace row (enter's parent workspace after a stale
-    pane). Returns 0 when the user quits."""
+    pane). Returns 0 when the user quits, LINK_OPEN_EXIT for L (the phone
+    launcher opens the TENDRIL Link app)."""
     selected = selection_index(rows, preferred_id)
     while True:
         render(rows, note, selected)
@@ -1293,6 +1315,24 @@ def menu_loop(rows, tty_mode=False, fd=None, note="", preferred_id=None):
                 attach(rows[index])
         elif raw.lower() == "q":
             return 0
+        elif raw.lower() == "l":
+            # U9: the phone asked for the TENDRIL Link app. The selector
+            # runs on the HOST and cannot reach Android's `am`; instead it
+            # signals the phone launcher, which turns the signal into the
+            # fixed local `am start -n app.tendril.link/.MainActivity`.
+            # Two signals, both always sent (LINK-CONTRACT-0.2 §4):
+            # - the exit status 75 (EX_TEMPFAIL) — ssh propagates it;
+            # - a per-launch request file keyed by the launcher's nonce
+            #   (TENDRIL_LINK_NONCE) — mosh drops exit statuses (verified
+            #   mosh 1.4.0 exits 0 regardless), so the launcher consumes
+            #   the request with one BatchMode ssh after the session ends.
+            # NEVER sniff SSH_CONNECTION to pick one: mosh-server inherits
+            # it from its ssh bootstrap, so a mosh session looks like ssh
+            # (physical S21 failure, build 158 — L behaved like Q).
+            _request_link_open()
+            print("L opens TENDRIL Link on the phone — "
+                  "if nothing opened, run: tendril link")
+            return LINK_OPEN_EXIT
         elif raw.lower() == "r":
             pass
         elif raw.lower() == "n":
@@ -1319,6 +1359,85 @@ def menu_loop(rows, tty_mode=False, fd=None, note="", preferred_id=None):
 PANE_RE = re.compile(r"^[A-Za-z0-9]+:[A-Za-z0-9]+$")
 MAX_TOKEN = 129                             # beyond this the token is junk
 SUBCOMMANDS = ("attach", "enter", "resolve", "focus", "link")
+# Selector key L: exit status the phone launcher watches for (see menu_loop).
+LINK_OPEN_EXIT = 75
+
+
+# The phone launcher's per-launch nonce: 16..32 lowercase hex, exported to
+# the selector as TENDRIL_LINK_NONCE and echoed back by the consume verb.
+LINK_NONCE_RE = re.compile(r"^[0-9a-f]{16,32}$")
+# A request nobody consumed (phone lost the network mid-session) is swept
+# after this long; it can never be read by another launch anyway (nonce).
+LINK_REQUEST_TTL_S = 3600
+
+
+def _link_request_dir():
+    return os.path.join(os.path.expanduser("~"), ".local", "state",
+                        "tendril", "link-open")
+
+
+def _request_link_open(nonce=None):
+    """Leave the phone-consumed link-open request for THIS launch: the file
+    is named by the launcher's nonce, so a request can only ever be read by
+    the launch that asked — no stale flag can open the app after a later
+    Q, and a selector with no nonce (host desktop, old launcher) writes
+    nothing. Atomic tmp+rename; failures are silent (the in-band hint
+    still tells the user the way). Returns True when written."""
+    if nonce is None:
+        nonce = os.environ.get("TENDRIL_LINK_NONCE", "")
+    if not LINK_NONCE_RE.match(nonce or ""):
+        return False
+    d = _link_request_dir()
+    try:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        tmp = os.path.join(d, ".%s.tmp" % nonce)
+        with open(tmp, "w") as fh:
+            fh.write("open\n")
+        os.replace(tmp, os.path.join(d, nonce))
+    except OSError:
+        return False
+    return True
+
+
+def _sweep_link_requests(now=None):
+    """Remove unconsumed requests older than LINK_REQUEST_TTL_S."""
+    now = time.time() if now is None else now
+    d = _link_request_dir()
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(d, name)
+        try:
+            if now - os.path.getmtime(path) > LINK_REQUEST_TTL_S:
+                os.remove(path)
+        except OSError:
+            pass
+
+
+def _link_open_request(nonce=None):
+    """`--link-open-request <nonce>` — consume-and-report the selector's L
+    request for ONE launch (phone launcher, after the interactive session
+    ends): prints `open` exactly when that launch's request exists and
+    removes it — consume-once — prints nothing otherwise; always exit 0.
+    A missing or malformed nonce answers nothing."""
+    _sweep_link_requests()
+    if not LINK_NONCE_RE.match(nonce or ""):
+        return 0
+    flag = os.path.join(_link_request_dir(), nonce)
+    try:
+        with open(flag) as fh:
+            content = fh.read().strip()
+    except OSError:
+        return 0
+    try:
+        os.remove(flag)
+    except OSError:
+        pass
+    if content == "open":
+        print("open")
+    return 0
 _RANK_NAME = {rank: name for name, rank in RANK.items()}
 STALE_NOTE = "That agent session has ended — choose another."
 
@@ -1331,11 +1450,15 @@ def _pane_lookup(token):
         return None
     snap = snapshot()
     if not snap:
+        _trace("pane-lookup-done")
         return None
+    pane = None
     for p in snap.get("panes", []):
         if p.get("pane_id") == token:
-            return p
-    return None
+            pane = p
+            break
+    _trace("pane-lookup-done")
+    return pane
 
 
 def _focus_pane(pane):
@@ -1354,7 +1477,9 @@ def _focus_pane(pane):
         run([HERDR, "tab", "focus", tab_id], 6)
     run([HERDR, "agent", "focus", pane_id], 6)
     snap = snapshot()
-    return bool(snap) and snap.get("focused_pane_id") == pane_id
+    ok = bool(snap) and snap.get("focused_pane_id") == pane_id
+    _trace("focus-done")
+    return ok
 
 
 def _selector_after(rows, note="", preferred_id=None):
@@ -1409,6 +1534,768 @@ def resolve_token(rows, token):
     if len(hits) > 1:
         return None, ("ambiguous", hits)
     return None, ("unknown", [])
+
+
+_LIVE_STATUS = ("working", "blocked", "done", "idle")
+_SNAPSHOT_MAX_BYTES = 64 * 1024     # contract §0: the whole wire document
+
+
+def _prompt_ready(status, harness):
+    """§7.3: the host could dispatch a prompt into this agent — a
+    launchable harness, an agent present, idle or done. The phone uses
+    it to enable schedule rows (Busy · Needs input · Not supported are
+    derived from status on the phone)."""
+    if status not in ("idle", "done"):
+        return False
+    try:
+        import tendril_schedule
+        return harness in tendril_schedule.HARNESSES
+    except Exception:
+        return False
+
+
+def _snapshot_agent(a, tele=None):
+    """One LIVE MAP agent row: the five schema-v1 contract fields plus the
+    `harness` tag and, when tendril_telemetry could derive them, the
+    telemetry keys (v2 facts plus v3 phase/events/children — children carry
+    only ids, types, statuses and token/cost numbers). Never cwd, terminal
+    titles or agent_session; telemetry carries only tool names and sanitized
+    file basenames inside `activity`, never transcript content."""
+    st = a.get("agent_status")
+    tab = a.get("tab_id")
+    agent = a.get("agent") or "agent"
+    harness = str(agent).lower()
+    out = {
+        "pane_id": a.get("pane_id") or "",
+        "tab_id": tab if tab else None,
+        "agent": agent,
+        "status": st if st in _LIVE_STATUS else "unknown",
+        "focused": bool(a.get("focused")),
+        "harness": harness,
+    }
+    out["prompt_ready"] = _prompt_ready(out["status"], harness)
+    if tele:
+        out.update(tele)
+    return out
+
+
+def _optional_sections(snap=None):
+    """(extra top-level sections, extra capability strings) contributed by
+    sibling host modules when they are installed (contract §1/§4). Each hook
+    returns (section_dict | None, capability_string) — a bare section dict is
+    tolerated. Best-effort: absence or failure omits its section AND its
+    capability string, and a present-but-EMPTY section registers nothing —
+    the phone renders the designed degraded state. The herdr snapshot the
+    assembler already fetched rides along for the schedule section's
+    §7.3 latency reconcile."""
+    extra, caps = {}, []
+
+    def take(verb, result):
+        # contract §1: the hook's own capability string wins; the verb name
+        # is the fallback for the tolerated bare-dict form.
+        if isinstance(result, tuple) and len(result) == 2:
+            sec, cap = result
+            if not (isinstance(cap, str) and cap):
+                cap = verb
+        else:
+            sec, cap = result, verb
+        if isinstance(sec, dict) and sec:
+            extra[verb] = sec
+            if cap not in caps:
+                caps.append(cap)
+
+    try:
+        import tendril_capacity
+        take("capacity", tendril_capacity.snapshot_section(budget_s=1.0))
+    except Exception:
+        pass
+    try:
+        import tendril_schedule
+        take("schedule", tendril_schedule.snapshot_section(snap=snap))
+    except Exception:
+        pass
+    try:
+        import tendril_health
+        take("health", tendril_health.snapshot_section())
+    except Exception:
+        pass
+    return extra, caps
+
+
+def _doc_bytes(doc):
+    return len(json.dumps(doc, separators=(",", ":")).encode(
+        "utf-8", "replace"))
+
+
+def _enforce_doc_cap(doc):
+    """Shrink the document to the 64 KB wire cap (contract §0): children are
+    dropped oldest-first (they are stored newest-first), then events
+    oldest-first, then the optional schedule/capacity sections, then
+    per-agent telemetry. The v1 agent/workspace fields always survive."""
+    if _doc_bytes(doc) <= _SNAPSHOT_MAX_BYTES:
+        return
+    agents = [a for ws in doc.get("workspaces", [])
+              for a in ws.get("agents", [])]
+    while _doc_bytes(doc) > _SNAPSHOT_MAX_BYTES:
+        victims = [a for a in agents if a.get("children")]
+        if not victims:
+            break
+        for a in victims:
+            a["children"].pop()          # tail of a newest-first list
+    while _doc_bytes(doc) > _SNAPSHOT_MAX_BYTES:
+        victims = [a for a in agents if a.get("events")]
+        if not victims:
+            break
+        for a in victims:
+            a["events"].pop(0)           # oldest of a newest-last list
+    for key in ("schedule", "capacity", "health"):
+        if _doc_bytes(doc) <= _SNAPSHOT_MAX_BYTES:
+            return
+        doc.pop(key, None)
+    for a in agents:
+        if _doc_bytes(doc) <= _SNAPSHOT_MAX_BYTES:
+            return
+        for k in ("children", "events", "phase", "trail", "last_event",
+                  "tool_started_at", "tool", "activity", "cost_usd",
+                  "output_tokens", "context_tokens", "started_at",
+                  "effort", "provider", "model"):
+            a.pop(k, None)
+    # titles are the PRIMARY identity (§11): the last thing to go
+    for a in agents:
+        if _doc_bytes(doc) <= _SNAPSHOT_MAX_BYTES:
+            return
+        for k in ("title", "title_source"):
+            a.pop(k, None)
+
+
+def _snapshot_doc():
+    """(doc, 0) or (None, 1) — the LIVE MAP document for TENDRIL Link's
+    phone map (schema v3: the v1/v2 fields, optional per-agent telemetry
+    with phase/events/children derived read-only by tendril_telemetry, and
+    optional capacity/schedule sections via the sibling host modules, each
+    registered in `capabilities`; any failure just omits that piece). ONE
+    `herdr api snapshot` call feeds both the selector rows and the raw
+    document; workspaces in collect()'s order (selector order). The gate is
+    _reachable_rows' semantics, but diagnostics go to STDERR and stdout
+    stays empty on failure: consumers read one JSON line or nothing."""
+    if not HERDR:
+        print("no compatible herdr client found", file=sys.stderr)
+        return None, 1
+    snap = snapshot()
+    rows = collect(snap)
+    if snap is None or rows is None:
+        print("cannot reach the Herdr server. Is it running? Try: herdr status",
+              file=sys.stderr)
+        return None, 1
+    agents_flat = [a for r in rows for a in r["agents"]]
+    tele = None
+    if tendril_telemetry is not None and agents_flat:
+        try:
+            tele = tendril_telemetry.for_agents(agents_flat)
+        except Exception:            # telemetry must never fail the map
+            tele = None
+    focused_pane = snap.get("focused_pane_id") or None
+    workspaces = []
+    idx = 0
+    for r in rows:
+        ags = []
+        for a in r["agents"]:
+            ags.append(_snapshot_agent(a, tele[idx] if tele else None))
+            idx += 1
+        workspaces.append({
+            "id": r["id"],
+            "label": r["label"],
+            "number": r["number"],
+            "focused": bool(r["focused"]),
+            "agents": ags,
+        })
+    doc = {
+        "version": 3,
+        "host": HOST_LABEL,
+        "generated_at": int(time.time()),
+        "focused_workspace": next((r["id"] for r in rows if r["focused"]), None),
+        "focused_pane": focused_pane,
+        "workspaces": workspaces,
+        # "etag": the phone may send `snapshot --if-none-match <etag>` and
+        # get a tiny not-modified line for unchanged polls (D11 freshness).
+        "capabilities": ["subagents", "etag"],
+    }
+    try:
+        extra, caps = _optional_sections(snap)
+        doc.update(extra)
+        doc["capabilities"] += [c for c in caps
+                                if c not in doc["capabilities"]]
+    except Exception:                # hooks must never fail the map
+        pass
+    # Session titles (DESIGN-FINAL-POLISH §11): one resolved `title` +
+    # `title_source` per agent, additive and best-effort — any failure just
+    # leaves the fields off and the phone falls back to the harness name.
+    try:
+        import tendril_titles
+        tendril_titles.annotate_document(doc, rows)
+        if "titles" not in doc["capabilities"]:
+            doc["capabilities"].append("titles")
+    except Exception:
+        pass
+    _enforce_doc_cap(doc)
+    return doc, 0
+
+
+def _doc_etag(doc):
+    """16-hex content tag for the LIVE MAP document: sha256 over the doc
+    minus the volatile `generated_at` (and the `etag` key itself), so two
+    polls of an unchanged host produce the SAME tag and a poll may send it
+    back as `snapshot --if-none-match <etag>` to get a tiny not-modified
+    line instead of the ~45 KB document (D11 freshness: unchanged polls
+    must be cheap enough for a 2 s foreground cadence)."""
+    core = {k: v for k, v in doc.items()
+            if k not in ("generated_at", "etag")}
+    blob = json.dumps(core, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8", "replace")
+    return hashlib.sha256(blob).hexdigest()[:16]
+
+
+def _snapshot_cmd(if_none_match=None):
+    """`snapshot [--json] [--if-none-match <etag16>]` — non-interactive LIVE
+    MAP document for the phone (phone/tendril snapshot dials this over plain
+    SSH). --json is accepted and a no-op: the output is one compact JSON
+    line either way. With --if-none-match matching the document's content
+    etag, the reply is one tiny `{"not_modified":true,...}` line instead.
+    Exit codes: 0 ok, 1 Herdr unreachable (stdout empty, reason on stderr),
+    2 usage."""
+    doc, code = _snapshot_doc()
+    if doc is None:
+        return code
+    etag = _doc_etag(doc)
+    doc["etag"] = etag
+    if if_none_match is not None and if_none_match == etag:
+        print(json.dumps({"version": doc["version"], "host": doc["host"],
+                          "generated_at": int(time.time()),
+                          "not_modified": True, "etag": etag,
+                          "capabilities": doc.get("capabilities", [])},
+                         separators=(",", ":")))
+        return 0
+    print(json.dumps(doc, separators=(",", ":")))
+    return 0
+
+
+# ---------- schedule: the TENDRIL scheduler verbs (contract §3/§4) ----------
+SCHEDULE_TITLES = {"started": "TENDRIL · TASK STARTED",
+                   "waiting": "TENDRIL · TASK WAITING",
+                   "failed": "TENDRIL · TASK FAILED"}
+SCHEDULE_PUSH = {"started": ("default", "white_check_mark"),
+                 "waiting": ("min", "hourglass"),
+                 "failed": ("high", "rotating_light")}
+
+
+def _notify_module():
+    """bin/herdr-notify loaded as a module (its filename has a dash), or
+    None when it is not installed next to us. Best-effort: a missing or
+    broken watcher must never break a schedule verb."""
+    if not NOTIFY_BIN or not os.path.isfile(NOTIFY_BIN):
+        return None
+    try:
+        loader = importlib.machinery.SourceFileLoader("tendril_notify_mod",
+                                                      NOTIFY_BIN)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+def _schedule_body(kind, task):
+    """Notification body: the task title; TASK WAITING says what it is
+    waiting for (contract §3: '<title> · waiting for <Provider> capacity').
+    Fires only when an `at` task came due but the provider was exhausted."""
+    title = str(task.get("title") or "scheduled task")[:80]
+    if kind != "waiting":
+        return title
+    provider = str((task.get("trigger") or {}).get("provider") or "provider")
+    return "%s · waiting for %s capacity" % (title, provider[:16].capitalize())
+
+
+def _schedule_notifier():
+    """notifier(kind, task) pushing TASK STARTED / TASK WAITING /
+    TASK FAILED via herdr-notify send() with the tendril deep link as the
+    click target — or None when the watcher is absent/unconfigured, so a
+    tick never touches the network for pushes nobody receives."""
+    mod = _notify_module()
+    if mod is None:
+        return None
+    try:
+        cfg = mod.load_env()
+        if not mod.configured(cfg):
+            return None
+    except Exception:
+        return None
+
+    def notify(kind, task):
+        title = SCHEDULE_TITLES.get(kind)
+        if not title:
+            return
+        priority, tags = SCHEDULE_PUSH.get(kind, ("default", "bell"))
+        body = _schedule_body(kind, task)
+        click = None
+        try:
+            link = tendril_link.describe(HOST_LABEL, task["workspace"],
+                                         task.get("workspace_label") or None,
+                                         task.get("pane_id"))
+            click = link.get("uri")
+        except Exception:
+            pass                            # a link must never eat a push
+        try:
+            mod.send(cfg, title, body, priority, tags, click=click)
+        except Exception:
+            pass                            # herdr-notify logs its own failures
+    return notify
+
+
+def _schedule_launcher():
+    """launcher(task) → (ok, pane_id, safe phrase). Argv lists only, one
+    `herdr` call per step (contract §3): a NEW target runs tab create →
+    `agent start` in that pane → `agent prompt <pane> --wait`; an §7.3
+    EXISTING target dispatches through the herdr agent-prompt argv ONLY
+    into the pane chosen at add — never a new pane, never typed into a
+    terminal. TARGET takes a pane id (verified live via
+    `herdr agent get <pane>`). Failure phrases are exactly the
+    contract's three.
+
+    D10 (§13 release blocker): `--wait` used to wait for the turn to
+    SETTLE with --timeout 15000, so any turn longer than 15 s — most
+    real prompts — returned herdr's `timeout` after the prompt had been
+    ACCEPTED and launched, and the task was stamped FAILED `prompt
+    rejected` while the agent kept working (reproduced live 2026-10-11:
+    a 25 s sleep task → FAILED at +15 s, pane finished at +40 s). The
+    launch acknowledgment is now herdr's own pickup proof: `--wait` with
+    the full `--until working blocked idle done` match set returns rc 0
+    as soon as herdr OBSERVES the agent leave idle after the submission
+    (its 5 s activity gate) or sees the turn already settled — rc 0
+    proves execution started (or finished), never merely that bytes were
+    typed. A longer turn stays RUNNING and the tick/snapshot reconcile
+    finishes it (pane idle/done ⇒ DONE); rc ≠ 0 still means no execution
+    evidence ⇒ FAILED `prompt rejected`."""
+    def launch(task):
+        if not HERDR:
+            return False, None, "launch refused"
+        target = task.get("target")
+        if isinstance(target, dict) and target.get("kind") == "existing":
+            pane = target.get("pane")
+            if not isinstance(pane, str) or not PANE_RE.match(pane):
+                return False, None, "launch refused"
+            rc, out, err = run([HERDR, "agent", "prompt", pane,
+                                task.get("prompt") or "", "--wait",
+                                "--until", "working", "--until", "blocked",
+                                "--until", "idle", "--until", "done",
+                                "--timeout", "15000"], 25)
+            if rc != 0:
+                return False, None, "prompt rejected"
+            return True, pane, None
+        name = "tendril-" + str(task.get("id", "")).split("-")[-1]
+        if not re.match(r"^[A-Za-z0-9._-]{1,32}$", name):
+            return False, None, "launch refused"
+        rc, out, err = run([HERDR, "tab", "create",
+                            "--workspace", task.get("workspace") or "",
+                            "--label", name, "--no-focus"], 12)
+        if rc != 0:
+            return False, None, "workspace missing"
+        pane = None
+        try:
+            pane = find_key(json.loads(out), "pane_id")
+        except (ValueError, TypeError):
+            pane = None
+        if not isinstance(pane, str) or not PANE_RE.match(pane):
+            return False, None, "launch refused"
+        rc, out, err = run([HERDR, "agent", "start", name, "--kind",
+                            task.get("harness") or "", "--pane", pane,
+                            "--timeout", "30000"], 45)
+        if rc != 0:
+            return False, None, "launch refused"
+        # §11: a scheduled task that CREATED the session makes the task
+        # title the session's native name. The pane's Pi extension consumes
+        # this pending record on its first prompt (written BEFORE the
+        # `agent prompt` below, so the ordering always holds); the wire
+        # title comes from the schedule section either way (level 3).
+        try:
+            import tendril_titles
+            tendril_titles.enqueue_native(pane, task.get("title"),
+                                          kind="scheduled")
+        except Exception:
+            pass                            # naming never blocks a launch
+        # same pickup acknowledgment as the §7.3 existing path (D10): rc 0
+        # proves the fresh agent took the prompt; the turn's real length is
+        # the tick/reconcile RUNNING→DONE business, not the launcher's.
+        rc, out, err = run([HERDR, "agent", "prompt", pane,
+                            task.get("prompt") or "", "--wait",
+                            "--until", "working", "--until", "blocked",
+                            "--until", "idle", "--until", "done",
+                            "--timeout", "15000"], 25)
+        if rc != 0:
+            return False, None, "prompt rejected"
+        return True, pane, None
+    return launch
+
+
+def _schedule_lookup():
+    """pane → agent row for §7.3 add-time target validation, built lazily:
+    a plain new-pane add never pays a herdr call. started_at comes from
+    the agent's own transcript via tendril_telemetry (bounded, cached);
+    a pane with no derivable started_at simply cannot pin the guard."""
+    state = {}
+
+    def lookup(pane):
+        if "rows" not in state:
+            snap = snapshot()
+            state["rows"] = {a.get("pane_id"): a
+                             for a in (snap or {}).get("agents", [])
+                             if isinstance(a, dict) and a.get("pane_id")}
+        row = state["rows"].get(pane)
+        if not isinstance(row, dict):
+            return None
+        out = {"agent": row.get("agent"),
+               "workspace_id": row.get("workspace_id"),
+               "status": row.get("agent_status"),
+               "started_at": None}
+        try:
+            import tendril_telemetry
+            tele = tendril_telemetry.for_agents([row], budget=0.5)
+            if isinstance(tele, list) and isinstance(tele[0], dict):
+                out["started_at"] = tele[0].get("started_at")
+        except Exception:
+            pass
+        return out
+    return lookup
+
+
+def _schedule_started_at_of(row):
+    """started_at for one live agent row (§7.3 launch guard), from the
+    agent's own transcript; None when it cannot be derived (the guard is
+    then unverifiable and never guessed)."""
+    try:
+        import tendril_telemetry
+        tele = tendril_telemetry.for_agents([row], budget=0.5)
+        if isinstance(tele, list) and isinstance(tele[0], dict):
+            return tele[0].get("started_at")
+    except Exception:
+        pass
+    return None
+
+
+def _schedule_reply(doc):
+    print(json.dumps(doc, separators=(",", ":")))
+
+
+def _schedule_cmd(args):
+    """`schedule tick|list [--json]|show <id>|add <b64url>|cancel <id>` —
+    the fixed scheduler verbs (LINK-CONTRACT-0.2 §3/§4). Every reply is
+    ONE JSON line on stdout; only `show` ever includes the prompt text."""
+    verb = args[0] if args else ""
+    try:
+        import tendril_schedule
+    except Exception:
+        print("no scheduler: tendril_schedule.py missing next to remote-agents",
+              file=sys.stderr)
+        return 1
+    ts = tendril_schedule
+    _, store_path, _ = ts.store_paths()
+    if verb == "tick" and len(args) == 1:
+        snap = snapshot()
+        if snap is None:
+            # RC2 fix: Herdr down (or no client resolved) used to feed
+            # snap=None into the tick and crash the timer with TypeError
+            # (run([None, "api", "snapshot"])) or fail due tasks with
+            # "launch refused". A tick without Herdr is a no-op: ok reply,
+            # zero launches — due tasks simply wait for a healthy tick.
+            _schedule_reply({"ok": True, "tick": {
+                "at": int(time.time()), "launched": 0,
+                "transitions": 0}, "herdr": "unavailable"})
+            return 0
+        def capacity(pid):
+            try:
+                import tendril_capacity
+                return tendril_capacity.provider_state(pid)
+            except Exception:
+                return None
+        summary, err = ts.run_tick(store_path, now=time.time(),
+                                   snap=snap, capacity=capacity,
+                                   launcher=_schedule_launcher(),
+                                   notifier=_schedule_notifier(),
+                                   started_at_of=_schedule_started_at_of)
+        if summary is None:
+            _schedule_reply({"ok": False, "error": err})
+            return 1
+        _schedule_reply({"ok": True, "tick": summary["tick"]})
+        # Capacity background refresh on the tick's own timer (contract
+        # §2): runs AFTER the scheduling work and the reply — launches are
+        # already done and the reply is out, so the ≤ 12 s bounded refresh
+        # (a no-op when no adapter is enabled) can never delay a task, a
+        # launch or this tick. Keeps enabled adapters inside their 30 min
+        # staleness bound without a manual `capacity --refresh`. Never
+        # raises; a busy lock (overlapping ticks) is a skip.
+        try:
+            import tendril_capacity
+            tendril_capacity.background_refresh()
+        except Exception:
+            pass
+        return 0
+    if verb == "list" and (len(args) == 1
+                           or (len(args) == 2 and args[1] == "--json")):
+        tasks, err = ts.list_tasks(store_path)
+        if err is not None:
+            _schedule_reply({"ok": False, "error": err})
+            return 1
+        _schedule_reply({"ok": True,
+                         "tasks": [ts.project(t) for t in tasks]})
+        return 0
+    if verb == "show" and len(args) == 2:
+        if not ts.ID_RE.match(args[1]):
+            _schedule_reply({"ok": False, "error": ts.E_ID})
+            return 1
+        task, err = ts.get_task(store_path, args[1])
+        if err is not None:
+            _schedule_reply({"ok": False, "error": err})
+            return 1
+        doc = ts.project(task)
+        doc["prompt"] = task.get("prompt")     # ONLY show returns the prompt
+        _schedule_reply({"ok": True, "task": doc})
+        return 0
+    if verb == "add" and len(args) == 2:
+        now = time.time()
+        task, err = ts.decode_add(args[1], now, lookup=_schedule_lookup())
+        if err is None:
+            task, err = ts.add_task(store_path, task, now)
+        if err is not None:
+            _schedule_reply({"ok": False, "error": err})
+            return 1
+        _schedule_reply({"ok": True, "task": ts.project(task)})
+        return 0
+    if verb == "cancel" and len(args) == 2:
+        if not ts.ID_RE.match(args[1]):
+            _schedule_reply({"ok": False, "error": ts.E_ID})
+            return 1
+        task, err = ts.cancel_task(store_path, args[1], time.time())
+        if err is not None:
+            _schedule_reply({"ok": False, "error": err})
+            return 1
+        _schedule_reply({"ok": True, "task": ts.project(task)})
+        return 0
+    print("usage: remote-agents schedule tick|list [--json]|show <id>"
+          "|add <b64url>|cancel <id>", file=sys.stderr)
+    return 2
+
+
+# ---------- health/herdr: Herdr health & recovery (contract §6) ----------
+HEALTH_PUSH = {"offline": ("high", "rotating_light"),
+               "restored": ("default", "white_check_mark")}
+
+
+# ---------- titles: the session naming verbs (DESIGN-FINAL-POLISH §11) ------
+
+def _rename_session_cmd(args):
+    """`rename-session <pane_id> <title>` / `rename-session <pane_id> --clear`
+    — the manual level-1 label (§11), phone-invocable. Validation matches the
+    phone launcher: a pane id, then a title sanitized on the host (control
+    chars stripped, collapsed, capped at 48) or --clear. The pane must exist
+    AND host a session right now: an override is never written blind, so a
+    reused pane can never carry a stale label. One JSON line on stdout."""
+    try:
+        import tendril_titles
+    except Exception:
+        print("no titles module: tendril_titles.py missing next to "
+              "remote-agents", file=sys.stderr)
+        return 1
+    if len(args) != 2:
+        print("usage: remote-agents rename-session <pane_id> <title>"
+              " | rename-session <pane_id> --clear", file=sys.stderr)
+        return 2
+    pane = args[0]
+    title = None if args[1] == "--clear" else args[1]
+    if not PANE_RE.match(pane):
+        print(json.dumps({"ok": False, "error": "bad pane id"},
+                         separators=(",", ":")))
+        return 2
+    snap = snapshot()
+    if snap is None:
+        print(json.dumps({"ok": False, "error": "Herdr is not answering"},
+                         separators=(",", ":")))
+        return 1
+    agent = next((a for a in snap.get("agents", [])
+                  if isinstance(a, dict) and a.get("pane_id") == pane), None)
+    ok, phrase = tendril_titles.rename_session(pane, title, agent=agent)
+    if not ok:
+        print(json.dumps({"ok": False, "error": phrase},
+                         separators=(",", ":")))
+        return 1
+    reply = {"ok": True, "pane_id": pane}
+    if phrase is not None:
+        reply["title"] = phrase             # --clear echoes no title
+    print(json.dumps(reply, separators=(",", ":")))
+    return 0
+
+
+def _titles_cmd(args):
+    """`titles backfill [--dry-run]` — the one-shot §11 migration: derive
+    titles for root sessions that have none and persist them in the host
+    cache ONLY (existing transcripts are never appended to). Idempotent."""
+    try:
+        import tendril_titles
+    except Exception:
+        print("no titles module: tendril_titles.py missing next to "
+              "remote-agents", file=sys.stderr)
+        return 1
+    return tendril_titles.main(args)
+
+
+def _health_notifier():
+    """notifier(kind, title, body) pushing HERDR OFFLINE / HERDR RESTORED
+    via herdr-notify send() — same lazy wiring as _schedule_notifier; None
+    (a no-op) when the watcher is absent or ntfy is unconfigured. Click
+    target stays None on purpose: the notification opens the app, never a
+    pane (contract §6.2)."""
+    mod = _notify_module()
+    if mod is None:
+        return None
+    try:
+        cfg = mod.load_env()
+        if not mod.configured(cfg):
+            return None
+    except Exception:
+        return None
+
+    def notify(kind, title, body):
+        priority, tags = HEALTH_PUSH.get(kind, ("default", "bell"))
+        try:
+            mod.send(cfg, title, body, priority, tags, click=None)
+        except Exception:
+            pass                            # herdr-notify logs its own failures
+    return notify
+
+
+def _health_cmd(args):
+    """`health --json` — ONE bounded (≤ 3 s) JSON line describing Herdr's
+    state, the tendril install, and the three services; `health tick` —
+    one guardian observation (the systemd timer runs it every 30 s; it
+    NEVER restarts Herdr). Read-only besides the guardian state file."""
+    verb = args[0] if args else ""
+    try:
+        import tendril_health
+    except Exception:
+        print("no health module: tendril_health.py missing next to"
+              " remote-agents", file=sys.stderr)
+        return 1
+    if verb == "--json" and len(args) == 1:
+        doc = tendril_health.health_doc(host=HOST_LABEL, herdr=HERDR,
+                                        run=run,
+                                        binary=HERDR_PROVENANCE,
+                                        client_version=HERDR_CLIENT_VERSION,
+                                        stale_record=HERDR_STALE)
+        print(json.dumps(doc, separators=(",", ":")))
+        return 0
+    if verb == "tick" and len(args) == 1:
+        summary = tendril_health.run_tick(host=HOST_LABEL, herdr=HERDR,
+                                          run=run,
+                                          notifier=_health_notifier())
+        print(json.dumps({"ok": True, "tick": summary},
+                         separators=(",", ":")))
+        return 0
+    print("usage: remote-agents health --json|tick", file=sys.stderr)
+    return 2
+
+
+def _herdr_cmd(args):
+    """`herdr restart|stop|start` — the fixed recovery verbs (contract
+    §6.1): argv-only start through Herdr's supported headless lifecycle,
+    VERIFIED before an ok; guard + rate limit per the contract. Reply is
+    ONE JSON line; exit 0 only on ok."""
+    verb = args[0] if args else ""
+    if verb not in ("restart", "stop", "start") or len(args) != 1:
+        print("usage: remote-agents herdr restart|stop|start",
+              file=sys.stderr)
+        return 2
+    try:
+        import tendril_health
+    except Exception:
+        print("no health module: tendril_health.py missing next to"
+              " remote-agents", file=sys.stderr)
+        return 1
+    doc = tendril_health.herdr_verb(verb, host=HOST_LABEL, herdr=HERDR,
+                                    run=run)
+    print(json.dumps(doc, separators=(",", ":")))
+    return 0 if doc.get("ok") else 1
+
+
+def _capacity_cmd(rest):
+    """`capacity [--json] [--refresh]` — ONE compact JSON line: the contract
+    §1 capacity section (provider ids, states, windows, tokens by day;
+    never transcript content, never credentials). `capacity status` prints
+    the human table instead; `capacity enable|disable <adapter>` opts in or
+    out of a network usage adapter (claude_oauth|codex_wham|zai_quota;
+    stored in ~/.config/tendril/capacity.json); enabling also triggers one
+    immediate bounded refresh and prints one honest line when the first
+    sample did not land (offline-safe: the enable always succeeds first).
+    Without --refresh the verb
+    serves the cached/locally-derived section through snapshot_section's
+    1 s budget (instant when the cache is fresh) and never touches the
+    network; --refresh rescans now and also allows the enabled network
+    adapters. Exit 0 ok, 2 usage, 1 module missing."""
+    flags = [a for a in rest if a.startswith("--")]
+    pos = [a for a in rest if not a.startswith("--")]
+    if [f for f in flags if f not in ("--json", "--refresh")] \
+            or (pos and pos[0] not in ("status", "enable", "disable")) \
+            or (pos and pos[0] in ("enable", "disable") and len(pos) != 2) \
+            or (pos and pos[0] == "status" and len(pos) != 1):
+        print("usage: remote-agents capacity [--json] [--refresh]\n"
+              "       remote-agents capacity status\n"
+              "       remote-agents capacity enable|disable "
+              "<claude_oauth|codex_wham|zai_quota>", file=sys.stderr)
+        return 2
+    try:
+        import tendril_capacity as cap
+    except ImportError:
+        print("tendril_capacity.py is missing next to remote-agents; "
+              "re-run ./install", file=sys.stderr)
+        return 1
+    refresh = "--refresh" in flags
+    if not pos or pos[0] == "status":
+        try:
+            if refresh:
+                sec = cap.collect(refresh=True,
+                                  budget_s=cap.REFRESH_BUDGET_S)
+            else:
+                sec = cap.snapshot_section(budget_s=1.0)[0]
+        except Exception:
+            sec = None
+        if not isinstance(sec, dict) or not sec:
+            sec = {"generated_at": int(time.time()), "providers": []}
+        if not pos:
+            print(json.dumps(sec, separators=(",", ":")))
+            return 0
+        try:
+            print(cap.status_text(sec))
+        except Exception:
+            print("capacity unavailable on this host")
+        return 0
+    if not cap.set_enabled(pos[1], pos[0] == "enable"):
+        print("unknown adapter '%s'; valid: %s"
+              % (pos[1], " ".join(cap.NET_IDS)), file=sys.stderr)
+        return 2
+    print("%s %s" % (pos[1], "enabled" if pos[0] == "enable"
+                     else "disabled"))
+    if pos[0] == "enable":
+        # One immediate bounded refresh so the phone stops showing "not
+        # reporting" the moment an adapter is enabled — best effort: the
+        # enable above already succeeded, and a failed fetch (offline, bad
+        # credentials, a concurrent tick refreshing) only means the first
+        # sample arrives with the next tick. One honest line, no secrets,
+        # no raw errors.
+        try:
+            cap.background_refresh()
+        except Exception:
+            pass
+        if not cap.adapter_reported(pos[1]):
+            print("enabled; first sample will arrive within 5 min")
+    return 0
 
 
 def _reachable_rows():
@@ -1828,6 +2715,54 @@ persistent AI agents.
   tendril attach|enter|resolve|focus|link <token>
                               direct addressing: workspace id (w15), pane id
                               (w15:p1), workspace number, or exact label
+  tendril snapshot [--json]   one line of LIVE MAP JSON (schema v1): the
+                              read-only workspace/agent mirror TENDRIL Link's
+                              phone map renders. Non-interactive, safe over
+                              plain SSH; on failure stdout stays empty and
+                              the reason goes to stderr (exit 1)
+  tendril capacity [--json] [--refresh]
+                              one line of capacity JSON (contract §1): per-
+                              provider rate-limit state and billable token
+                              usage from the local transcripts, plus opted-in
+                              network usage adapters. Read-only; never prints
+                              or stores credentials. Without --refresh the
+                              network is never touched
+  tendril capacity status     the same facts as a human table (no secrets)
+  tendril capacity enable|disable <adapter>
+                              opt in/out of a network usage adapter
+                              (claude_oauth | codex_wham | zai_quota)
+  tendril schedule tick       one scheduler pass (the user systemd timer runs
+                              this every 30 s; safe to run by hand)
+  tendril schedule list [--json]
+                              known tasks, newest first (never prompt text)
+  tendril schedule show <id>  one task INCLUDING its prompt — the only verb
+                              that ever prints prompt text
+  tendril schedule add <b64url>
+                              enqueue {title, prompt, workspace, harness,
+                              trigger} as one base64url JSON payload
+  tendril schedule cancel <id> cancel a task that has not started running
+  tendril health --json      one bounded (≤ 3 s) JSON line: Herdr state
+                             (running|down|stopped|unknown), the tendril
+                             install, and the notify/scheduler/guardian
+                             services — no secrets, paths or pids (§6.1)
+  tendril health tick        one guardian observation (the user systemd
+                             timer runs this every 30 s; it NOTIFIES, it
+                             never restarts Herdr)
+  tendril herdr restart      the one safe revive: refuses the intentional-
+                             stop guard, rate limited 1/30 s, starts Herdr
+                             via its supported headless lifecycle and
+                             VERIFIES (status running + api snapshot ≤ 10 s)
+  tendril herdr stop         intentional stop: writes the stop guard, then
+                             stops Herdr (guard keeps the guardian silent)
+  tendril herdr start        clears the guard, then starts + verifies
+  tendril rename-session <pane_id> <title> | <pane_id> --clear
+                              the session's manual label (§11): sanitized,
+                              ≤ 48 chars; also reaches the live Pi session's
+                              native name. One JSON line
+  tendril titles backfill [--dry-run]
+                              one-shot §11 migration: derive titles for old
+                              sessions that have none; writes ONLY the host
+                              cache, never the transcripts. Idempotent
   tendril service status|start|stop|restart|logs
                               the notification watcher, on launchd or systemd
   tendril --pair [--code | --manual]
@@ -1846,6 +2781,9 @@ persistent AI agents.
                               assets, one asset's raw bytes (tendril,
                               termux-url-opener, agent, link-apk), or a
                               generated setup/upgrade script for Termux
+  tendril --link-open-request <nonce>
+                              consume-and-report the selector's L request of
+                              one phone launch: prints `open` once, then clears
   tendril --link-stage <path> stage a built TENDRIL Link APK (tendril-link.apk
                               + tendril-link.json) so phones can pick it up
   tendril --version           the installed version and commit
@@ -1922,10 +2860,43 @@ def main():
         return 0
     if "--upgrade" in args:
         return _upgrade(args)
+    if "--link-open-request" in args:
+        i = args.index("--link-open-request")
+        return _link_open_request(args[i + 1] if i + 1 < len(args) else None)
     if "--pair" in args:
         return _pair(args)
     if any(a in args for a in PHONE_FLAGS):
         return _phone(args)
+    if args[:1] == ["snapshot"]:
+        rest = args[1:]
+        inm = None
+        if "--if-none-match" in rest:
+            i = rest.index("--if-none-match")
+            val = rest[i + 1] if i + 1 < len(rest) else None
+            if val is None or not re.match(r"^[0-9a-f]{16}$", val):
+                print("usage: remote-agents snapshot [--json] "
+                      "[--if-none-match <etag>]", file=sys.stderr)
+                return 2
+            inm = val
+            rest = rest[:i] + rest[i + 2:]
+        rest = [a for a in rest if a != "--json"]
+        if rest:
+            print("usage: remote-agents snapshot [--json] "
+                  "[--if-none-match <etag>]", file=sys.stderr)
+            return 2
+        return _snapshot_cmd(if_none_match=inm)
+    if args[:1] == ["capacity"]:
+        return _capacity_cmd(args[1:])
+    if args[:1] == ["schedule"]:
+        return _schedule_cmd(args[1:])
+    if args[:1] == ["rename-session"]:
+        return _rename_session_cmd(args[1:])
+    if args[:1] == ["titles"]:
+        return _titles_cmd(args[1:])
+    if args[:1] == ["health"]:
+        return _health_cmd(args[1:])
+    if args[:1] == ["herdr"]:
+        return _herdr_cmd(args[1:])
     if args[:1] == ["service"]:
         return _service(args[1:])
     if len(args) == 2 and args[0] in SUBCOMMANDS:
@@ -1941,6 +2912,16 @@ def main():
               file=sys.stderr)
         print("       remote-agents service status|start|stop|restart|logs",
               file=sys.stderr)
+        print("       remote-agents snapshot [--json] - LIVE MAP JSON for the Link app",
+              file=sys.stderr)
+        print("       remote-agents capacity [--json] [--refresh] | capacity status",
+              file=sys.stderr)
+        print("       remote-agents health --json|tick | herdr restart|stop|start",
+              file=sys.stderr)
+        print("       remote-agents rename-session <pane_id> <title|--clear> "
+              "| titles backfill [--dry-run]", file=sys.stderr)
+        print("       remote-agents capacity enable|disable "
+              "<claude_oauth|codex_wham|zai_quota>", file=sys.stderr)
         print("       remote-agents --pair [--code | --manual] | --upgrade [--verbose]",
               file=sys.stderr)
         print("       remote-agents --phone-manifest | --phone-asset <name> "

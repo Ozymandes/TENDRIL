@@ -8,6 +8,7 @@ resolve/focus/link verbs (one plain SSH round trip, no key check, no Mosh).
 HOME is a temp dir with a space in its name; the real home is never touched.
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -19,17 +20,27 @@ INSTALL = os.path.join(REPO, "install")
 UNINSTALL = os.path.join(REPO, "uninstall")
 PHONE = os.path.join(REPO, "phone", "tendril")
 
+# RC2 connection reuse (mirrors phone/tendril): see tests/test_phone_verbs.py.
+CM = "-o ControlMaster=auto -o ControlPath=~/.ssh/tendril-cm-%C"
+SESSION_CM = CM + " -o ConnectionAttempts=1 -o ConnectTimeout=6"
+
 SSH_STUB = ('printf \'ssh %s\\n\' "$*" >> "$TENDRIL_RECORD"\n'
             'exit "${TENDRIL_SSH_RC:-0}"\n')
-# simulate the remote side: run the command string the launcher built
+# simulate the remote side: run the command string the launcher built, then
+# exit like the real mosh-client: the remote status is NOT propagated, and
+# TENDRIL_MOSH_RC forces mosh's OWN failure (0 = success).
 MOSH_STUB = ('printf \'mosh %s\\n\' "$*" >> "$TENDRIL_RECORD"\n'
              'while [ $# -gt 0 ] && [ "$1" != "--" ]; do shift; done\n'
              '[ $# -gt 0 ] && shift\n'
              '[ "$1" = "sh" ] && shift\n'
              '[ "$1" = "-lc" ] && shift\n'
-             'exec sh -c "$1"\n')
+             'sh -c "$1"\n'
+             'exit "${TENDRIL_MOSH_RC:-0}"\n')
 REMOTE_STUB = 'printf \'remote-agents %s\\n\' "$*" >> "$TENDRIL_RECORD"\n'
 
+
+
+NONCE_RE = re.compile(r"(TENDRIL_LINK_NONCE=|--link-open-request )[0-9a-f]{16}")
 
 class ClientEnv(unittest.TestCase):
     """Temp HOME + stub bin dir shared by installer and launcher tests."""
@@ -55,7 +66,7 @@ class ClientEnv(unittest.TestCase):
         e["HOME"] = self.home
         e["TENDRIL_RECORD"] = self.record
         for k in ("XDG_CONFIG_HOME", "TENDRIL_ALIAS", "AGENT_ALIAS",
-                  "TENDRIL_SSH_RC", "SHELL"):
+                  "TENDRIL_SSH_RC", "TENDRIL_MOSH_RC", "SHELL"):
             e.pop(k, None)
         e.update(over)
         return e
@@ -78,9 +89,12 @@ class ClientEnv(unittest.TestCase):
                               capture_output=True, text=True, timeout=120)
 
     def calls(self):
+        # the per-launch link-open nonce is random by design: normalized so
+        # two launches compare equal on everything else
         try:
             with open(self.record) as f:
-                return f.read().splitlines()
+                return [NONCE_RE.sub(r"\1<nonce>", c)
+                        for c in f.read().splitlines()]
         except OSError:
             return []
 
@@ -188,9 +202,14 @@ class InstalledLauncher(ClientEnv):
         p = self.launcher(self.tendril_bin(), [])
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         calls = self.calls()
-        self.assertEqual(calls[0],
-                         "ssh -o ConnectTimeout=5 -o BatchMode=yes "
-                         "testhost true")
+        # RC2 fast path: the alias file dials the alias via mosh directly —
+        # no synchronous key probe before the transport. The ONE ssh after
+        # the session is the L-flag consume, and it uses the SAME alias from
+        # the file (proving the file fed the whole launcher, not just mosh).
+        ssh_calls = [c for c in calls if c.startswith("ssh ")]
+        self.assertEqual(len(ssh_calls), 1)
+        self.assertIn("--link-open-request", ssh_calls[0])
+        self.assertIn("testhost", ssh_calls[0])
         mosh = [c for c in calls if c.startswith("mosh ")]
         self.assertEqual(len(mosh), 1)
         self.assertIn("testhost", mosh[0])
@@ -227,33 +246,41 @@ class InstalledLauncher(ClientEnv):
         self.assertIn("attach 'w15'", mosh[0])
 
     def test_batchmode_failure_falls_back_to_interactive_ssh(self):
-        p = self.launcher(self.tendril_bin(), [], TENDRIL_SSH_RC="1")
-        # the launcher execs the interactive ssh, so its rc propagates
+        # RC2 fast path: the key-auth probe runs only AFTER the transport
+        # fails; when the probe fails too (no key auth yet), the guidance
+        # prints and the launcher execs the interactive ssh, so its rc
+        # propagates (the degraded first-time-key path, unchanged).
+        p = self.launcher(self.tendril_bin(), [], TENDRIL_MOSH_RC="17",
+                          TENDRIL_SSH_RC="1")
         self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
         self.assertIn("key-auth check failed for 'testhost'", p.stdout)
         calls = self.calls()
-        self.assertFalse(any(c.startswith("mosh ") for c in calls))
-        self.assertIn("ssh -t testhost remote-agents", calls)
+        self.assertTrue(any(c.startswith("mosh ") for c in calls))
+        self.assertIn("ssh -t " + SESSION_CM + " testhost remote-agents",
+                      calls)
 
     # ---- resolve / focus / link: one plain SSH round trip -------------
     def test_focus_is_one_plain_ssh_without_key_check_or_mosh(self):
         p = self.launcher(self.tendril_bin(), ["focus", "w15"])
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(self.calls(),
-                         ["ssh testhost remote-agents focus 'w15'"])
+                         ["ssh " + SESSION_CM +
+                          " testhost remote-agents focus 'w15'"])
 
     def test_link_with_explicit_alias(self):
         p = self.launcher(self.tendril_bin(), ["otherhost", "link", "w3"])
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(self.calls(),
-                         ["ssh otherhost remote-agents link 'w3'"])
+                         ["ssh " + SESSION_CM +
+                          " otherhost remote-agents link 'w3'"])
 
     def test_resolve_accepts_pane_ids(self):
         p = self.launcher(self.tendril_bin(), ["testhost", "resolve",
                                                "w15:p1"])
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertEqual(self.calls(),
-                         ["ssh testhost remote-agents resolve 'w15:p1'"])
+                         ["ssh " + SESSION_CM +
+                          " testhost remote-agents resolve 'w15:p1'"])
 
     def test_direct_verbs_match_the_phone_launcher_exactly(self):
         for args in (["focus", "w15"], ["otherhost", "link", "w3"]):

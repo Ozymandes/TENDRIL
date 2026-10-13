@@ -1,0 +1,8 @@
+{"type":"assistant","timestamp":"@T6@","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1000,"output_tokens":500,"cache_creation_input_tokens":100,"cache_read_input_tokens":900000}}}
+{"type":"assistant","timestamp":"@T5@","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1000,"output_tokens":500,"cache_creation_input_tokens":100,"cache_read_input_tokens":800000}}}
+{"type":"assistant","timestamp":"@T4@","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1000,"output_tokens":500,"cache_creation_input_tokens":100,"cache_read_input_tokens":700000}}}
+{"type":"assistant","timestamp":"@T3@","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1000,"output_tokens":500,"cache_creation_input_tokens":100,"cache_read_input_tokens":600000}}}
+{"type":"assistant","timestamp":"@T2@","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1000,"output_tokens":500,"cache_creation_input_tokens":100,"cache_read_input_tokens":500000}}}
+{"type":"assistant","timestamp":"@T1@","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1000,"output_tokens":500,"cache_creation_input_tokens":100,"cache_read_input_tokens":400000}}}
+{"type":"assistant","timestamp":"@T0@","message":{"model":"claude-opus-4-8","usage":{"input_tokens":1000,"output_tokens":500,"cache_creation_input_tokens":100,"cache_read_input_tokens":900000}}}
+{"type":"user","timestamp":"@T0@","message":{"role":"user","content":"decoy prompt text that must never appear anywhere"}}

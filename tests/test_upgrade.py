@@ -38,6 +38,10 @@ from test_darwin_install import INSTALL, FakeDarwin  # noqa: E402
 from test_host_platform import UID, recorder  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# the checkout's own VERSION (the tests copy it into their temp repos)
+with open(os.path.join(REPO, "VERSION")) as _vf:
+    REPO_VERSION = _vf.read().strip()
+
 sys.path.insert(0, os.path.join(REPO, "bin"))
 import tendril_host as th  # noqa: E402
 import tendril_upgrade as tu  # noqa: E402
@@ -46,9 +50,20 @@ MODULE = os.path.join(REPO, "bin", "tendril_upgrade.py")
 REMOTE_AGENTS = os.path.join(REPO, "bin", "remote-agents")
 UNIT_SRC = os.path.join(REPO, "systemd", th.UNIT)
 
-BIN_FILES = ("remote-agents", "herdr-notify", "tendril_link.py",
-             "tendril_host.py", "herdr-bindings.py", "tendril_upgrade.py",
-             "tendril_phone.py")
+# the ONE runtime manifest (§7.4): the seeded tree carries exactly the
+# files ./install keeps in sync, so the upgrade copy loop is exercised
+# against every real module
+def _runtime_files():
+    out = []
+    with open(os.path.join(REPO, "bin", "runtime-files.txt")) as f:
+        for ln in f:
+            ln = ln.strip()
+            if ln and not ln.startswith("#"):
+                out.append(ln)
+    return tuple(out)
+
+
+BIN_FILES = _runtime_files()
 PHONE_FILES = ("tendril", "termux-url-opener", "agent")
 
 CUSTOM_NOTIFY = (b"NTFY_URL=https://ntfy.example\n"
@@ -120,8 +135,8 @@ def git_ok(args, cwd=None):
 
 
 def seed_tree(work):
-    """A minimal but REAL tendril tree: the actual scripts, installer and
-    assets from this checkout."""
+    """A minimal but REAL tendril tree: the actual scripts, installer,
+    runtime manifest and assets from this checkout."""
     for sub, names in (("bin", BIN_FILES),
                        ("phone", PHONE_FILES),
                        ("systemd", (th.UNIT,))):
@@ -129,6 +144,9 @@ def seed_tree(work):
         for name in names:
             shutil.copy2(os.path.join(REPO, sub, name),
                          os.path.join(work, sub, name))
+    # the installer reads bin/runtime-files.txt to know what to copy
+    shutil.copy2(os.path.join(REPO, "bin", "runtime-files.txt"),
+                 os.path.join(work, "bin", "runtime-files.txt"))
     shutil.copy2(os.path.join(REPO, "install"), os.path.join(work, "install"))
     shutil.copy2(os.path.join(REPO, "VERSION"), os.path.join(work, "VERSION"))
 
@@ -171,6 +189,14 @@ def sha(path):
 def read_file(path, mode="r"):
     with open(path, mode) as f:
         return f.read()
+
+
+def without_herdr_lines(config_bytes):
+    """Config bytes minus the recorded Herdr keys — the only lines
+    ./install --upgrade may rewrite (§7.4 record)."""
+    return b"".join(ln for ln in config_bytes.splitlines(keepends=True)
+                    if not ln.startswith((b"HERDR_BIN=", b"HERDR_VERSION=",
+                                          b"HERDR_REALPATH=")))
 
 
 class UpgradeEnv(unittest.TestCase):
@@ -317,8 +343,8 @@ class VersionResolution(unittest.TestCase):
 
     def test_version_file_until_tagged(self):
         work, _ = make_checkout(self.tmp)          # VERSION file, no tags
-        self.assertEqual(tu.resolve_version(work), "0.2.0-dev")
-        self.assertTrue(tu.version_line(work).startswith("tendril 0.2.0-dev"))
+        self.assertEqual(tu.resolve_version(work), REPO_VERSION)
+        self.assertTrue(tu.version_line(work).startswith("tendril " + REPO_VERSION))
 
     def test_exact_tag_overrides(self):
         work, _ = make_checkout(self.tmp)
@@ -521,7 +547,7 @@ class FullUpgradeLaunchd(UpgradeEnv):
         self.assertEqual(doc["commit"], new_head)
         self.assertEqual(doc["phone"]["tendril"],
                          sha(os.path.join(self.work, "phone", "tendril")))
-        self.assertEqual(doc["version"], "0.2.0-dev")
+        self.assertEqual(doc["version"], REPO_VERSION)
         # watcher: herdr-notify changed -> exactly one restart cycle
         counts = self.verb_counts(self.launchctl())
         self.assertEqual(counts.get("bootout"), 1)
@@ -537,17 +563,22 @@ class FullUpgradeLaunchd(UpgradeEnv):
             "ssh tendril-test remote-agents --phone-script upgrade "
             "> $PREFIX/tmp/tu.sh && sh $PREFIX/tmp/tu.sh", out)
         self.assertNotIn("scp", out)
-        # config + notify.env byte-identical, PATH block exactly once
+        # config preserved outside the recorded HERDR_* lines (§7.4);
+        # notify.env byte-identical; PATH block exactly once
         conf = os.path.join(self.home, ".config", "remote-agents")
+        conf_after = read_file(os.path.join(conf, "config"), "rb")
+        self.assertEqual(without_herdr_lines(conf_after),
+                         without_herdr_lines(CUSTOM_CONFIG))
+        self.assertIn(b"HERDR_BIN=", conf_after)     # re-recorded (§7.4)
+        self.assertRegex(conf_after.decode(),
+                         r"HERDR_VERSION=0\.9\.3\n")
         self.assertEqual(read_file(os.path.join(conf, "notify.env"), "rb"),
                          CUSTOM_NOTIFY)
-        self.assertEqual(read_file(os.path.join(conf, "config"), "rb"),
-                         CUSTOM_CONFIG)
         profile = read_file(os.path.join(self.home, ".profile"))
         self.assertEqual(profile.count("# >>> tendril remote PATH"), 1)
         self.assert_block(out, host="updated", watcher="restarted",
                           android="client refresh recommended")
-        self.assertIn("  version     0.2.0-dev", out)
+        self.assertIn("  version     " + REPO_VERSION, out)
 
     def test_already_current_runs_health_check_and_changes_nothing(self):
         first = self.run_installer_directly()
@@ -884,8 +915,12 @@ class InstallerUpgradeMode(FakeDarwin):
             self.assertEqual(body.count("# >>> tendril remote PATH"), 1, rc)
         self.assertEqual(read_file(self.conf_path("notify.env"), "rb"),
                          CUSTOM_NOTIFY)
-        self.assertEqual(read_file(self.conf_path("config"), "rb"),
-                         CUSTOM_CONFIG)
+        conf_after = read_file(self.conf_path("config"), "rb")
+        # every non-Herdr line preserved (§7.4: the recorded binary lines
+        # are the only sanctioned config change in an upgrade)
+        self.assertEqual(without_herdr_lines(conf_after),
+                         without_herdr_lines(CUSTOM_CONFIG))
+        self.assertIn(b"HERDR_BIN=", conf_after)
         # nothing changed on repeats: no restart actions, no plist churn
         restarts = [c for c in self.launchctl_calls()[len(before):]
                     if c.startswith(("bootout", "bootstrap"))]
@@ -994,12 +1029,12 @@ class Interface(unittest.TestCase):
     def test_version_from_checkout(self):
         p = self.run_cli(REMOTE_AGENTS, "--version")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertTrue(p.stdout.startswith("tendril 0.2.0-dev"), p.stdout)
+        self.assertTrue(p.stdout.startswith("tendril " + REPO_VERSION), p.stdout)
 
     def test_module_version_subcommand(self):
         p = self.run_cli(MODULE, "version")
         self.assertEqual(p.returncode, 0)
-        self.assertTrue(p.stdout.startswith("tendril 0.2.0-dev"))
+        self.assertTrue(p.stdout.startswith("tendril " + REPO_VERSION))
 
     def test_help_lists_upgrade_and_version(self):
         p = self.run_cli(REMOTE_AGENTS, "--help")

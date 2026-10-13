@@ -178,7 +178,11 @@ class PhoneEnv(unittest.TestCase):
             return p
         return p.returncode, p.stdout.decode(), p.stderr.decode()
 
-    def run_generated(self, kind, stdin="", **env_over):
+    def run_generated(self, kind, stdin="", tty=False, **env_over):
+        """Run the generated script under sh. tty=True gives it a REAL
+        terminal on stdin (the user typing `tendril --upgrade` in Termux),
+        with [stdin] pre-typed; tty=False is a pipe (the Link app's
+        background RUN_COMMAND) — the script must never prompt there."""
         script = self.call_tp(tp.phone_script, kind)
         self.assertTrue(script)
         path = os.path.join(self.tmp, "generated-%s.sh" % kind)
@@ -188,9 +192,21 @@ class PhoneEnv(unittest.TestCase):
         # setup runs see a brand-new phone: no alias anywhere
         env_over.setdefault("TENDRIL_ALIAS", "stubhost" if kind == "upgrade"
                             else "")
-        return subprocess.run(["sh", path], input=stdin, text=True,
-                              capture_output=True, env=self.env(**env_over),
-                              timeout=120)
+        if not tty:
+            return subprocess.run(["sh", path], input=stdin, text=True,
+                                  capture_output=True,
+                                  env=self.env(**env_over), timeout=120)
+        import pty
+        master, slave = pty.openpty()
+        try:
+            if stdin:
+                os.write(master, stdin.encode())
+            return subprocess.run(["sh", path], stdin=slave, text=True,
+                                  capture_output=True,
+                                  env=self.env(**env_over), timeout=120)
+        finally:
+            os.close(slave)
+            os.close(master)
 
     def log_lines(self, path):
         try:
@@ -675,7 +691,8 @@ class UpgradeScriptRun(PhoneEnv):
         # Android 11+ package visibility: cmd usually answers nothing, so
         # the recorded sha (written after the user presses Enter) decides
         self.fresh_phone(recorded=False)
-        p = self.run_generated("upgrade", stdin="\n", TENDRIL_FAKE_VC="")
+        p = self.run_generated("upgrade", stdin="\n", tty=True,
+                               TENDRIL_FAKE_VC="")
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
         apk = os.path.join(self.home, ".cache", "tendril",
@@ -703,9 +720,82 @@ class UpgradeScriptRun(PhoneEnv):
         self.assertEqual(self.log_lines(self.reload_log),
                          ["termux-reload-settings"])
 
+    # ---- HEADLESS: the Link app's background RUN_COMMAND (stdin = pipe) ----
+
+    def test_headless_parks_the_verified_apk_and_hands_off_to_the_app(self):
+        # Physical S21 failure (build 158): from the app the script ran
+        # termux-open from the background (Android suppresses the activity
+        # start) and then blocked on `read`. Headless now: verify, park,
+        # print the handoff, exit — no installer from Termux, no prompt.
+        doc = self.fresh_phone(recorded=False)
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, out)
+        apk = os.path.join(self.home, ".cache", "tendril",
+                           "tendril-link-0.2.0.apk")
+        with open(apk, "rb") as f:
+            self.assertEqual(f.read(), APK_BYTES)
+        self.assertEqual(self.log_lines(self.open_log), [])      # no termux-open
+        self.assertNotIn("Tap Update", out)                       # no prompt
+        self.assertNotIn("opening Android installer", out)
+        self.assertIn("  TENDRIL Link   update ready", p.stdout)
+        self.assertIn("  APK saved: %s" % apk, p.stdout)
+        self.assertIn("  APK verified: %d %s %d %s" % (
+            doc["versionCode"], doc["sha256"], doc["size"],
+            doc["signer_sha256"]), p.stdout)
+        self.assertIn("  handoff: app", p.stdout)
+        # nothing recorded: only a confirmed install may record the sha
+        self.assertFalse(os.path.exists(os.path.join(
+            self.home, ".config", "tendril", "link-apk.sha256")))
+
+    def test_headless_exits_while_stdin_is_held_open_like_termux_appshell(self):
+        # Termux AppShell keeps a background command's stdin OPEN until the
+        # process exits; a `read` anywhere would hang until the app's
+        # deadline. The run must finish with stdin never closed.
+        self.fresh_phone(recorded=False)
+        script = self.call_tp(tp.phone_script, "upgrade")
+        path = os.path.join(self.tmp, "generated-held.sh")
+        with open(path, "w") as f:
+            f.write(script)
+        proc = subprocess.Popen(
+            ["sh", path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+            env=self.env(TENDRIL_ALIAS="stubhost", TENDRIL_FAKE_VC=""))
+        try:
+            rc = proc.wait(timeout=60)                # stdin still open
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            self.fail("the headless upgrade blocked with stdin held open")
+        finally:
+            proc.stdin.close()
+        out = proc.stdout.read()
+        proc.stdout.close()
+        proc.stderr.close()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("  handoff: app", out)
+
+    def test_headless_current_phone_downloads_nothing(self):
+        self.fresh_phone(recorded=False)
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="42")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn("  TENDRIL Link   current", p.stdout)
+        self.assertNotIn("handoff", p.stdout)
+        self.assertNotIn("APK saved", p.stdout)
+
+    def test_headless_corrupt_download_refuses_without_handoff(self):
+        self.fresh_phone(recorded=False)
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="",
+                               TENDRIL_CORRUPT="link-apk")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn("  TENDRIL Link   download failed", p.stdout)
+        self.assertNotIn("handoff", out)
+        self.assertNotIn("APK verified", out)
+
     def test_staged_apk_visible_but_still_old_is_not_recorded(self):
         self.fresh_phone(recorded=False)
-        p = self.run_generated("upgrade", stdin="\n", TENDRIL_FAKE_VC="5")
+        p = self.run_generated("upgrade", stdin="\n", tty=True,
+                               TENDRIL_FAKE_VC="5")
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
         self.assertIn("not installed yet - run  tendril --upgrade  again",
@@ -716,8 +806,8 @@ class UpgradeScriptRun(PhoneEnv):
 
     def test_staged_apk_versioncode_verified_after_enter(self):
         self.fresh_phone(recorded=False)
-        p = self.run_generated("upgrade", stdin="\n", TENDRIL_FAKE_VC="5",
-                               TENDRIL_FAKE_VC2="42")
+        p = self.run_generated("upgrade", stdin="\n", tty=True,
+                               TENDRIL_FAKE_VC="5", TENDRIL_FAKE_VC2="42")
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
         self.assertIn("recorded (versionCode 42 installed)", p.stdout)
@@ -741,8 +831,8 @@ class UpgradeScriptRun(PhoneEnv):
         os.remove(os.path.join(self.home, ".config", "tendril",
                                "link-apk.sha256"))          # force pending
         os.remove(self.vc_file)                  # fresh cmd call counter
-        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="5",
-                               TENDRIL_FAKE_VC2="42")
+        p = self.run_generated("upgrade", stdin="\n", tty=True,
+                               TENDRIL_FAKE_VC="5", TENDRIL_FAKE_VC2="42")
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
         with open(props) as f:
@@ -853,7 +943,8 @@ class SetupScriptRun(PhoneEnv):
         # a brand-new phone gets TENDRIL Link from the same verified path
         self.host_ready()
         self.stage()
-        p = self.run_generated("setup", stdin="\n", TENDRIL_FAKE_VC="")
+        p = self.run_generated("setup", stdin="\n", tty=True,
+                               TENDRIL_FAKE_VC="")
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
         self.assertIn("  TENDRIL Link   update ready", p.stdout)

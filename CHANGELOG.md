@@ -2,7 +2,54 @@
 
 All notable changes to TENDRIL are documented here.
 
-## Unreleased
+## v0.2.0 — the handheld control plane (2026-10-13)
+
+TENDRIL Link becomes a full Android control surface and the host grows the
+control-plane pieces it needs. Physically certified end to end on a Galaxy
+S21 Ultra (F-Droid Termux) against a Linux host.
+
+Highlights:
+
+- **TENDRIL Link** (Android companion): HOME, LIVE (agents, sessions,
+  subagents, topology), CAPACITY, SCHEDULE, session detail (context,
+  output, cost), NEEDS YOU, diagnostics, QR / paste pairing, and an
+  ntfy notification bridge. Phone → host only through fixed verbs over
+  Termux RUN_COMMAND + SSH ([docs/LINK-CONTRACT-0.2.md](docs/LINK-CONTRACT-0.2.md)).
+- **Live snapshot v3** (`tendril snapshot`): workspaces, agents, subagent
+  provenance, capabilities and an etag for cheap freshness polling.
+- **Scheduler** (`tendril schedule …`, `tendril-schedule.timer`): tasks
+  for new or existing sessions with `at`, `on_reset` and
+  `when_available` triggers; host-authoritative, crash-safe (a task that
+  was running during a crash is marked interrupted, never relaunched).
+- **Capacity** (`tendril capacity …`): local transcript adapters for
+  Claude Code, Codex and Pi (no network), plus opt-in usage adapters for
+  Claude, Codex and Z.AI; session/weekly windows, resets, pressure, spend.
+- **Herdr health and recovery**: `tendril health --json`, a guardian timer
+  that notifies once per outage and never restarts Herdr itself, the
+  verified `tendril herdr restart` revive, and an intentional-stop guard
+  (`tendril herdr stop|start`).
+- **Session titles**: `tendril rename-session`, native Claude Code / Pi
+  title resolution, and `tendril titles backfill`.
+- **Selector**: `L` returns to TENDRIL Link over both SSH and Mosh (a
+  per-launch, consume-once request — mosh drops exit statuses).
+- **App updates from the app**: the host stages signed, pinned builds
+  (`tendril --link-stage`); Link discovers them automatically, remembers
+  them across failed checks, and installs through `tendril --upgrade` →
+  in-app re-verification → Android's installer (confirmation always
+  stays). Headless `--upgrade` never prompts.
+- **Portability fixes found by clean CI runners**: the installer's
+  service PATH de-duplication now matches; the phone launcher's local
+  schedule-target and hex-id checks now run on older coreutils and on
+  macOS bash 3.2 (the host always re-validated); telemetry and session
+  titles work when `$HOME` sits behind a symlink (macOS `/private/var`,
+  Silverblue `/var/home`). The suite no longer depends on the developer
+  machine's Herdr, harnesses or tool layout.
+- **Security model** moved to the root [SECURITY.md](SECURITY.md) and
+  extended for TENDRIL Link, pairing codes, updates and capacity
+  credentials.
+
+Earlier in the 0.2 cycle:
+
 
 - Android real-device certification (Samsung Galaxy S21 Ultra, F-Droid Termux
   0.118, TENDRIL Link full integration): ntfy notification tap → TENDRIL Link →

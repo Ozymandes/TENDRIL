@@ -44,6 +44,28 @@ if [ -f "$UNIT" ] || [ -f "$PLIST" ]; then
     fi
 fi
 
+# the scheduler timer units (contract §3): stop the 30 s tick before the
+# binaries it calls go away
+SCHED_UNIT="$HOME/.config/systemd/user/tendril-schedule.service"
+SCHED_TIMER="$HOME/.config/systemd/user/tendril-schedule.timer"
+if [ -f "$SCHED_TIMER" ] || [ -f "$SCHED_UNIT" ]; then
+    systemctl --user disable --now tendril-schedule.timer 2>/dev/null
+    rm -f "$SCHED_TIMER" "$SCHED_UNIT"
+    systemctl --user daemon-reload 2>/dev/null
+    say "removed: tendril-schedule.timer + .service (scheduler disabled)"
+fi
+
+# the guardian timer units (contract §6): stop the 30 s tick before the
+# binaries it calls go away
+GUARD_UNIT="$HOME/.config/systemd/user/tendril-guardian.service"
+GUARD_TIMER="$HOME/.config/systemd/user/tendril-guardian.timer"
+if [ -f "$GUARD_TIMER" ] || [ -f "$GUARD_UNIT" ]; then
+    systemctl --user disable --now tendril-guardian.timer 2>/dev/null
+    rm -f "$GUARD_TIMER" "$GUARD_UNIT"
+    systemctl --user daemon-reload 2>/dev/null
+    say "removed: tendril-guardian.timer + .service (guardian disabled)"
+fi
+
 # client launchers installed by ./install --client (recognised by their header)
 for f in tendril tendril-remote; do
     if [ -f "$BIN_DIR/$f" ] && [ ! -L "$BIN_DIR/$f" ] \
@@ -64,12 +86,31 @@ if [ -L "$BIN_DIR/tendril" ] && [ "$(readlink "$BIN_DIR/tendril")" = "remote-age
     say "removed: $BIN_DIR/tendril"
 fi
 
-for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py; do
-    if [ -f "$BIN_DIR/$f" ]; then
-        rm -f "$BIN_DIR/$f"
-        say "removed: $BIN_DIR/$f"
-    fi
-done
+# the runtime files: ONE manifest shared with ./install (§7.4) — the old
+# hardcoded list silently left newer modules (tendril_capacity.py & co)
+# behind. A missing checkout degrades to the historical list.
+if [ -f "$PKG_DIR/bin/runtime-files.txt" ]; then
+    while IFS= read -r f; do
+        case $f in '' | \#*) continue ;; esac
+        if [ -f "$BIN_DIR/$f" ]; then
+            rm -f "$BIN_DIR/$f"
+            say "removed: $BIN_DIR/$f"
+        fi
+    done < "$PKG_DIR/bin/runtime-files.txt"
+else
+    for f in remote-agents herdr-notify tendril_link.py tendril_host.py herdr-bindings.py; do
+        if [ -f "$BIN_DIR/$f" ]; then
+            rm -f "$BIN_DIR/$f"
+            say "removed: $BIN_DIR/$f"
+        fi
+    done
+fi
+
+# the Pi session auto-titler extension (§11) — one file we installed
+if [ -f "$HOME/.pi/agent/extensions/tendril-session-title.ts" ]; then
+    rm -f "$HOME/.pi/agent/extensions/tendril-session-title.ts"
+    say "removed: ~/.pi/agent/extensions/tendril-session-title.ts"
+fi
 
 # bin timestamped backups created by the installer are leftovers too
 ls "$BIN_DIR"/remote-agents.bak.* "$BIN_DIR"/herdr-notify.bak.* >/dev/null 2>&1 \

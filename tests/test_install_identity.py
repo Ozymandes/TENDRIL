@@ -274,7 +274,17 @@ class UpgradePreservesIdentity(IdentityDarwin):
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
         with open(config_path(self)) as f:
-            self.assertEqual(f.read(), body)      # byte-identical
+            after = f.read()
+        # every identity line byte-identical; the §7.4 record is the one
+        # sanctioned change (HERDR_BIN/HERDR_VERSION re-recorded in place)
+        herdr_lines = ("HERDR_BIN=", "HERDR_VERSION=", "HERDR_REALPATH=")
+        self.assertEqual(
+            [ln for ln in after.splitlines()
+             if not ln.startswith(herdr_lines)],
+            [ln for ln in body.splitlines()
+             if not ln.startswith(herdr_lines)])
+        self.assertIn("HERDR_BIN=/", after)
+        self.assertIn("HERDR_VERSION=", after)
         with open(notify) as f:
             self.assertEqual(f.read(),
                              "NTFY_URL=https://ntfy.sh\n"

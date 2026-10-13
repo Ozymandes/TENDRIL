@@ -1,0 +1,22 @@
+# TENDRIL runtime files — the ONE manifest (LINK-CONTRACT-0.2 §7.4).
+#
+# Every file the installer keeps in ~/.local/bin next to remote-agents.
+# Consumed by ./install (fresh + --upgrade copy loops), ./uninstall
+# (removal loop) and tests/test_runtime_files.py (which scans bin/ for
+# every module remote-agents and herdr-notify import or reference and
+# asserts the manifest is complete). One name per line; blank lines and
+# #-comments ignored. Add a runtime file HERE or the installed tree goes
+# stale (this is how tendril_capacity.py went missing in 0.2.0-rc1).
+remote-agents
+herdr-notify
+herdr-bindings.py
+tendril_herdr.py
+tendril_link.py
+tendril_host.py
+tendril_upgrade.py
+tendril_phone.py
+tendril_telemetry.py
+tendril_schedule.py
+tendril_capacity.py
+tendril_health.py
+tendril_titles.py

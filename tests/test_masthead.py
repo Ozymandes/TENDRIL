@@ -127,13 +127,13 @@ class Selector(unittest.TestCase):
         bottom = next(i for i, line in enumerate(lines) if line.startswith("\u2514"))
         return [line[2:-1].rstrip() for line in lines[dividers[-1] + 1:bottom]]
 
-    def test_footer_has_exactly_the_five_supported_actions(self):
+    def test_footer_lists_the_interactive_actions_including_link(self):
         wide = frame(self.new, 48, 50, 0)
         narrow = frame(self.new, 34, 50, 0)
         self.assertEqual(self.footer_items(wide), [
-            "N New   I Info   ? Help   R Refresh   Q Quit"])
+            "N New   I Info   R Refresh   Q Quit   L Link"])
         self.assertEqual(self.footer_items(narrow), [
-            "N New   I Info   ? Help", "R Refresh   Q Quit"])
+            "N New   I Info   R Refresh", "Q Quit   L Link"])
         for text in (wide, narrow):
             for removed in ("P Project", "S Shell", "L Last", "T TestPush"):
                 self.assertNotIn(removed, text)
@@ -413,6 +413,9 @@ class Launcher(unittest.TestCase):
         r = subprocess.run(["sh", os.path.join(self.home_bin, name), *args],
                            capture_output=True, text=True, env=e, timeout=20)
         calls = read(self.log, "r") if os.path.exists(self.log) else ""
+        # the per-launch link-open nonce is random by design
+        calls = re.sub(r"(TENDRIL_LINK_NONCE=|--link-open-request )[0-9a-f]{16}",
+                       r"\1<nonce>", calls)
         return r.returncode, calls, r.stdout
 
     def test_agent_alias_runs_exactly_what_tendril_runs(self):
@@ -427,7 +430,9 @@ class Launcher(unittest.TestCase):
 
     def test_tendril_alias_wins_over_legacy_agent_alias(self):
         _, calls, _ = self.launch("tendril", TENDRIL_ALIAS="new", AGENT_ALIAS="old")
-        self.assertIn("mosh new", calls)
+        # RC2: the mosh dial carries the shared ControlMaster bootstrap
+        self.assertIn("mosh --ssh=", calls)
+        self.assertIn(" new -- sh -lc ", calls)
         self.assertNotIn("old", calls)
 
     def test_missing_alias_prints_usage(self):

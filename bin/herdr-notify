@@ -29,6 +29,10 @@ from urllib.parse import quote
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import tendril_link  # canonical deep-link payloads; lives next to this file
+try:
+    import tendril_herdr   # the ONE §7.4 herdr resolver (recorded → env → detect)
+except ImportError:        # stale install: keep polling with the plain fallback
+    tendril_herdr = None
 
 # ---------- portable configuration + Herdr client detection ----------
 CONFIG_SEARCH = [
@@ -54,87 +58,40 @@ def load_config():
 CONFIG = load_config()
 
 
-def _herdr_candidates():
-    out = []
-    override = CONFIG.get("HERDR_BIN") or os.environ.get("HERDR_BIN")
-    if override:
-        out.append(os.path.expanduser(override))
+def _stale_herdr():              # no resolver module installed: first runnable
+    for cand in (CONFIG.get("HERDR_BIN"), os.environ.get("HERDR_BIN")):
+        cand = os.path.expanduser(cand or "")
+        if cand and os.path.isfile(cand) and os.access(cand, os.X_OK):
+            return cand
     found = shutil.which("herdr")
     if found:
-        out.append(found)
-    # install.sh (~/.local/bin) and Homebrew locations: launchd/systemd PATHs omit them
+        return found
     for d in ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin"):
         p = os.path.join(os.path.expanduser(d), "herdr")
-        if os.path.isfile(p):
-            out.append(p)
-    mise = os.path.expanduser("~/.local/share/mise/installs/herdr")
-    latest = os.path.join(mise, "latest", "herdr")
-    if os.path.isfile(latest):
-        out.append(latest)
-    if os.path.isdir(mise):
-        versions = []
-        for name in os.listdir(mise):
-            p = os.path.join(mise, name, "herdr")
-            if os.path.isfile(p):
-                versions.append((name, p))
-        versions.sort(key=lambda t: [int(x) if x.isdigit() else 0
-                                     for x in t[0].split(".")], reverse=True)
-        out += [p for _, p in versions]
-    seen, uniq = set(), []
-    for cand in out:
-        real = os.path.realpath(cand)
-        if real not in seen:
-            seen.add(real)
-            uniq.append(cand)
-    return uniq
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
 
 
-HERDR_VERDICTS = []
-
-
-def herdr_probe(path):
+if tendril_herdr is not None:
     try:
-        v = subprocess.run([path, "--version"], capture_output=True,
-                           text=True, timeout=6)
-        version = (v.stdout or v.stderr).strip() or "(no version output)"
-    except subprocess.TimeoutExpired:
-        return False, "no answer to --version (timeout)"
-    except OSError as e:
-        return False, f"not runnable: {e}"
-    try:
-        s = subprocess.run([path, "status"], capture_output=True,
-                           text=True, timeout=8)
-        txt = (s.stdout or "") + (s.stderr or "")
-    except subprocess.TimeoutExpired:
-        return False, f"{version}; status timed out"
-    except OSError as e:
-        return False, f"{version}; status failed: {e}"
-    running = re.search(r"status:\s*running", txt)
-    compatible = (re.search(r"endpoint_compatible:\s*yes", txt)
-                  or re.search(r"private_protocol_compatible:\s*yes", txt))
-    if running and compatible:
-        return True, f"{version} (protocol-compatible with running server)"
-    if running:
-        return False, f"{version} (INCOMPATIBLE with running server)"
-    return True, f"{version} (no running server detected)"
-
-
-def detect_herdr():
-    picked = None
-    for cand in _herdr_candidates():
-        ok, detail = herdr_probe(cand)
-        HERDR_VERDICTS.append((cand, ok, detail))
-        if ok:
-            picked = cand
-            break
-    return picked
-
-
-HERDR = detect_herdr()
+        HERDR = tendril_herdr.resolve(config=CONFIG,
+                                      env=os.environ)["bin"]
+    except Exception:              # the watcher must never die on resolve
+        HERDR = None
+else:
+    HERDR = _stale_herdr()
 ENV_FILE = (os.environ.get("NOTIFY_ENV")
             or os.path.expanduser("~/.config/remote-agents/notify.env"))
-POLL_SECONDS = 8
+POLL_SECONDS = 2   # D11: faster LOCAL detection (herdr api snapshot is a
+                   # local socket call, ~6 ms — no network traffic). Real
+                   # alerts (needs input / finished / nudge) are detected
+                   # within ≤ 2 s instead of ≤ 8 s; publish VOLUME is
+                   # unchanged (transition-driven, MIN_REPEAT still 90 s).
+                   # NTFY_SYNC=1 pushes ride this too, but SYNC is opt-in
+                   # (self-hosted ntfy only — never for public ntfy.sh).
 MIN_REPEAT = 90  # min seconds between pushes for the same pane
+SYNC_MIN_INTERVAL = 4  # min seconds between TENDRIL · SYNC pushes
 NUDGE_DEFAULT_MINUTES = 45  # "still working" nudge threshold (0 disables)
 MAX_TITLE_LABEL = 60        # title label cap (… suffix past this)
 MAX_CWD_CHARS = 28          # keep short cwds whole, else last two components
@@ -423,7 +380,75 @@ def push(state, pid, agent, cls, workspaces, cfg, allow_push, now,
         log(f"WARN push failed for {title}: {e}")
 
 
-def poll(state, cfg, allow_push):
+# ---------- D11 freshness: the TENDRIL · SYNC invalidation event ----------
+
+# Parent-level state changes (working/idle/done/blocked, agents appearing
+# or vanishing) CAN be pushed as a MIN-priority ntfy message the phone
+# never surfaces: its receiver answers with one debounced snapshot refresh
+# (§7.6). OFF BY DEFAULT: this host typically publishes to the public
+# ntfy.sh, whose anonymous per-visitor daily quota (~250 msgs) a busy
+# workspace's state flaps would exhaust within the hour — 429-rejecting
+# the REAL needs-you/finished alerts. The app's fast 2 s foreground
+# cadence already covers LIVE freshness without any publish. Only enable
+# SYNC deliberately, and ONLY against a SELF-HOSTED ntfy server
+# (NTFY_URL=https://<your-ntfy> in notify.env + NTFY_SYNC=1).
+
+def sync_enabled(cfg):
+    """SYNC is opt-in: NTFY_SYNC=1 (or true/yes/on) enables it. Default
+    OFF — the public ntfy.sh quota is reserved for the real alerts."""
+    return str(cfg.get("NTFY_SYNC", "0")).strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def sync_digest(snap):
+    """Order-independent signature of herdr-visible parent state: one
+    (pane_id, status) row per agent. No labels, no cwd — the digest itself
+    never leaves the host; only the fact of a change does."""
+    rows = [(str(a.get("pane_id") or ""), str(a.get("agent_status") or ""))
+            for a in snap.get("agents", [])]
+    return tuple(sorted(rows))
+
+
+def send_sync(cfg, now, sync):
+    """One TENDRIL · SYNC push; stamps the bookkeeping on success only, so
+    a failed send stays pending and the next poll retries."""
+    try:
+        send(cfg, "TENDRIL · SYNC", "state changed", "min",
+             "arrows_clockwise")
+        sync["last"] = now
+        sync["pending"] = False
+        log("SYNC push")
+    except Exception as e:  # a failed sync must never kill the watcher
+        sync["pending"] = True
+        log(f"WARN sync push failed: {e}")
+
+
+def maybe_sync(sig, cfg, allow_push, now, sync):
+    """Track the digest across polls; push at most one SYNC per
+    [SYNC_MIN_INTERVAL] — and ONLY when the host explicitly opted in
+    (NTFY_SYNC=1, self-hosted ntfy). With the default config this is a
+    pure no-op: a burst of parent-state changes produces ZERO publishes
+    beyond the pre-existing finished/input/nudge alert set. Never raises."""
+    if not (allow_push and configured(cfg) and sync_enabled(cfg)):
+        sync["sig"] = sig
+        sync["pending"] = False
+        return
+    if sig == sync.get("sig"):
+        if sync.get("pending") \
+                and now - sync.get("last", 0.0) >= SYNC_MIN_INTERVAL:
+            send_sync(cfg, now, sync)
+        return
+    first = sync.get("sig") is None
+    sync["sig"] = sig
+    if first:
+        return                   # baseline: never push on the first sighting
+    if now - sync.get("last", 0.0) >= SYNC_MIN_INTERVAL:
+        send_sync(cfg, now, sync)
+    else:
+        sync["pending"] = True
+
+
+def poll(state, cfg, allow_push, sync=None):
     """One poll cycle. Returns True on success, False when snapshot failed.
 
     State is pane_id -> (status, status_since, last_push). The still-working
@@ -473,6 +498,8 @@ def poll(state, cfg, allow_push):
     for pid in list(state):
         if pid not in seen:
             del state[pid]  # pane/agent gone; silent by design
+    if sync is not None:
+        maybe_sync(sync_digest(snap), cfg, allow_push, now, sync)
     return True
 
 
@@ -482,16 +509,21 @@ def watch():
         log(f"push NOT CONFIGURED - transitions will only be logged. "
             f"Create {ENV_FILE} (see notify.env.example).")
     state = {}
+    sync = {"sig": None, "last": 0.0, "pending": False}
     gap = False  # first failed poll must not hit an unbound local
     while True:
         sd_notify("WATCHDOG=1")  # feed systemd watchdog every cycle
-        if poll(state, cfg, allow_push=True):
+        if poll(state, cfg, allow_push=True, sync=sync):
             gap = False
         else:
             if not gap:
                 log("WARN herdr snapshot unreachable; will re-baseline on recovery")
             gap = True
             state.clear()  # re-baseline after outage: no stale notification storm
+            # the digest re-baselines too: an outage breaks continuity, so
+            # the first poll after recovery must never SYNC on stale deltas
+            sync["sig"] = None
+            sync["pending"] = False
         time.sleep(POLL_SECONDS)
 
 

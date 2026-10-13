@@ -15,6 +15,10 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CLI = os.path.join(REPO, "bin", "remote-agents")
 LAUNCHER = os.path.join(REPO, "phone", "tendril")
 
+# RC2 connection reuse (mirrors phone/tendril): see tests/test_phone_verbs.py.
+CM = "-o ControlMaster=auto -o ControlPath=~/.ssh/tendril-cm-%C"
+SESSION_CM = CM + " -o ConnectionAttempts=1 -o ConnectTimeout=6"
+
 sys.path.insert(0, os.path.join(REPO, "bin"))
 import tendril_link as tl  # noqa: E402
 
@@ -262,8 +266,10 @@ class SnapshotShape(unittest.TestCase):
                 return 0, json.dumps(self.SNAPSHOT), ""
             return 0, "status: running\n", ""
         with mock.patch.object(ra, "HOST_LABEL", "testhost"), \
+                mock.patch.object(ra, "HERDR", "/fake/herdr"), \
                 mock.patch.object(ra, "run", fake_run):
             # no snapshot() patch: the real envelope parsing must produce rows
+            # (HERDR patched: CI runners have no herdr binary to resolve)
             rows = ra.collect()
             by_id = {r["id"]: r for r in rows}
             self.assertEqual(by_id["w15"]["label"], "tendril")
@@ -341,14 +347,21 @@ class PhoneLauncher(unittest.TestCase):
                               capture_output=True, text=True, timeout=60)
 
     def test_no_args_opens_the_selector_via_mosh(self):
+        # RC2 fast path: exactly ONE interactive transport invocation — the
+        # old synchronous `ssh … true` preflight is gone from the healthy
+        # path. After the session ends, ONE BatchMode ssh consumes the
+        # selector's L flag (mosh drops exit statuses) — and opens nothing
+        # when the host answers silence.
         p = self.run_launcher([])
         self.assertEqual(p.returncode, 0)
-        self.assertTrue(any(c.startswith("ssh -o ConnectTimeout=5") for c in self.calls()))
         mosh = [c for c in self.calls() if c.startswith("mosh ")]
         self.assertEqual(len(mosh), 1)
         self.assertIn("testhost", mosh[0])
         self.assertNotIn("attach", mosh[0])
         self.assertTrue(any(c.rstrip() == "remote-agents" for c in self.calls()))
+        ssh_calls = [c for c in self.calls() if c.startswith("ssh ")]
+        self.assertEqual(len(ssh_calls), 1)
+        self.assertIn("--link-open-request", ssh_calls[0])
 
     def test_attach_uses_default_alias_and_quotes_the_id(self):
         p = self.run_launcher(["attach", "w15"])
@@ -365,8 +378,10 @@ class PhoneLauncher(unittest.TestCase):
         mosh = [c for c in self.calls() if c.startswith("mosh ")]
         self.assertEqual(len(mosh), 1)
         # the remote command is `exec remote-agents enter '<id>'`, so the
-        # selector's Quit ends the session (no orphan mosh)
-        self.assertIn("sh -lc exec remote-agents enter 'w15:p1'", mosh[0])
+        # selector's Quit ends the session (no orphan mosh); this launch's
+        # link-open nonce is exported first (selector L over mosh)
+        self.assertRegex(mosh[0], r"sh -lc export TENDRIL_LINK_NONCE=[0-9a-f]{16}; "
+                                  r"exec remote-agents enter 'w15:p1'$")
         # the remote shell receives the quoted id as one argument
         self.assertIn("remote-agents enter w15:p1", self.calls())
 
@@ -392,7 +407,8 @@ class PhoneLauncher(unittest.TestCase):
         p = self.run_launcher(["ssh", "testhost"])
         self.assertEqual(p.returncode, 0)
         self.assertFalse(any(c.startswith("mosh ") for c in self.calls()))
-        self.assertIn("ssh -t testhost remote-agents", self.calls())
+        self.assertIn("ssh -t " + SESSION_CM + " testhost remote-agents",
+                      self.calls())
 
     def test_mosh_fallback_lands_on_ssh_with_the_same_command(self):
         mosh_path = os.path.join(self.bindir, "mosh")
@@ -401,7 +417,8 @@ class PhoneLauncher(unittest.TestCase):
         os.chmod(mosh_path, 0o755)
         p = self.run_launcher(["attach", "w15"])
         self.assertEqual(p.returncode, 0)
-        self.assertIn("ssh -t testhost remote-agents attach 'w15'", self.calls())
+        self.assertIn("ssh -t " + SESSION_CM +
+                      " testhost remote-agents attach 'w15'", self.calls())
 
     def test_invalid_id_exits_two_without_connecting(self):
         p = self.run_launcher(["attach", "x;rm"])

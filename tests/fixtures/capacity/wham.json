@@ -1,0 +1,1 @@
+{"rate_limit":{"primary_window":{"used_percent":12.5,"resets_at":@RESET@,"window_minutes":300},"secondary_window":{"utilization":0.5,"reset_after_seconds":86400,"window_minutes":10080}},"plan_type":"plus","decoy_account":{"email":"decoy-owner@example.test","access_token":"FAKE-SECRET-TOKEN-h2r-in-response"}}
