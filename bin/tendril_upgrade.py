@@ -34,7 +34,7 @@ import sys
 import tempfile
 import time
 
-DEFAULT_VERSION = "0.2.0-dev"
+DEFAULT_VERSION = "0.2.0"
 INSTALLER = "install"
 PHONE_FILES = ("tendril", "termux-url-opener", "agent")
 # Config keys ./install --upgrade may update (LINK-CONTRACT-0.2 §7.4: the
@@ -304,7 +304,7 @@ def describe_version(repo):
 
 
 def resolve_version(repo):
-    """Single source of truth: VERSION (0.2.0-dev until tagged); a tag on
+    """Single source of truth: VERSION (e.g. 0.2.0); a tag on
     HEAD overrides it; git describe fills in for pre-VERSION checkouts."""
     tag = exact_tag(repo)
     if tag:

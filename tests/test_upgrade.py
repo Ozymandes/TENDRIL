@@ -38,6 +38,10 @@ from test_darwin_install import INSTALL, FakeDarwin  # noqa: E402
 from test_host_platform import UID, recorder  # noqa: E402
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# the checkout's own VERSION (the tests copy it into their temp repos)
+with open(os.path.join(REPO, "VERSION")) as _vf:
+    REPO_VERSION = _vf.read().strip()
+
 sys.path.insert(0, os.path.join(REPO, "bin"))
 import tendril_host as th  # noqa: E402
 import tendril_upgrade as tu  # noqa: E402
@@ -339,8 +343,8 @@ class VersionResolution(unittest.TestCase):
 
     def test_version_file_until_tagged(self):
         work, _ = make_checkout(self.tmp)          # VERSION file, no tags
-        self.assertEqual(tu.resolve_version(work), "0.2.0-dev")
-        self.assertTrue(tu.version_line(work).startswith("tendril 0.2.0-dev"))
+        self.assertEqual(tu.resolve_version(work), REPO_VERSION)
+        self.assertTrue(tu.version_line(work).startswith("tendril " + REPO_VERSION))
 
     def test_exact_tag_overrides(self):
         work, _ = make_checkout(self.tmp)
@@ -543,7 +547,7 @@ class FullUpgradeLaunchd(UpgradeEnv):
         self.assertEqual(doc["commit"], new_head)
         self.assertEqual(doc["phone"]["tendril"],
                          sha(os.path.join(self.work, "phone", "tendril")))
-        self.assertEqual(doc["version"], "0.2.0-dev")
+        self.assertEqual(doc["version"], REPO_VERSION)
         # watcher: herdr-notify changed -> exactly one restart cycle
         counts = self.verb_counts(self.launchctl())
         self.assertEqual(counts.get("bootout"), 1)
@@ -574,7 +578,7 @@ class FullUpgradeLaunchd(UpgradeEnv):
         self.assertEqual(profile.count("# >>> tendril remote PATH"), 1)
         self.assert_block(out, host="updated", watcher="restarted",
                           android="client refresh recommended")
-        self.assertIn("  version     0.2.0-dev", out)
+        self.assertIn("  version     " + REPO_VERSION, out)
 
     def test_already_current_runs_health_check_and_changes_nothing(self):
         first = self.run_installer_directly()
@@ -1025,12 +1029,12 @@ class Interface(unittest.TestCase):
     def test_version_from_checkout(self):
         p = self.run_cli(REMOTE_AGENTS, "--version")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertTrue(p.stdout.startswith("tendril 0.2.0-dev"), p.stdout)
+        self.assertTrue(p.stdout.startswith("tendril " + REPO_VERSION), p.stdout)
 
     def test_module_version_subcommand(self):
         p = self.run_cli(MODULE, "version")
         self.assertEqual(p.returncode, 0)
-        self.assertTrue(p.stdout.startswith("tendril 0.2.0-dev"))
+        self.assertTrue(p.stdout.startswith("tendril " + REPO_VERSION))
 
     def test_help_lists_upgrade_and_version(self):
         p = self.run_cli(REMOTE_AGENTS, "--help")
