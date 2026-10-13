@@ -1,246 +1,392 @@
-![TENDRIL launch banner](assets/branding/TENDRIL_BANNER.png)
+<p align="center">
+  <img src="docs/assets/readme/tendril-logo-transparent.png"
+       alt="TENDRIL — The Edge Is Yours"
+       width="640">
+</p>
 
-[![Python](https://img.shields.io/badge/Python-stdlib-3776AB?style=for-the-badge&logo=python&logoColor=white)](#host-installation) [![Linux](https://img.shields.io/badge/Linux-host-1F2937?style=for-the-badge&logo=linux&logoColor=F0C94A)](#host-installation) [![macOS](https://img.shields.io/badge/macOS-host%20%2F%20client-8A8A8F?style=for-the-badge&logo=apple&logoColor=white)](docs/MACOS.md) [![Android](https://img.shields.io/badge/Android-Termux-197A46?style=for-the-badge&logo=android&logoColor=white)](docs/ANDROID.md) [![Herdr](https://img.shields.io/badge/Herdr-0.9%2B-8A5CF6?style=for-the-badge)](https://herdr.dev) [![Remote agents](https://img.shields.io/badge/remote-agents-1F1F1F?style=for-the-badge&logo=github&logoColor=white)](#what-it-does) [![Mosh%20%2F%20SSH](https://img.shields.io/badge/Mosh%20%2F%20SSH-private_network-238DB5?style=for-the-badge)](#how-it-works) [![CLI%20%2F%20TUI](https://img.shields.io/badge/CLI%20%2F%20TUI-terminal-16A6A1?style=for-the-badge)](#what-it-does) [![Version tag](https://img.shields.io/badge/version-v0.1.1-3974AD?style=for-the-badge&logo=github&logoColor=white)](https://github.com/Ozymandes/TENDRIL/tree/v0.1.1) [![MIT](https://img.shields.io/badge/licence-MIT-D6A62E?style=for-the-badge&logo=opensourceinitiative&logoColor=white)](LICENSE)
+<p align="center">
+  <strong>A handheld control plane for persistent AI agents.</strong>
+</p>
 
-TENDRIL puts a small, direct control surface for persistent AI-agent sessions
-in your pocket. From your phone, check the live workspaces on your
-workstation (Linux or macOS), move to the session you need, and leave the
-host to keep working when you put the phone away.
+<p align="center">
+  <a href="https://github.com/Ozymandes/TENDRIL/releases/tag/v0.2.0"><img alt="Version v0.2.0" src="https://img.shields.io/badge/version-v0.2.0-CBFD75?style=flat-square&labelColor=111111"></a>
+  <a href="https://github.com/Ozymandes/TENDRIL/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/Ozymandes/TENDRIL/ci.yml?branch=main&style=flat-square&label=tests&labelColor=111111"></a>
+  <a href="LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-CBFD75?style=flat-square&labelColor=111111"></a>
+  <a href="#where-it-runs"><img alt="Host: Linux" src="https://img.shields.io/badge/host-Linux-6FD3DE?style=flat-square&labelColor=111111&logo=linux&logoColor=white"></a>
+  <a href="docs/ANDROID.md"><img alt="Phone: Android + Termux" src="https://img.shields.io/badge/phone-Android%20%C2%B7%20Termux-6FD3DE?style=flat-square&labelColor=111111&logo=android&logoColor=white"></a>
+  <a href="https://herdr.dev"><img alt="Herdr 0.9.3+" src="https://img.shields.io/badge/runtime-Herdr%200.9.3%2B-F0B54A?style=flat-square&labelColor=111111"></a>
+</p>
 
-## Platforms
+---
 
-| Role | Platform | Status |
-|---|---|---|
-| Host | Linux | ✅ daily use, full test suite |
-| Host | macOS (Apple silicon, Intel) | 🟡 Darwin-simulation tests pass; real-Mac sign-off pending |
-| Client | Android (Termux) | ✅ real-device certified (launcher/TUI, selector, ntfy one-tap entry, exact pane deep links, detach back to the selector) |
-| Client | macOS terminal | 🟡 launcher tests pass; real-Mac sign-off pending |
-| Client | iOS (Blink Shell) | 🟡 source-verified against Blink + host-side tests; real-iPhone sign-off pending |
+TENDRIL turns your phone into the control surface for AI agents that live
+on your own machine.
 
-✅ marks combinations in daily use with the full test suite (Android is
-additionally certified on a real S21 Ultra / Termux device). 🟡 means
-supported and covered by automated tests (CI runs the suite on Linux and
-on a macOS runner), but not yet signed off on a real device. Any host
-works with any client: SSH everywhere, Mosh where both ends have it.
-One-tap notification entry on Android uses the optional
-TENDRIL Link Android companion (not yet
-published); TENDRIL works fully without it. See [docs/MACOS.md](docs/MACOS.md) and
-[docs/IOS_BLINK.md](docs/IOS_BLINK.md).
+Your agents run for hours in [Herdr](https://herdr.dev) on your
+workstation. From **TENDRIL Link** on your Android phone you can see which
+of them are working, which are idle, which failed and which are waiting
+for you — down to the subagents they spawned. You can see how much Claude
+and Z.AI capacity is left before the next reset, schedule the next job,
+get told when something finishes or breaks, revive Herdr when it falls
+over, and drop straight into the exact terminal pane that needs you.
+
+Underneath is the stack you already trust: Herdr keeps the agents alive,
+SSH and Mosh over Tailscale carry the connection, Termux runs on the
+phone. TENDRIL replaces none of it. It makes those pieces behave like one
+system you can hold in one hand.
+
+> SSH gets you into the machine. TENDRIL tells you what the machine is doing.
+
+<p align="center">
+  <img src="docs/assets/readme/board-01-control-plane.png"
+       alt="TENDRIL Link: HOME, LIVE and CAPACITY on a real phone"
+       width="100%">
+</p>
+
+Three surfaces carry most of the day:
+
+- **HOME** is the whole system in one glance: link state, how many agents
+  and subagents are alive, the provider under the most pressure, anything
+  that needs you, and one button into the console.
+- **LIVE** is every session as it happens — working, idle, failed, needs
+  input — with subagent trails, history, and a topology view.
+- **CAPACITY** is provider usage and limits: session and weekly windows,
+  when they reset, tokens today and metered spend.
 
 ## Why TENDRIL exists
 
-Long-running work deserves a connection that can come and go. I wanted to
-check on a living little agent lab from my phone: see what's running, switch
-to the right workspace, and steer it without hauling the workstation around.
-There is a particular pleasure in doing that over the first cup of Earl Grey,
-before the morning has quite started.
+Starting an agent is the easy part. Keeping a handful of them honest over
+a day is not.
 
-I admired the polish of tools like Moshi, then found that some of the features
-I most wanted were behind a paywall. I took that as a design prompt. TENDRIL
-is my own small, MIT-licensed system, shaped around the balance of beauty,
-control, simplicity, and openness I wanted from the start.
+Once you have several sessions on two providers, subagents spawning
+subagents, a job you'd like to run the moment your quota resets, and a
+runtime that occasionally decides to stop, "just SSH in and have a look"
+stops being a plan. You can reach the machine from anywhere. What you
+can't do from a phone keyboard is hold the whole picture in your head.
+
+The primitives were already excellent. SSH is the transport. Mosh keeps
+it alive through tunnels and lift doors. Tailscale makes the host
+reachable without exposing it to the internet. Herdr keeps the agents
+running after you walk away.
+
+What was missing was the layer that knows what all of it *means*: which
+session is blocked, which provider is about to throttle you, whether the
+host is unreachable or merely Herdr is down, and which pane a notification
+is actually about. That layer is TENDRIL.
+
+It began as a way to check on a small agent lab from a phone over the
+first cup of Earl Grey. Version 0.1 was a launcher and a terminal
+selector. It kept growing until it needed an app of its own.
+
+<p align="center">
+  <img src="docs/assets/readme/board-02-sessions-scheduling.png"
+       alt="TENDRIL Link: scheduling a task, LIVE detail and a session's context, output and cost"
+       width="100%">
+</p>
+
+## Sessions and scheduling
+
+TENDRIL is not a chat UI. It doesn't put a text box between you and your
+agents; it shows you what they are doing and gets you to the terminal
+where they're doing it.
+
+**Schedule work for later.** Give a task a title and the exact prompt the
+agent will receive, then pick where it lands: a new session in a
+workspace, or an agent pane that is already running. It can start at a
+set time, at a provider's next reset, or as soon as capacity comes back.
+Tasks live on the host, so your phone can be asleep when they start. A
+task that was running when the host crashed is marked *interrupted*, never
+silently launched twice.
+
+**Inspect a session.** Open any session to see its state, model, how much
+of the context window it has used, output tokens, cost where the harness
+reports it, and its subagents. Then **Open session** — TENDRIL focuses that
+exact workspace, tab and pane and attaches you over Mosh.
 
 ## What it does
 
-- `tendril` connects from Termux or a desktop to your Linux or macOS host,
-  preferring Mosh and falling back to SSH.
-- `remote-agents` presents Herdr's live workspaces in a terminal selector. Pick
-  a workspace to attach, open a shell, or view host info.
-- Sessions are addressable: `remote-agents attach <id>` (and
-  `tendril attach <id>` on the phone) jumps straight to a workspace by
-  Herdr workspace id, pane id, number, or exact label — no selector needed.
-- `herdr-notify` can watch session state and send an ntfy alert when work
-  finishes or an agent needs input.
+**Live operations.** Every Herdr workspace, agent and subagent, with
+honest states (working, idle, failed, needs input), session titles you can
+rename from the phone, and one-tap entry into the exact pane.
 
-The agents run in Herdr on the workstation. The phone joins their sessions; it
-does not host them. Your work survives a dropped connection, a closed terminal,
-and the walk to the kettle.
+**Scheduling.** Future tasks for new or existing sessions; time,
+on-reset and when-available triggers; host-authoritative state that
+survives reboots.
 
-## How it works
+**Capacity.** Claude, Codex and Pi usage from your own local transcripts
+(no network, no credentials), plus opt-in provider usage APIs for Claude,
+Codex and Z.AI: quota windows, reset times, pressure, spend.
 
-```text
-ANDROID / TERMUX                         LINUX / MACOS HOST
-`tendril` ── Tailscale ── Mosh / SSH ──> Herdr
-                                           └─ `remote-agents` TUI
-                                                ├─ Pi / Claude Code / Codex
-                                                └─ persistent workspaces
+**Notifications.** An agent finished, an agent needs input, a scheduled
+task started or failed, Herdr went down or came back — delivered through
+your own [ntfy](https://ntfy.sh) topic. Tapping one opens the exact pane
+it is about, not just the workspace.
 
-                                           `herdr-notify` ── ntfy ──> Android
-```
+**Recovery.** Herdr outage detection, a verified one-tap revive, and
+intentional stops that stay respected.
 
-Herdr owns the persistent sessions. TENDRIL supplies the mobile launcher and
-workspace switchboard; the optional notifier reports meaningful state changes.
-The console and watcher use Herdr's live snapshot, and the host install stays
-user-local with Python's standard library.
+**Host management.** Pairing by QR code, a diagnostics panel covering
+every link in the chain, and updates for both the host and the app.
+
+<p align="center">
+  <img src="docs/assets/readme/board-03-reliability-recovery.png"
+       alt="TENDRIL Link: NEEDS YOU, HERDR OFFLINE with Revive Herdr, diagnostics and host pairing"
+       width="100%">
+</p>
+
+## It tells the truth about the system
+
+A control plane that guesses is worse than none. TENDRIL keeps the
+failure states apart, because they need different things from you:
+
+- **Unreachable is not offline.** If your phone can't reach the host,
+  that's a network problem. If the host answers but Herdr doesn't, the
+  phone says **HERDR OFFLINE** — *host reachable, Herdr stopped 21 s
+  ago* — and offers **Revive Herdr**.
+- **Stopped on purpose is not crashed.** `tendril herdr stop` sets a
+  guard. The guardian stays quiet, and the phone won't offer to undo your
+  decision.
+- **Recovery is explicit.** A guardian checks Herdr every 30 seconds and
+  notifies you once when it goes down and once when it's back. It never
+  restarts anything by itself. Revive is your call: one rate-limited
+  restart that is only reported as done once Herdr is verifiably serving
+  again.
+- **Human attention comes first.** **NEEDS YOU** lists every agent
+  waiting on input, and how long it has waited.
+- **Diagnostics show the real boundaries.** Termux, its permission, the
+  launcher, the SSH alias, deep links, the notification bridge, the host,
+  Herdr, TENDRIL and the notifier — each with its own state, so a broken
+  link is named rather than implied.
+
+## Architecture
+
+<p align="center">
+  <img src="docs/assets/readme/architecture.png"
+       alt="TENDRIL system architecture: TENDRIL Link, secure connection, TENDRIL host control plane, Herdr runtime, model providers"
+       width="100%">
+</p>
+
+1. **TENDRIL Link** — the phone surface: monitor, schedule, recover,
+   inspect, update, enter sessions.
+2. **Secure connection** — Tailscale for reachability; Mosh for
+   interactive sessions, with SSH as the fallback; plain SSH in BatchMode
+   for every background call the app makes.
+3. **TENDRIL host** — `remote-agents` and a handful of standard-library
+   Python modules: the live snapshot, scheduler, capacity, health
+   guardian, notifier, pairing and the phone update channel. Two user
+   systemd timers and one watcher service. No database, no daemon you
+   have to babysit.
+4. **Herdr** — the persistent runtime: workspaces, sessions, agents (Pi,
+   Claude Code, Codex) and their subagents.
+5. **Model providers** — where capacity comes from: Claude, Z.AI, Codex.
+
+Three flows connect them: *control* (you direct the agents), *state*
+(live sessions and activity flow back), *notify / recovery* (events,
+alerts and revives).
+
+**TENDRIL is the control plane. Herdr is the runtime.** The host is the
+authority on everything durable; the phone renders what the host reports
+and asks it to act. Details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
+and the binding phone ↔ host contract,
+[docs/LINK-CONTRACT-0.2.md](docs/LINK-CONTRACT-0.2.md).
+
+A few opinions hold it together:
+
+- **Use the primitives.** If SSH, Mosh, Tailscale, Herdr or Termux already
+  do something well, TENDRIL calls them rather than reinventing them.
+- **The host is authoritative.** Durable state lives where the work does.
+- **Exact context matters.** A notification about pane `w15:p3` should
+  land you in `w15:p3`.
+- **Failure is a state, not a surprise.** Degraded is something you can
+  see, name and fix.
+
+<p align="center">
+  <img src="docs/assets/readme/board-04-release-loop.png"
+       alt="TENDRIL Link release loop: update available, installed, link established"
+       width="100%">
+</p>
+
+## Updates
+
+The host is the update server for its phones. You never need a store, an
+account or a download page.
+
+1. The host stages a TENDRIL Link build with `tendril --link-stage`, which
+   checks the build's manifest against the APK, pins its signing key, and
+   refuses a signer change or a downgrade.
+2. Link checks the host after it connects and when you return to the app.
+   A newer build shows as a small lime mark on HOME, and it is remembered
+   until you install it, even if a later check fails.
+3. **About → Update TENDRIL** runs the phone's trusted
+   `tendril --upgrade` in the background. That downloads the APK over your
+   existing SSH key and checks its sha256 and size. Link then re-verifies
+   the same bytes — package, version, signer — before handing them to
+   Android.
+4. Android's own installer asks you to confirm. Then About says **up to
+   date**.
+
+Typing `tendril --upgrade` in Termux does the same thing and is always
+available as a fallback. On the host, `tendril --upgrade` updates TENDRIL
+itself by fast-forwarding a clean checkout; your configuration and
+notification topic are left byte-for-byte untouched.
+
+## Where it runs
+
+| | Supported | Status in v0.2.0 |
+|---|---|---|
+| Host | Linux with a systemd user session, Herdr 0.9.3+, Python 3.9+ (stdlib only), OpenSSH | ✅ the full feature set; daily use and the full test suite |
+| Host | macOS | 🟡 selector, attach and notifications (launchd); the scheduler and guardian timers aren't installed; no real-Mac sign-off yet |
+| Phone | Android 8+, [Termux from F-Droid](https://f-droid.org/packages/com.termux/), TENDRIL Link | ✅ certified end to end on a Galaxy S21 Ultra |
+| Terminal clients | Termux alone, a Linux or macOS terminal, iOS [Blink Shell](docs/IOS_BLINK.md) | ✅ Termux · 🟡 macOS and Blink (tested, not signed off on device) |
+| Network | Tailscale recommended; SSH required; Mosh preferred | ✅ |
+
+**About TENDRIL Link availability.** In v0.2.0, TENDRIL Link reaches a
+phone through its host: a staged build is installed by the Termux setup
+script or by `tendril --upgrade`. Public builds of the app are not
+published yet. Everything else — the host, the Termux console, scheduling
+and capacity from the CLI, health and recovery, notifications — works
+without it.
 
 ## Quick start
 
-### Guided setup (recommended for beginners)
+You'll need a Linux machine running [Herdr](https://herdr.dev) 0.9.3 or
+newer, OpenSSH (plus `mosh-server` if you can), Tailscale on the host and
+the phone, and [Termux from F-Droid](https://f-droid.org/packages/com.termux/)
+on an Android phone.
 
-[`docs/scripts/tendril-phone-setup.sh`](docs/scripts/tendril-phone-setup.sh)
-sets up both sides from the phone. It installs SSH and Mosh in Termux, creates
-the phone's key and `~/.ssh/config` alias, copies the key to the host, installs
-Herdr and TENDRIL on the host (no `sudo`), adds the `tendril` and `agent`
-commands, a Termux:Widget shortcut and the deep-link helper
-(`termux-url-opener`), then checks the whole chain. The
-[setup guide](docs/TENDRIL-SETUP-GUIDE.md) covers every step.
-
-```sh
-bash tendril-phone-setup.sh            # first run, and later updates
-bash tendril-phone-setup.sh --check    # read-only check
-```
-
-Notes:
-
-- Run host steps as your normal user, not root.
-- When the host installer runs, press Enter for the text questions, but type
-  `y` for every yes/no question. They default to No, and skipping the
-  keybinding questions leaves Alt+D unbound.
-- Install Termux and Termux:Widget from F-Droid. Termux:Widget is not on
-  Google Play.
-- On a server or VPS, run `sudo loginctl enable-linger $USER` so the
-  notification watcher keeps running after you log out (Linux/systemd hosts;
-  on macOS the watcher is a launchd agent that starts at login —
-  [docs/MACOS.md](docs/MACOS.md)).
-
-### Host installation
-
-On the host — Linux or macOS — install Herdr first, then clone TENDRIL and
-run its interactive installer. It checks compatibility, previews changes
-with `--dry-run`, and never uses `sudo`.
+**1. Install TENDRIL on the host.** It's user-local, previews with
+`--dry-run`, and never uses `sudo`.
 
 ```sh
 git clone https://github.com/Ozymandes/TENDRIL.git
 cd TENDRIL
-./install --doctor
+./install --doctor     # read-only check
 ./install
 ```
 
-On a Mac, enable Remote Login first and expect Homebrew-flavoured hints;
-the watcher installs as a launchd LaunchAgent rather than a systemd unit.
-Prerequisites, firewall and Mosh quirks, and the Linux/macOS lifecycle
-table are in [docs/MACOS.md](docs/MACOS.md). A Mac or Linux desktop can
-also be a pure *client* instead of a host: `./install --client` installs a
-`tendril` command that dials your host over SSH/Mosh. On either kind of
-host, the installer can set up the push watcher as a user service — check
-it with `tendril service status`, manage with
-`tendril service restart|stop|logs`.
+On a server, also run `sudo loginctl enable-linger $USER` so the timers
+keep running after you log out.
 
-To update only the host selector from the checkout root, replace its executable:
+**2. Confirm Herdr is visible.**
 
 ```sh
-install -m 755 bin/remote-agents "$HOME/.local/bin/remote-agents.new" &&
-mv -f "$HOME/.local/bin/remote-agents.new" "$HOME/.local/bin/remote-agents"
+tendril                # the workspace selector
+tendril health --json  # "herdr":{"state":"running"…}
 ```
 
-This changes only `remote-agents`; it leaves host configuration and ntfy
-subscriptions alone. Do not rerun the interactive installer just to update the
-binary. An already-running Mosh selector keeps using its old process until you
-quit and start `tendril` again; see the [Android guide](docs/ANDROID.md) for the
-safe exit sequence.
-
-The canonical way to update everything is `tendril --upgrade` (safe
-self-update from the recorded checkout; config and your ntfy topic stay
-byte-identical). To pair a phone — the TENDRIL Link app or Termux — run
-`tendril --pair` on the host: it prints the identity summary, the pairing
-code (QR when `qrencode` is installed), the ntfy subscribe URL and a
-paste-ready Termux setup block.
-
-### Android / Termux
-
-Install OpenSSH and Mosh, configure an SSH host alias, and add the phone's key
-to the host — or skip the hand steps: `tendril --pair` on the host prints a
-paste-ready block with your real values (and the code for the TENDRIL Link
-app). The [Android guide](docs/ANDROID.md) walks through pairing and copies
-both canonical launchers from the host checkout into `~/bin`.
+**3. Set up the phone.** On the host:
 
 ```sh
-tendril --pair                       # on the host: code + QR + setup block
-pkg update && pkg install openssh mosh
-ssh-keygen -t ed25519 -f ~/.ssh/id_ed25519 -N "" -C termux
-ssh-copy-id <host-alias>
-tendril
+tendril --pair --manual
 ```
 
-## Why it feels different
+It prints one command with your real host filled in. Paste it into Termux.
+It installs SSH and Mosh, creates a phone key, copies it to the host (you
+type your host password once), installs the launchers, enables Termux's
+external-apps setting, and installs TENDRIL Link if the host has a build
+staged.
 
-A terminal tool can be beautiful and still be precise. TENDRIL keeps the
-interface close to the work: legible at phone width, quick to navigate, and
-free of a dashboard layer between you and the sessions. The name fits that
-shape. A tendril reaches into a larger living system and gives you a thread
-back to it. The engineering stays thin; the tool still gets to have a point
-of view.
+**4. Pair TENDRIL Link.** Run `tendril --pair` on the host and scan the QR
+(or paste the code) in the app. Allow it to run commands in Termux when
+Android asks. The pairing also brings your notification settings along.
 
-## Commands and compatibility
+**5. Open the control plane.** HOME should read **LINK READY**. Tap
+**Open Tendril** for the console, or just type `tendril` in Termux.
 
-`tendril` is the official phone command. Install `phone/tendril` as
-`~/bin/tendril`. `phone/agent` remains a real wrapper for existing installs of
-`agent`; it is supported for backwards compatibility. The older
-`AGENT_ALIAS` setting also continues to work.
+Doing it by hand, or something went sideways? See the
+[Android guide](docs/ANDROID.md) and the
+[step-by-step setup guide](docs/TENDRIL-SETUP-GUIDE.md).
 
-In the selector, use ↑/↓ to highlight a workspace and Enter to attach; typing
-its number followed by Enter still works, including multi-digit numbers. The
-footer actions are `N New`, `I Info`, `? Help`, `R Refresh`, and `Q Quit`; each
-runs on a single keypress, without Enter. Enter remains for workspace selection
-and text fields. Help pages fit the screen; any key advances or returns.
-`N` immediately opens a shell in the selected/focused workspace's directory.
-Herdr names it after that directory; there are no name, directory, agent, or
-confirmation prompts. Without a usable workspace directory, it uses the
-console's current directory.
+## Day to day
 
-`Alt+D` detaches back to the menu (tap ALT then D on the phone); `Ctrl+B` then
-`D` is the fallback. Detaching leaves workspaces and agents running. The host
-console's Ctrl+Home bridge translates `ESC [ 1 ; 5 H` to Alt+D by default for
-TTY attachments, including over Mosh or SSH. It does not require `TERMUX_VERSION`
-to be forwarded from the phone. Set host-side `TENDRIL_DETACH_BRIDGE=0` to
-disable it; non-TTY attachments pass input through unchanged. Inside a
-workspace, `Ctrl+B 1..9` jumps to a workspace, `Ctrl+B w` opens the picker, and
-`Ctrl+B n`/`p` cycles tabs. Alt+Up is left to Pi for editing steering messages,
-not bound to Herdr workspace switching. Run `herdr-notify --test` on the host to send a test
-notification. See the [Android guide](docs/ANDROID.md) for setup and troubleshooting.
+```sh
+tendril                       # the selector (from the phone: Termux or Link → Open Tendril)
+tendril enter <id>            # focus + attach an exact workspace or pane (w15, w15:p3)
+tendril snapshot --json       # the live workspace/agent mirror the app renders
+tendril capacity status       # provider windows, resets and usage as a table
+tendril schedule list         # scheduled tasks, newest first
+tendril health --json         # Herdr, TENDRIL and service states (no secrets)
+tendril herdr restart         # the verified revive
+tendril herdr stop | start    # intentional stop (sets the guard) / start (clears it)
+tendril --pair                # pairing code + QR for TENDRIL Link
+tendril --upgrade             # update (host: TENDRIL itself · phone: launchers + Link)
+herdr-notify --test           # send a test notification
+```
 
-Sessions are addressable objects. `remote-agents attach|resolve|focus|link <id>`
-attach directly and expose machine-readable metadata plus canonical
-tendril-link payloads (host + workspace id + label, nothing else) for
-notification deep links — see [docs/DEEPLINK.md](docs/DEEPLINK.md). iPhone
-via Blink Shell is a first-class client ([docs/IOS_BLINK.md](docs/IOS_BLINK.md)):
-Alt+D detach, Mosh hosts with a `tendril` startup command, and the automatic
-256-colour palette. Notifications stay deterministic — no LLM, no API cost.
+In the selector, every key is a single press: ↑/↓ and Enter (or a number
+and Enter) attach, **N** opens a new shell, **I** shows host info, **R**
+refreshes, **Q** quits, **L** returns to TENDRIL Link, and **?** shows the
+key reference. Inside a session, **Alt+D** (or **Ctrl+B d**) detaches back
+to the selector; your agents keep running.
 
-| Command | What it does |
-|---|---|
-| `tendril --upgrade [--verbose]` | self-update the host: fetch + fast-forward the recorded checkout, then a non-interactive refresh; ends in a health check + summary |
-| `tendril --version` | installed version and commit (`VERSION` in the repo; `0.2.0-dev` until the next tag) |
-| `tendril --help` | the full command list, including the above |
+`tendril --help` lists everything else.
 
-**Upgrading.** `tendril --upgrade` reads the provenance every `./install`
-records (`~/.config/remote-agents/install.json`: source checkout, commit,
-branch, version, phone-launcher hashes), refuses — one line, nothing
-touched — unless that checkout is clean, on the same branch, and in sync
-with its upstream (no uncommitted changes, no merge/rebase in progress, no
-detached HEAD, no missing upstream, no local or diverged commits), then
-runs `git fetch --quiet` + `git merge --ff-only @{u}` (never reset, rebase
-or force) followed by the installer's non-interactive `./install --upgrade`
-(binaries, entrypoint symlink, PATH block only when missing, idempotent
-Herdr-binding merge, watcher unit). `config` and `notify.env` are asserted
-byte-identical, so the ntfy topic never rotates here; the watcher restarts
-only when its binary or unit changed (or it was not running). The run ends
-with non-destructive health checks and a summary block (`host updated |
-already current`, `watcher running | restarted | NOT RUNNING`, `android
-client current | client refresh recommended` — the exact Termux commands
-are printed when the phone launchers changed). Upgrade is flags-only on
-purpose: a bare word is a session-token position, and a workspace may
-legitimately be labeled `upgrade`. Phone side, see the refresh note in
-[docs/ANDROID.md](docs/ANDROID.md).
+## Security
 
-## Further reading
+TENDRIL lives inside the trust you already set up: your tailnet, your SSH
+keys, your user account. No root, no inbound ports beyond tailnet SSH and
+Mosh, no accounts, no analytics, no TENDRIL cloud.
 
-- [Beginner setup guide](docs/TENDRIL-SETUP-GUIDE.md)
-- [Android / Termux setup](docs/ANDROID.md)
-- [macOS host & client](docs/MACOS.md)
-- [Architecture](docs/ARCHITECTURE.md)
-- [Security model](docs/SECURITY.md)
-- [License](LICENSE)
+- **Link can only ask, never command.** It sends a fixed set of verbs to
+  `~/bin/tendril` as argument arrays. Every variable argument is
+  validated on the phone *and* on the host. There is no field anywhere
+  that becomes a shell command.
+- **The phone can revive Herdr but can't stop it.** Stop and start are
+  host-only.
+- **Updates are pinned and confirmed.** Host-staged builds are checked
+  against their manifest and signing key, re-verified by the app, and
+  installed only after Android asks you.
+- **Credentials stay put.** Capacity's network adapters are off until
+  you enable them, and they never print or store tokens. `health` and
+  `capacity` output carries no secrets.
+- **Pairing codes are secrets.** They can carry your read-only
+  notification token.
 
-Run `./install --doctor` for a read-only host check. Run `./uninstall` to remove
-TENDRIL's installed files; it asks before removing your configuration.
+The full model is in [SECURITY.md](SECURITY.md).
+
+## What TENDRIL isn't
+
+It isn't a cloud agent platform, a chat front end, a remote desktop or a
+file manager, and it is not a replacement for SSH, Mosh or Tailscale. Your
+agents run on your machine, under your account. TENDRIL just makes sure
+you know what they're up to.
+
+## v0.2.0 — the handheld control plane
+
+v0.1 got you into your sessions from a phone. v0.2.0 is the release where
+TENDRIL understands them.
+
+It brings TENDRIL Link: HOME, LIVE (including subagents), CAPACITY and
+SCHEDULE. It adds a host scheduler that can target new or existing
+sessions, and capacity tracking across Claude, Codex, Pi and Z.AI.
+Notifications now land in the exact pane, and Herdr health is watched by
+a guardian with a verified revive. QR pairing, a diagnostics panel,
+session titles, and app updates that are discovered and installed from
+the app round it out.
+
+The details are in the [changelog](CHANGELOG.md) and the
+[release notes](https://github.com/Ozymandes/TENDRIL/releases/tag/v0.2.0).
+
+## Contributing
+
+The host is plain Python standard library and POSIX `sh`. The test suite
+needs nothing else:
+
+```sh
+python3 -m unittest discover -s tests
+```
+
+CI runs it on Ubuntu and macOS. Issues and pull requests are welcome; for
+anything touching what the phone may ask the host to do, read
+[docs/LINK-CONTRACT-0.2.md](docs/LINK-CONTRACT-0.2.md) first.
+
+More reading: [Android](docs/ANDROID.md) ·
+[setup guide](docs/TENDRIL-SETUP-GUIDE.md) · [macOS](docs/MACOS.md) ·
+[iOS / Blink](docs/IOS_BLINK.md) · [deep links](docs/DEEPLINK.md) ·
+[architecture](docs/ARCHITECTURE.md) · [security](SECURITY.md).
+`./install --doctor` checks a host without changing anything;
+`./uninstall` removes TENDRIL and asks before touching your configuration.
+
+## Licence
+
+[MIT](LICENSE). The edge is yours.
