@@ -33,7 +33,7 @@ fi
 # The production signing certificate of TENDRIL Link (SHA-256 of the DER
 # cert, lowercase hex). Public by nature; pinned here so a substituted
 # manifest cannot introduce a different signer.
-LINK_SIGNER=@LINK_SIGNER_SHA256@
+LINK_SIGNER=44fa9365d6ac01ef94b8f462a0161f946c023c7377013d198d654f526333e03b
 LINK_PACKAGE=app.tendril.link
 
 LOGDIR="$HOME/.cache/tendril"

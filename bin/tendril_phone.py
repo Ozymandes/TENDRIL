@@ -51,7 +51,7 @@ USAGE = ("usage: tendril --phone-manifest\n"
 # and the pin in phone/setup.sh (tests keep all three identical). Empty
 # until the release key exists: then --link-fetch refuses and --link-stage
 # keeps the per-host first-stage pin (development builds).
-LINK_RELEASE_SIGNER = ""
+LINK_RELEASE_SIGNER = "44fa9365d6ac01ef94b8f462a0161f946c023c7377013d198d654f526333e03b"
 LINK_RELEASE_BASE = "https://github.com/Ozymandes/TENDRIL/releases"
 
 MANIFEST_HEADER = "tendril-phone-manifest 1"
