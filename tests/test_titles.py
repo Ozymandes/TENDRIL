@@ -314,8 +314,9 @@ class Precedence(TitlesTestBase):
         path = self.write_pi("w/--home-x--/e.jsonl", _pi_session(
             1_800_000_000, "Rewrite the pairing bloom timings",
             name="Native name"))
-        titles = {path: {"title": "Mine", "source": "manual",
-                         "session_start": 1_800_000_000}}
+        # the cache is keyed by the transcript's realpath (session_key)
+        titles = {os.path.realpath(path): {"title": "Mine", "source": "manual",
+                                           "session_start": 1_800_000_000}}
         title, source = tt.resolve_agent(self._agent(path), "tendril", [],
                                          titles=titles, home=self.home)
         self.assertEqual((title, source), ("Mine", "manual"))

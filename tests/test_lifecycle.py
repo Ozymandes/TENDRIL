@@ -86,7 +86,8 @@ class LifecycleCli(unittest.TestCase):
         # would leak mise shims/real herdrs into resolution and flake
         self.env.update({
             "HOME": self.home,
-            "PATH": self.bindir + os.pathsep + "/usr/bin",
+            # /bin too: macOS keeps cat & friends there (no usr-merge)
+            "PATH": os.pathsep.join([self.bindir, "/usr/bin", "/bin"]),
             "TENDRIL_FAKE_HERDR_STATE": self.state,
             "PYTHONDONTWRITEBYTECODE": "1",
         })

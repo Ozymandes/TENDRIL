@@ -233,6 +233,9 @@ class InstallCopyTests(unittest.TestCase):
         mode = os.stat(self.conf("service.env")).st_mode & 0o777
         self.assertEqual(mode, 0o600, "service.env must be 0600")
 
+    @unittest.skipIf(sys.platform == "darwin",
+                     "systemd timers: a launchd host installs none by design "
+                     "(docs/MACOS.md) — covered on Linux")
     def test_upgrade_ensures_both_timers_and_reports_state(self):
         p = self.run_install("--upgrade")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)

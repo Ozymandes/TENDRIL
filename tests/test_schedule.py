@@ -349,9 +349,11 @@ class AddTests(Base):
         ]
         for want, blob in cases:
             with self.subTest(want=want):
+                # every other case: the harness IS installed (never the
+                # real PATH — a CI runner has no `pi`, a dev box does)
                 kw = {"which": lambda k: None, "home": self.home} \
                     if want == "harness is not installed" \
-                    else {"home": self.home}
+                    else {"which": lambda k: True, "home": self.home}
                 task, err = ts.decode_add(blob, NOW, **kw)
                 self.assertIsNone(task)
                 self.assertEqual(err, want)

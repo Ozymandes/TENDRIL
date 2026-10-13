@@ -321,7 +321,10 @@ class ResolutionTests(ResolverEnv):
         os.chmod(shim_path, 0o755)
         self.set_path(mise + "/shims")
         picked, version, _v = self.detect()
-        self.assertEqual(picked, os.path.realpath(real))   # never the shim
+        # never the shim: the install it serves (compared resolved — the
+        # temp dir itself may sit behind a symlink, e.g. macOS /var)
+        self.assertNotEqual(picked, shim_path)
+        self.assertEqual(os.path.realpath(picked), os.path.realpath(real))
         self.assertEqual(version, "0.9.3")
 
     def test_record_refuses_unsafe_world_writable_target(self):
@@ -411,8 +414,8 @@ class RecordTests(ResolverEnv):
                                  "HERDR_BIN=%s" % os.path.join(
                                      self.tmp, "pool", "herdr"),
                                  "HERDR_VERSION=0.9.3",
-                                 "HERDR_REALPATH=%s" % os.path.join(
-                                     self.tmp, "pool", "herdr")])
+                                 "HERDR_REALPATH=%s" % os.path.realpath(
+                                     os.path.join(self.tmp, "pool", "herdr"))])
 
     def test_record_realpaths_symlinks(self):
         real = make_herdr(os.path.join(self.tmp, "real", "herdr"), "0.9.3")

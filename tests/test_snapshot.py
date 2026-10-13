@@ -180,7 +180,9 @@ class SnapshotCommand(unittest.TestCase):
     def test_workspaces_in_selector_order(self):
         self.assertEqual(self.main(["snapshot"]), 0)
         doc = self.doc()
-        with mock.patch.object(ra, "run", self.fake_run(SNAPSHOT)):
+        # a resolved herdr binary, as on a real host (CI runners have none)
+        with mock.patch.object(ra, "HERDR", "/fake/herdr"), \
+                mock.patch.object(ra, "run", self.fake_run(SNAPSHOT)):
             rows = ra.collect()
         self.assertEqual([w["id"] for w in doc["workspaces"]],
                          [r["id"] for r in rows])

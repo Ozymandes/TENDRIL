@@ -266,8 +266,10 @@ class SnapshotShape(unittest.TestCase):
                 return 0, json.dumps(self.SNAPSHOT), ""
             return 0, "status: running\n", ""
         with mock.patch.object(ra, "HOST_LABEL", "testhost"), \
+                mock.patch.object(ra, "HERDR", "/fake/herdr"), \
                 mock.patch.object(ra, "run", fake_run):
             # no snapshot() patch: the real envelope parsing must produce rows
+            # (HERDR patched: CI runners have no herdr binary to resolve)
             rows = ra.collect()
             by_id = {r["id"]: r for r in rows}
             self.assertEqual(by_id["w15"]["label"], "tendril")
