@@ -2,6 +2,50 @@
 
 All notable changes to TENDRIL are documented here.
 
+## v0.2.1 — Interaction + Installation Polish (2026-10-14)
+
+v0.2.1 turns the working pieces of v0.2.0 into one product, and gives the
+phone a production-signed, physically verified update path. Certified end
+to end on a Galaxy S21 Ultra (F-Droid Termux) against a Linux host,
+including a real uninstall → reinstall cycle and a real in-place
+production update.
+
+Highlights:
+
+- **Pairing v3**: a one-shot trust flow — QR enrollment, host-key
+  fingerprint pinning, and one-shot SSH enrollment of the phone's key.
+- **Zero-config notifications**: the host provisions a private ntfy
+  identity during `tendril install`; the pairing code carries it to the
+  phone. No topics, no manual setup.
+- **Permissions at the right moment**: the Link app asks for
+  POST_NOTIFICATIONS and Termux RUN_COMMAND during pairing, then re-probes
+  immediately — no Diagnostics scavenger hunt.
+- **`tendril install` everywhere**: one idempotent install/repair command
+  on host and phone. The phone takes its installer from its paired host;
+  the public bootstrap remains the one-time `curl … | sh`.
+- **Truthful Android package state**: absent / installed / older / newer /
+  unknown — a failed probe (`pm path` transaction errors,
+  `INTERACT_ACROSS_USERS` denials) is UNKNOWN and never read as installed
+  or absent. A cached APK or a recorded sha is never install evidence.
+- **Production-signed TENDRIL Link + staged update channel**: pinned
+  production signer, manifest + SHA-256 + package identity checks, a lime
+  HOME update indicator, the About update flow, and a physically verified
+  in-place update that preserves pairing and app data.
+- **A more truthful HOME**: the active-session card follows the live
+  session, NEEDS YOU keeps human attention first, and recently-completed
+  work gets its own dossier state.
+- **Dynamic Capacity provider discovery**, including OpenAI/Codex, with
+  explicit unavailable/stale states.
+- **Terminal comfort**: Herdr sessions scroll natively under the finger in
+  Termux (mouse-mode compatibility bridge), and the extra-keys toolbar
+  gains a guaranteed keyboard-recovery key for use while tracking is on.
+- **Exact-session notification deep links**, hardened installer/reinstall
+  paths, and a refreshed README (Boards 05 + 06 now carry the product's
+  two central ideas at the top).
+
+The full physical certification matrix lives in
+[docs/PHYSICAL-VALIDATION-0.2.1.md](docs/PHYSICAL-VALIDATION-0.2.1.md).
+
 ## v0.2.0 — the handheld control plane (2026-10-13)
 
 TENDRIL Link becomes a full Android control surface and the host grows the
