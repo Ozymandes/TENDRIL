@@ -423,28 +423,65 @@ fetch_asset() {
     return 0
 }
 
-# link_installed_code - the installed app.tendril.link versionCode
-# (best effort; empty when `cmd` cannot answer).
+# link_installed_code - the installed app.tendril.link versionCode, but
+# ONLY from a probe that RAN (exit 0): empty on any failure, and the
+# caller must treat that as version-UNKNOWN, never as a version.
 link_installed_code() {
-    command -v cmd >/dev/null 2>&1 || return 0
-    cmd package list packages --show-versioncode "$LINK_PACKAGE" 2>/dev/null |
+    _lic_out=$(cmd package list packages --show-versioncode "$LINK_PACKAGE" 2>/dev/null)
+    _lic_rc=$?
+    [ "$_lic_rc" -eq 0 ] || return 0
+    printf '%s\n' "$_lic_out" |
         sed -n "s/^package:$LINK_PACKAGE .*versionCode:\\([0-9][0-9]*\\).*$/\\1/p" |
         head -n 1
     return 0
 }
 
-# link_absent - ANDROID PACKAGE REALITY for app.tendril.link (exit 0 =
-# ABSENT). Read-only Termux probes, in order: `pm path`, `cmd package
-# path`, then the versionCode listing as a last resort. A cached APK and
-# a recorded sha from a PAST install are NEVER install evidence: when
-# every probe answers empty the package is not installed (installing
-# over absent is always safe; "current" over absent is the bug this
-# guards - a manual uninstall must be repaired by exactly this command).
-link_absent() {
-    [ -n "$(pm path "$LINK_PACKAGE" 2>/dev/null | head -n 1)" ] && return 1
-    [ -n "$(cmd package path "$LINK_PACKAGE" 2>/dev/null | head -n 1)" ] && return 1
-    [ -n "$(link_installed_code)" ] && return 1
-    return 0
+# link_state - ANDROID PACKAGE REALITY for app.tendril.link as a strict
+# three-state answer on stdout: present | absent | unknown.
+#
+#   present   a probe RAN and returned PARSEABLE package evidence (a
+#             `package:<path>` line or a listed versionCode)
+#   absent    probes RAN clean (exit 0, empty answer) and provably do
+#             not know the package
+#   unknown   a probe FAILED - non-zero exit (transaction errors,
+#             SecurityException / INTERACT_ACROSS_USERS) or unparseable
+#             output. On some devices (Samsung + Termux) `pm path` dies
+#             with "Failed transaction (2147483646)": a failed probe is
+#             UNKNOWN and must never be read as installed or absent.
+#
+# A cached APK and a recorded sha from a PAST install are NEVER evidence
+# in any state. Only `present` may lead to launching the app.
+link_state() {
+    _ls_saw=0
+    _out=$(pm path "$LINK_PACKAGE" 2>/dev/null); _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+        case $_out in
+            package:*) printf present; return 0 ;;
+            "") _ls_saw=1 ;;
+            *) printf unknown; return 0 ;;
+        esac
+    fi
+    _out=$(cmd package path "$LINK_PACKAGE" 2>/dev/null); _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+        case $_out in
+            package:*) printf present; return 0 ;;
+            "") _ls_saw=1 ;;
+            *) printf unknown; return 0 ;;
+        esac
+    fi
+    _out=$(cmd package list packages --show-versioncode "$LINK_PACKAGE" 2>/dev/null); _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+        # presence needs PARSEABLE evidence: a listed versionCode with
+        # actual digits - an empty-version line proves nothing
+        _ls_code=$(printf '%s\n' "$_out" |
+            sed -n "s/^package:$LINK_PACKAGE .*versionCode:\\([0-9][0-9]*\\).*$/\\1/p" |
+            head -n 1)
+        if [ -n "$_ls_code" ]; then
+            printf present; return 0
+        fi
+        _ls_saw=1
+    fi
+    if [ "$_ls_saw" -eq 1 ]; then printf absent; else printf unknown; fi
 }
 
 # ensure_external_apps - add `allow-external-apps = true` to
@@ -566,6 +603,7 @@ obtain_link_apk() {
 }
 
 FAILED=0
+LINK_CONFIRMED=0                 # Android-package presence PROVEN (never assumed)
 ROW_LAUNCHER=current
 ROW_URL=current
 ROW_AGENT=current
@@ -624,33 +662,39 @@ if [ "$MODE" = setup ]; then
 fi
 
 if [ -n "$APK_SHA" ]; then
-    # ANDROID PACKAGE REALITY decides - never a cached APK and never a
-    # recorded sha from a PAST install (a manual uninstall must be
-    # repaired by exactly this command), and a newer build on the phone
-    # is never silently downgraded:
-    _inst=$(link_installed_code)
-    case $_inst in
-        "" | *[!0-9]*) _inst="" ;;
-    esac
-    _link_state=older
-    if link_absent; then
-        _link_state=absent
-    elif [ -z "$_inst" ]; then
-        _link_state=installed             # present; version unreadable
-    elif [ "$_inst" -eq "$APK_CODE" ]; then
-        _link_state=current
-    elif [ "$_inst" -gt "$APK_CODE" ]; then
-        _link_state=newer
+    # ANDROID PACKAGE REALITY decides as a strict three-state machine -
+    # never a cached APK, never a recorded sha from a PAST install, and
+    # NEVER a failed probe (on some devices pm path / cmd die with
+    # transaction or INTERACT_ACROSS_USERS errors: that is UNKNOWN):
+    _link_state=$(link_state)
+    _inst=""
+    if [ "$_link_state" = present ]; then
+        _inst=$(link_installed_code)
+        case $_inst in
+            "" | *[!0-9]*) _inst="" ;;
+        esac
+        if [ -z "$_inst" ]; then
+            _link_state=installed             # presence proven; version unreadable
+        elif [ "$_inst" -gt "$APK_CODE" ]; then
+            _link_state=newer
+        elif [ "$_inst" -eq "$APK_CODE" ]; then
+            _link_state=current
+        else
+            _link_state=older
+        fi
     fi
     case $_link_state in
         current)
             LINK_ROW=current
+            LINK_CONFIRMED=1
             record_link_sha || true ;;
         newer)
             LINK_ROW="phone has $_inst > staged $APK_CODE - kept"
+            LINK_CONFIRMED=1
             record_link_sha || true ;;
         installed)
-            LINK_ROW="installed" ;;
+            LINK_ROW="installed"
+            LINK_CONFIRMED=1 ;;
         absent | older)
             PENDING_APK=$(obtain_link_apk); _dl_rc=$?
             if [ "$_dl_rc" -eq 0 ] && [ -n "$PENDING_APK" ]; then
@@ -663,6 +707,18 @@ if [ -n "$APK_SHA" ]; then
                 LINK_ROW="download failed"
                 FAILED=1
             fi ;;
+        unknown)
+            # Probes refused: installed-vs-absent is UNKNOWABLE here. Do
+            # not change anything, do not launch anything, do not guess.
+            LINK_ROW="state unknown - Android probes refused"
+            FAILED=1
+            echo "PHONE // TENDRIL Link: this device refused the package probes (pm path / cmd)." >&2
+            echo "  installed-vs-absent is UNKNOWN - nothing was changed or launched." >&2
+            if [ -s "$HOME/.cache/tendril/tendril-link-$APK_NAME.apk" ]; then
+                echo "  to (re)install by hand, open the verified cached APK:" >&2
+                echo "    termux-open \"$HOME/.cache/tendril/tendril-link-$APK_NAME.apk\"" >&2
+            fi
+            echo "  then run  tendril install  again once the probes answer." >&2 ;;
     esac
 fi
 
@@ -720,7 +776,12 @@ elif [ -n "$PENDING_APK" ]; then
                 esac
                 if [ -n "$_now" ] && [ "$_now" -lt "$APK_CODE" ]; then
                     echo "  not installed yet - run  tendril --upgrade  again after the update finishes."
+                    FAILED=1
                 elif record_link_sha; then
+                    # The user's Enter IS the confirmation that Android
+                    # finished; a readable versionCode is the stronger
+                    # proof. Only then may the app be launched.
+                    LINK_CONFIRMED=1
                     if [ -n "$_now" ]; then
                         echo "  recorded (versionCode $_now installed)"
                     else
@@ -733,6 +794,7 @@ elif [ -n "$PENDING_APK" ]; then
             else
                 echo ""
                 echo "PHONE // TENDRIL Link: not confirmed, sha not recorded - re-run tendril --upgrade after installing." >&2
+                FAILED=1
             fi
         fi
     else
@@ -751,11 +813,12 @@ fi
 
 [ "$FAILED" -eq 1 ] && exit 1
 
-# launch_link - open TENDRIL Link when this ran interactively: install,
-# repair and update all end on the app. Headless (the Link app's own
-# background RUN_COMMAND) never starts activities - Android suppresses
-# them from the background anyway, and the handoff is the app's.
-if [ -t 0 ] && command -v am >/dev/null 2>&1; then
+# launch_link - open TENDRIL Link when this ran interactively AND the
+# package's presence is PROVEN (probe-confirmed state, or the user's own
+# installer ack). Never a guess: launching an absent package is exactly
+# the Error-type-3 class this script exists to prevent. Headless (the
+# Link app's own background RUN_COMMAND) never starts activities.
+if [ "$LINK_CONFIRMED" -eq 1 ] && [ -t 0 ] && command -v am >/dev/null 2>&1; then
     am start -n "$LINK_PACKAGE/.MainActivity" >/dev/null 2>&1 || true
 fi
 exit 0

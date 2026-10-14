@@ -199,6 +199,43 @@ installed_code() {
     cmd package list packages --show-versioncode "$LINK_PACKAGE" 2>/dev/null \
         | sed -n 's/^package:app\.tendril\.link .*versionCode:\([0-9][0-9]*\).*$/\1/p' | head -n 1
 }
+# link_state - the same strict three-state probe as the host-served
+# installer: present | absent | unknown. A FAILED probe (transaction
+# errors, SecurityException / INTERACT_ACROSS_USERS, unparseable output)
+# is UNKNOWN on some devices (Samsung + Termux) and must never be read
+# as installed or absent.
+link_state() {
+    _ls_saw=0
+    _out=$(pm path "$LINK_PACKAGE" 2>/dev/null); _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+        case $_out in
+            package:*) printf present; return 0 ;;
+            "") _ls_saw=1 ;;
+            *) printf unknown; return 0 ;;
+        esac
+    fi
+    _out=$(cmd package path "$LINK_PACKAGE" 2>/dev/null); _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+        case $_out in
+            package:*) printf present; return 0 ;;
+            "") _ls_saw=1 ;;
+            *) printf unknown; return 0 ;;
+        esac
+    fi
+    _out=$(cmd package list packages --show-versioncode "$LINK_PACKAGE" 2>/dev/null); _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+        # presence needs PARSEABLE evidence: a listed versionCode with
+        # actual digits - an empty-version line proves nothing
+        _ls_code=$(printf '%s\n' "$_out" |
+            sed -n "s/^package:$LINK_PACKAGE .*versionCode:\\([0-9][0-9]*\\).*$/\\1/p" |
+            head -n 1)
+        if [ -n "$_ls_code" ]; then
+            printf present; return 0
+        fi
+        _ls_saw=1
+    fi
+    if [ "$_ls_saw" -eq 1 ]; then printf absent; else printf unknown; fi
+}
 MANIFEST="$LOGDIR/tendril-link.json"
 fetch "$LINK_BASE/tendril-link.json" "$MANIFEST" \
     || fail "Could not download the TENDRIL Link release manifest" "See $LOG (is the phone online?)"
@@ -210,7 +247,13 @@ M_SHA=$(mval sha256); M_SIZE=$(mval size); M_SIGNER=$(mval signer_sha256)
 [ "$M_SIGNER" = "$LINK_SIGNER" ] \
     || fail "The release manifest names a different signing key" "Refusing to install (expected the pinned TENDRIL release key)."
 NOW=$(installed_code)
-if [ -n "$NOW" ] && [ -n "$M_CODE" ] && [ "$NOW" -ge "$M_CODE" ] 2>/dev/null; then
+LINK_STATE=$(link_state)
+if [ "$LINK_STATE" = unknown ]; then
+    fail "Could not verify whether TENDRIL Link is installed" \
+        "This device refused the Android package probes (pm path / cmd)." \
+        "Nothing was changed or launched. Run this command again later."
+fi
+if [ -n "$NOW" ] && [ -n "$M_CODE" ] && [ "$NOW" -ge "$M_CODE" ] 2>/dev/null && [ "$LINK_STATE" = present ]; then
     ok "TENDRIL Link $M_NAME" "already installed"
     INSTALLED=1
 else

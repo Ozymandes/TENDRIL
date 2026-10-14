@@ -174,8 +174,8 @@ class PhoneEnv(unittest.TestCase):
         e["TENDRIL_VC_FILE"] = self.vc_file
         e["TENDRIL_AM_LOG"] = self.am_log
         for k in ("TENDRIL_ALIAS", "AGENT_ALIAS", "PREFIX", "TENDRIL_FAKE_VC",
-                  "TENDRIL_FAKE_VC2", "TENDRIL_FAKE_PM", "TENDRIL_CORRUPT",
-                  "TENDRIL_SSH_FAIL"):
+                  "TENDRIL_FAKE_VC2", "TENDRIL_FAKE_PM", "TENDRIL_FAKE_CMD",
+                  "TENDRIL_CORRUPT", "TENDRIL_SSH_FAIL"):
             e.pop(k, None)
         e.update(over)
         return e
@@ -267,25 +267,36 @@ printf 'termux-reload-settings\\n' >> "$TENDRIL_RELOAD_LOG"
 exit 0
 """
 
-PM_STUB = """#!/bin/sh
-# Android package-manager reality, faked: TENDRIL_FAKE_PM=1 (default) =
-# app.tendril.link present; anything else = ABSENT (pm path answers
-# nothing). `pm path` is the script's FIRST presence probe.
-if [ "$1" = "path" ] && [ "$2" = "app.tendril.link" ]; then
-    if [ "${TENDRIL_FAKE_PM:-1}" = "1" ]; then
-        printf 'package:/data/app/~~fake~~/app.tendril.link/base.apk\\n'
-    fi
-fi
-exit 0
-"""
-
 AM_STUB = """#!/bin/sh
 { printf 'am'; for a in "$@"; do printf ' <%s>' "$a"; done; printf '\\n'; } >> "$TENDRIL_AM_LOG"
 exit 0
 """
 
+PM_STUB = """#!/bin/sh
+# Android package-manager reality, faked (TENDRIL_FAKE_PM):
+#   1 (default) = present  -> `pm path` prints the package: line, exit 0
+#   0           = absent   -> exit 0, prints nothing (a CLEAN empty answer)
+#   fail        = FAILED   -> stderr 'Failed transaction (2147483646)', exit 1
+#                            (the real Samsung+Termux shape)
+#   garbage     = FAILED   -> stdout 'Failed transaction (2147483646)', exit 0
+#                            (unparseable output - must be UNKNOWN too)
+if [ "$1" = "path" ] && [ "$2" = "app.tendril.link" ]; then
+    case "${TENDRIL_FAKE_PM:-1}" in
+        1) printf 'package:/data/app/~~fake~~/app.tendril.link/base.apk\\n' ;;
+        0) : ;;
+        fail) printf 'Failed transaction (2147483646)\\n' >&2; exit 1 ;;
+        garbage) printf 'Failed transaction (2147483646)\\n' ;;
+    esac
+fi
+exit 0
+"""
+
 CMD_STUB = """#!/bin/sh
 { printf 'cmd'; for a in "$@"; do printf ' <%s>' "$a"; done; printf '\\n'; } >> "$TENDRIL_CMD_LOG"
+if [ "${TENDRIL_FAKE_CMD:-}" = "fail" ]; then
+    printf 'SecurityException: INTERACT_ACROSS_USERS\\n' >&2
+    exit 7
+fi
 case "$*" in
     *"list packages"*)
         _n=$(cat "$TENDRIL_VC_FILE" 2>/dev/null)
@@ -301,6 +312,7 @@ case "$*" in
 esac
 exit 0
 """
+
 
 
 class Manifest(PhoneEnv):
@@ -987,12 +999,15 @@ class UpgradeScriptRun(PhoneEnv):
         p = self.run_generated("upgrade", stdin="\n", tty=True,
                                TENDRIL_FAKE_VC="5")
         out = p.stdout + p.stderr
-        self.assertEqual(p.returncode, 0, out)
+        # NOT a success: the update did not complete, and nothing was
+        # launched (the package presence was never confirmed)
+        self.assertEqual(p.returncode, 1, out)
         self.assertIn("not installed yet - run  tendril --upgrade  again",
                       p.stdout)
         self.assertFalse(os.path.exists(
             os.path.join(self.home, ".config", "tendril",
                          "link-apk.sha256")))
+        self.assertEqual(self.log_lines(self.am_log), [])
 
     def test_staged_apk_versioncode_verified_after_enter(self):
         self.fresh_phone(recorded=False)
@@ -1004,6 +1019,9 @@ class UpgradeScriptRun(PhoneEnv):
         with open(os.path.join(self.home, ".config", "tendril",
                                "link-apk.sha256")) as f:
             self.assertEqual(f.read().strip(), sha_bytes(APK_BYTES))
+        # a CONFIRMED install may launch the exact MainActivity
+        self.assertEqual(self.log_lines(self.am_log),
+                         ["am <start> <-n> <app.tendril.link/.MainActivity>"])
 
     def test_upgrade_enables_external_apps_only_when_opening(self):
         # without a pending APK the upgrade must not touch ~/.termux at all
@@ -1104,6 +1122,71 @@ class UpgradeScriptRun(PhoneEnv):
         self.assertEqual(
             [c for c in self.asset_calls() if "link-apk" in c], [])
         self.assertNotIn("handoff", out)
+
+    # ---- probe FAILURE is UNKNOWN - never installed, never absent ------
+
+    def test_failed_probes_are_unknown_and_change_nothing(self):
+        # The real S21 shape: `pm path` dies with "Failed transaction
+        # (2147483646)" and `cmd` dies with INTERACT_ACROSS_USERS.
+        # installed-vs-absent is UNKNOWABLE: no download, no installer,
+        # no launch, one truthful row + guidance, non-zero exit.
+        self.fresh_phone(recorded=False)
+        p = self.run_generated("upgrade", stdin="",
+                               TENDRIL_FAKE_PM="fail", TENDRIL_FAKE_CMD="fail")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn("  TENDRIL Link   state unknown - Android probes refused",
+                      p.stdout)
+        self.assertIn("installed-vs-absent is UNKNOWN", out)
+        self.assertEqual(
+            [c for c in self.asset_calls() if "link-apk" in c], [])
+        self.assertEqual(self.log_lines(self.open_log), [])
+        self.assertNotIn("handoff", out)
+
+    def test_unparseable_probe_output_is_unknown_never_installed(self):
+        # THE false-positive shape: the transaction error text lands on
+        # STDOUT and exit 0 - non-empty garbage must never count as
+        # presence evidence (the old code read it as "installed").
+        self.fresh_phone(recorded=False)
+        p = self.run_generated("upgrade", stdin="",
+                               TENDRIL_FAKE_PM="garbage", TENDRIL_FAKE_CMD="fail")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn("  TENDRIL Link   state unknown - Android probes refused",
+                      p.stdout)
+        self.assertNotIn("  TENDRIL Link   installed", out)
+        self.assertNotIn("  TENDRIL Link   current", out)
+        self.assertEqual(self.log_lines(self.am_log), [])
+
+    def test_unknown_with_a_cached_apk_points_at_it(self):
+        # UNKNOWN cannot act, but it can be honest about the one safe
+        # manual path: the already-verified cached APK.
+        doc = self.fresh_phone(recorded=False)
+        cache = os.path.join(self.home, ".cache", "tendril")
+        os.makedirs(cache, exist_ok=True)
+        parked = os.path.join(cache, "tendril-link-%s.apk" % doc["versionName"])
+        with open(parked, "wb") as f:
+            f.write(APK_BYTES)
+        p = self.run_generated("upgrade", stdin="",
+                               TENDRIL_FAKE_PM="fail", TENDRIL_FAKE_CMD="fail")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn("termux-open", out)
+        self.assertIn(parked, out)
+        self.assertEqual(self.log_lines(self.open_log), [])   # not opened FOR you
+
+    def test_one_clean_absent_answer_outweighs_failed_others(self):
+        # `pm path` ran CLEAN (exit 0, empty) - that alone is absence
+        # evidence, even when the cmd probes are denied; the fallback
+        # download then opens the installer (the safe direction).
+        self.fresh_phone(recorded=False)
+        p = self.run_generated("upgrade", stdin="",
+                               TENDRIL_FAKE_PM="0", TENDRIL_FAKE_CMD="fail")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("  TENDRIL Link   not installed - installer ready",
+                      p.stdout)
+        self.assertIn("  handoff: app", out)
 
     def test_link_not_staged_row(self):
         self.seed_snapshot()
