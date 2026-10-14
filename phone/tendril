@@ -229,7 +229,15 @@ enroll_phone() {
     _e_label=$(getprop ro.product.model 2>/dev/null | tr -c 'A-Za-z0-9._-' '-' | cut -c1-32)
     _e_label=${_e_label%-}
     [ -n "$_e_label" ] || _e_label=termux
-    _e_proof=$(printf '%s\n%s %s' "$_e_secret" "$_e_type" "$_e_b64" | sha256sum | cut -d ' ' -f1)
+    # portable hasher: Termux has sha256sum, macOS ships only shasum
+    if command -v sha256sum >/dev/null 2>&1; then
+        _e_hash="sha256sum"
+    elif command -v shasum >/dev/null 2>&1; then
+        _e_hash="shasum -a 256"
+    else
+        enroll_fail hash "no sha256 tool found - install coreutils (or shasum)" 3
+    fi
+    _e_proof=$(printf '%s\n%s %s' "$_e_secret" "$_e_type" "$_e_b64" | $_e_hash | cut -d ' ' -f1)
     curl -fsS --max-time 15 -o /dev/null \
         -d "tendril-enroll-1 $_e_type $_e_b64 $_e_label $_e_proof" "$_e_url/$_e_topic" \
         || enroll_fail notify "could not reach the notification server $_e_url" 6
