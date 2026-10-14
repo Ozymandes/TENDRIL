@@ -32,11 +32,27 @@ import os
 import re
 import sys
 import tempfile
+import urllib.request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    import tendril_apk           # v0.2.1: read the APK's real signer
+except ImportError:              # stale install: manifest-only checks
+    tendril_apk = None
 
 USAGE = ("usage: tendril --phone-manifest\n"
          "       tendril --phone-asset <tendril|termux-url-opener|agent|link-apk>\n"
          "       tendril --phone-script <setup|upgrade>\n"
-         "       tendril --link-stage <path>")
+         "       tendril --link-stage <path>\n"
+         "       tendril --link-fetch [<release-tag>]")
+
+# The PRODUCTION signing certificate of TENDRIL Link (SHA-256 of the DER
+# certificate, lowercase hex) - the same value as config/link-signer.sha256
+# and the pin in phone/setup.sh (tests keep all three identical). Empty
+# until the release key exists: then --link-fetch refuses and --link-stage
+# keeps the per-host first-stage pin (development builds).
+LINK_RELEASE_SIGNER = "44fa9365d6ac01ef94b8f462a0161f946c023c7377013d198d654f526333e03b"
+LINK_RELEASE_BASE = "https://github.com/Ozymandes/TENDRIL/releases"
 
 MANIFEST_HEADER = "tendril-phone-manifest 1"
 PHONE_ASSETS = ("tendril", "termux-url-opener", "agent")
@@ -332,6 +348,7 @@ APK_NAME='@APK_NAME@'
 APK_SHA='@APK_SHA@'
 APK_SIZE='@APK_SIZE@'
 APK_SIGNER='@APK_SIGNER@'       # host-pinned signing-cert sha256 (the Link app re-checks it)
+LINK_PACKAGE='app.tendril.link'
 
 command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || {
     echo "PHONE // neither sha256sum nor shasum found - refusing to install unverified." >&2
@@ -406,14 +423,65 @@ fetch_asset() {
     return 0
 }
 
-# link_installed_code - the installed app.tendril.link versionCode
-# (best effort; empty when `cmd` cannot answer).
+# link_installed_code - the installed app.tendril.link versionCode, but
+# ONLY from a probe that RAN (exit 0): empty on any failure, and the
+# caller must treat that as version-UNKNOWN, never as a version.
 link_installed_code() {
-    command -v cmd >/dev/null 2>&1 || return 0
-    cmd package list packages --show-versioncode app.tendril.link 2>/dev/null |
-        sed -n 's/^package:app\.tendril\.link .*versionCode:\([0-9][0-9]*\).*$/\1/p' |
+    _lic_out=$(cmd package list packages --show-versioncode "$LINK_PACKAGE" 2>/dev/null)
+    _lic_rc=$?
+    [ "$_lic_rc" -eq 0 ] || return 0
+    printf '%s\n' "$_lic_out" |
+        sed -n "s/^package:$LINK_PACKAGE .*versionCode:\\([0-9][0-9]*\\).*$/\\1/p" |
         head -n 1
     return 0
+}
+
+# link_state - ANDROID PACKAGE REALITY for app.tendril.link as a strict
+# three-state answer on stdout: present | absent | unknown.
+#
+#   present   a probe RAN and returned PARSEABLE package evidence (a
+#             `package:<path>` line or a listed versionCode)
+#   absent    probes RAN clean (exit 0, empty answer) and provably do
+#             not know the package
+#   unknown   a probe FAILED - non-zero exit (transaction errors,
+#             SecurityException / INTERACT_ACROSS_USERS) or unparseable
+#             output. On some devices (Samsung + Termux) `pm path` dies
+#             with "Failed transaction (2147483646)": a failed probe is
+#             UNKNOWN and must never be read as installed or absent.
+#
+# A cached APK and a recorded sha from a PAST install are NEVER evidence
+# in any state. Only `present` may lead to launching the app.
+link_state() {
+    _ls_saw=0
+    _out=$(pm path "$LINK_PACKAGE" 2>/dev/null); _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+        case $_out in
+            package:*) printf present; return 0 ;;
+            "") _ls_saw=1 ;;
+            *) printf unknown; return 0 ;;
+        esac
+    fi
+    _out=$(cmd package path "$LINK_PACKAGE" 2>/dev/null); _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+        case $_out in
+            package:*) printf present; return 0 ;;
+            "") _ls_saw=1 ;;
+            *) printf unknown; return 0 ;;
+        esac
+    fi
+    _out=$(cmd package list packages --show-versioncode "$LINK_PACKAGE" 2>/dev/null); _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+        # presence needs PARSEABLE evidence: a listed versionCode with
+        # actual digits - an empty-version line proves nothing
+        _ls_code=$(printf '%s\n' "$_out" |
+            sed -n "s/^package:$LINK_PACKAGE .*versionCode:\\([0-9][0-9]*\\).*$/\\1/p" |
+            head -n 1)
+        if [ -n "$_ls_code" ]; then
+            printf present; return 0
+        fi
+        _ls_saw=1
+    fi
+    if [ "$_ls_saw" -eq 1 ]; then printf absent; else printf unknown; fi
 }
 
 # ensure_external_apps - add `allow-external-apps = true` to
@@ -437,6 +505,28 @@ ensure_external_apps() {
             || { rm -f "$_ea_new"; return 1; }
     fi
     mv -f "$_ea_new" "$_ea_props"
+    return 0
+}
+
+# ensure_extra_keys - put a KEYBOARD toggle on Termux's extra-keys
+# toolbar when the user has no extra-keys layout of their own. Inside a
+# TENDRIL session the host bridge turns mouse tracking on (touch
+# scrolling), and Termux then consumes every terminal TAP as a mouse
+# click: its onSingleTapUp shows the soft keyboard ONLY when tracking is
+# off, so a collapsed keyboard can never be re-raised by tapping the
+# screen (upstream termux-app#5184). The toolbar stays visible with the
+# keyboard down and its KEYBOARD key raises it regardless of tracking.
+# The user's own extra-keys layout is never touched; the default
+# show/hide toggle behaviour is never overridden (this file never writes
+# soft-keyboard-toggle-behaviour). Returns 0 when it wrote the row.
+ensure_extra_keys() {
+    _ek_props="$HOME/.termux/termux.properties"
+    if [ -f "$_ek_props" ] \
+       && grep -Eq '^[[:space:]]*extra-keys[[:space:]]*=' "$_ek_props"; then
+        return 1                                 # the user's layout wins
+    fi
+    mkdir -p "$HOME/.termux" || return 1
+    printf '%s\n' "extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]" >> "$_ek_props"
     return 0
 }
 
@@ -495,7 +585,25 @@ download_link_apk() {
     printf '%s' "$_dl_apk"
 }
 
+# obtain_link_apk - the staged APK, verified and parked: a cached copy is
+# reused ONLY when it passes the exact same sha256+size check (a cached
+# APK is a download optimization, NEVER install evidence).
+obtain_link_apk() {
+    _ob_parked="$HOME/.cache/tendril/tendril-link-$APK_NAME.apk"
+    if [ -s "$_ob_parked" ]; then
+        _ob_sha=$(sha_file "$_ob_parked")
+        _ob_size=$(wc -c < "$_ob_parked" | tr -d ' ')
+        if [ "$_ob_sha" = "$APK_SHA" ] && [ "$_ob_size" = "$APK_SIZE" ]; then
+            printf '%s' "$_ob_parked"
+            return 0
+        fi
+        rm -f "$_ob_parked"
+    fi
+    download_link_apk
+}
+
 FAILED=0
+LINK_CONFIRMED=0                 # Android-package presence PROVEN (never assumed)
 ROW_LAUNCHER=current
 ROW_URL=current
 ROW_AGENT=current
@@ -534,14 +642,17 @@ if [ "$MODE" = setup ]; then
             FAILED=1
         fi
     fi
+    if ensure_extra_keys; then _ek_changed=1; else _ek_changed=0; fi
     if ensure_external_apps; then
         ROW_TERMUX="allow-external-apps = true"
+    else
+        ROW_TERMUX="allow-external-apps already true"
+    fi
+    if [ "$_ek_changed" -eq 1 ] || [ "$ROW_TERMUX" = "allow-external-apps = true" ]; then
         if command -v termux-reload-settings >/dev/null 2>&1; then
             termux-reload-settings >/dev/null 2>&1 || true
             ROW_TERMUX="$ROW_TERMUX, settings reloaded"
         fi
-    else
-        ROW_TERMUX="allow-external-apps already true"
     fi
     if ensure_rc_path; then
         ROW_PATH="PATH line added to ~/.bashrc"
@@ -551,26 +662,64 @@ if [ "$MODE" = setup ]; then
 fi
 
 if [ -n "$APK_SHA" ]; then
-    _rec=""
-    [ -r "$HOME/.config/tendril/link-apk.sha256" ] \
-        && IFS= read -r _rec < "$HOME/.config/tendril/link-apk.sha256"
-    _inst=$(link_installed_code)
-    case $_inst in
-        "" | *[!0-9]*) _inst="" ;;
-    esac
-    if [ -n "$_inst" ] && [ "$_inst" -ge "$APK_CODE" ]; then
-        LINK_ROW=current                      # the phone already runs this build
-    elif [ "$_rec" = "$APK_SHA" ]; then
-        LINK_ROW=current                      # the user already installed this APK
-    else
-        PENDING_APK=$(download_link_apk); _dl_rc=$?
-        if [ "$_dl_rc" -eq 0 ] && [ -n "$PENDING_APK" ]; then
-            LINK_ROW="update ready"
+    # ANDROID PACKAGE REALITY decides as a strict three-state machine -
+    # never a cached APK, never a recorded sha from a PAST install, and
+    # NEVER a failed probe (on some devices pm path / cmd die with
+    # transaction or INTERACT_ACROSS_USERS errors: that is UNKNOWN):
+    _link_state=$(link_state)
+    _inst=""
+    if [ "$_link_state" = present ]; then
+        _inst=$(link_installed_code)
+        case $_inst in
+            "" | *[!0-9]*) _inst="" ;;
+        esac
+        if [ -z "$_inst" ]; then
+            _link_state=installed             # presence proven; version unreadable
+        elif [ "$_inst" -gt "$APK_CODE" ]; then
+            _link_state=newer
+        elif [ "$_inst" -eq "$APK_CODE" ]; then
+            _link_state=current
         else
-            LINK_ROW="download failed"
-            FAILED=1
+            _link_state=older
         fi
     fi
+    case $_link_state in
+        current)
+            LINK_ROW=current
+            LINK_CONFIRMED=1
+            record_link_sha || true ;;
+        newer)
+            LINK_ROW="phone has $_inst > staged $APK_CODE - kept"
+            LINK_CONFIRMED=1
+            record_link_sha || true ;;
+        installed)
+            LINK_ROW="installed"
+            LINK_CONFIRMED=1 ;;
+        absent | older)
+            PENDING_APK=$(obtain_link_apk); _dl_rc=$?
+            if [ "$_dl_rc" -eq 0 ] && [ -n "$PENDING_APK" ]; then
+                if [ "$_link_state" = absent ]; then
+                    LINK_ROW="not installed - installer ready"
+                else
+                    LINK_ROW="update ready"
+                fi
+            else
+                LINK_ROW="download failed"
+                FAILED=1
+            fi ;;
+        unknown)
+            # Probes refused: installed-vs-absent is UNKNOWABLE here. Do
+            # not change anything, do not launch anything, do not guess.
+            LINK_ROW="state unknown - Android probes refused"
+            FAILED=1
+            echo "PHONE // TENDRIL Link: this device refused the package probes (pm path / cmd)." >&2
+            echo "  installed-vs-absent is UNKNOWN - nothing was changed or launched." >&2
+            if [ -s "$HOME/.cache/tendril/tendril-link-$APK_NAME.apk" ]; then
+                echo "  to (re)install by hand, open the verified cached APK:" >&2
+                echo "    termux-open \"$HOME/.cache/tendril/tendril-link-$APK_NAME.apk\"" >&2
+            fi
+            echo "  then run  tendril install  again once the probes answer." >&2 ;;
+    esac
 fi
 
 if [ "$MODE" = setup ]; then
@@ -627,7 +776,12 @@ elif [ -n "$PENDING_APK" ]; then
                 esac
                 if [ -n "$_now" ] && [ "$_now" -lt "$APK_CODE" ]; then
                     echo "  not installed yet - run  tendril --upgrade  again after the update finishes."
+                    FAILED=1
                 elif record_link_sha; then
+                    # The user's Enter IS the confirmation that Android
+                    # finished; a readable versionCode is the stronger
+                    # proof. Only then may the app be launched.
+                    LINK_CONFIRMED=1
                     if [ -n "$_now" ]; then
                         echo "  recorded (versionCode $_now installed)"
                     else
@@ -640,6 +794,7 @@ elif [ -n "$PENDING_APK" ]; then
             else
                 echo ""
                 echo "PHONE // TENDRIL Link: not confirmed, sha not recorded - re-run tendril --upgrade after installing." >&2
+                FAILED=1
             fi
         fi
     else
@@ -657,6 +812,15 @@ if [ "$MODE" = setup ] && [ "$FAILED" -eq 0 ]; then
 fi
 
 [ "$FAILED" -eq 1 ] && exit 1
+
+# launch_link - open TENDRIL Link when this ran interactively AND the
+# package's presence is PROVEN (probe-confirmed state, or the user's own
+# installer ack). Never a guess: launching an absent package is exactly
+# the Error-type-3 class this script exists to prevent. Headless (the
+# Link app's own background RUN_COMMAND) never starts activities.
+if [ "$LINK_CONFIRMED" -eq 1 ] && [ -t 0 ] && command -v am >/dev/null 2>&1; then
+    am start -n "$LINK_PACKAGE/.MainActivity" >/dev/null 2>&1 || true
+fi
 exit 0
 """
 
@@ -752,6 +916,21 @@ def link_stage(path):
                          % problems[0])
         return 1
 
+    # v0.2.1: the APK's ACTUAL signer must be the manifest's - a manifest
+    # can say anything; the signing block cannot be faked without the key
+    if tendril_apk is not None:
+        try:
+            actual = tendril_apk.signer_sha256s(apk_path)
+        except (OSError, tendril_apk.ApkError) as exc:
+            sys.stderr.write("tendril --link-stage: refusing to stage: "
+                             "cannot read the APK signer (%s)\n" % exc)
+            return 1
+        if doc["signer_sha256"] not in actual:
+            sys.stderr.write("tendril --link-stage: refusing to stage: the "
+                             "APK is signed by %s, not the manifest's %s\n"
+                             % (actual[0][:12], doc["signer_sha256"][:12]))
+            return 1
+
     link = link_dir()
     pin_path = os.path.join(link, "signer.sha256")
     old_pin = None
@@ -760,10 +939,22 @@ def link_stage(path):
             old_pin = f.read().strip()
     except OSError:
         old_pin = None
+    rotated = False
     if old_pin and old_pin != doc["signer_sha256"]:
-        sys.stderr.write("tendril --link-stage: refusing to stage: signing "
-                         "key changed - Android would refuse an in-place "
-                         "update\n")
+        # the ONE allowed change: a development pin -> the official release
+        # key (pinned in this file). Phones on the old key must reinstall
+        # once; Android refuses an in-place update across signers.
+        if LINK_RELEASE_SIGNER and doc["signer_sha256"] == LINK_RELEASE_SIGNER:
+            rotated = True
+        else:
+            sys.stderr.write("tendril --link-stage: refusing to stage: signing "
+                             "key changed - Android would refuse an in-place "
+                             "update\n")
+            return 1
+    if LINK_RELEASE_SIGNER and old_pin == LINK_RELEASE_SIGNER \
+            and doc["signer_sha256"] != LINK_RELEASE_SIGNER:
+        sys.stderr.write("tendril --link-stage: refusing to stage: not signed "
+                         "by the TENDRIL release key\n")
         return 1
 
     staged_json = os.path.join(link, "tendril-link.json")
@@ -773,7 +964,7 @@ def link_stage(path):
         prev_code = prev.get("versionCode") if isinstance(prev, dict) else None
     except (OSError, ValueError):
         prev_code = None
-    if type(prev_code) is int and doc["versionCode"] < prev_code:
+    if type(prev_code) is int and doc["versionCode"] < prev_code and not rotated:
         sys.stderr.write("tendril --link-stage: refusing to stage: "
                          "versionCode %d is lower than the staged %d\n"
                          % (doc["versionCode"], prev_code))
@@ -781,14 +972,94 @@ def link_stage(path):
 
     _atomic_copy(apk_path, os.path.join(link, "tendril-link.apk"))
     _atomic_write(json.dumps(doc, sort_keys=True) + "\n", staged_json)
-    if not old_pin:
+    if not old_pin or rotated:
         _atomic_write(doc["signer_sha256"] + "\n", pin_path)
 
+    if rotated:
+        print("  signer rotated to the TENDRIL release key - phones still on the "
+              "development build reinstall TENDRIL Link once")
     print("TENDRIL // LINK STAGED")
     print("  version   %s" % doc["versionName"])
     print("  build     %s" % doc["build"])
     print("  sha256    %s" % doc["sha256"][:12])
     return 0
+
+
+def link_fetch(tag=None, opener=None, out=sys.stdout):
+    """`tendril --link-fetch [<tag>]` (v0.2.1): stage the OFFICIAL TENDRIL
+    Link release for this host's phones - download the release manifest
+    and APK from GitHub (latest release, or <tag>), require the pinned
+    release signer in the manifest AND in the APK's signing block, the
+    sha256 + size, then stage it through link_stage (versionCode and pin
+    rules included). Idempotent: an already-staged build is a no-op.
+    Returns an exit code; one line on any refusal."""
+    if not LINK_RELEASE_SIGNER:
+        sys.stderr.write("tendril --link-fetch: no release signer is pinned in "
+                         "this TENDRIL version - nothing fetched\n")
+        return 1
+    if tag is not None and not TOKEN_RE.match(tag):
+        sys.stderr.write("tendril --link-fetch: bad release tag\n")
+        return 2
+    base = ("%s/download/%s" % (LINK_RELEASE_BASE, tag) if tag
+            else "%s/latest/download" % LINK_RELEASE_BASE)
+    open_ = opener or urllib.request.urlopen
+
+    def get(name, limit):
+        req = urllib.request.Request("%s/%s" % (base, name),
+                                     headers={"User-Agent": "tendril-link-fetch"})
+        with open_(req, timeout=60) as resp:
+            body = resp.read(limit + 1)
+        if len(body) > limit:
+            raise ValueError("%s is larger than expected" % name)
+        return body
+
+    try:
+        doc = json.loads(get("tendril-link.json", 64 * 1024).decode("utf-8"))
+    except (OSError, ValueError) as exc:
+        sys.stderr.write("tendril --link-fetch: could not read the release "
+                         "manifest (%s)\n" % exc)
+        return 1
+    if not isinstance(doc, dict) or doc.get("signer_sha256") != LINK_RELEASE_SIGNER:
+        sys.stderr.write("tendril --link-fetch: refusing: the release manifest "
+                         "does not name the pinned TENDRIL release key\n")
+        return 1
+    staged = staged_manifest()
+    if staged and staged.get("sha256") == doc.get("sha256"):
+        out.write("TENDRIL Link %s (%s) already staged\n"
+                  % (doc.get("versionName"), doc.get("versionCode")))
+        return 0
+    size = doc.get("size")
+    if type(size) is not int or not 0 < size <= 200 * 1024 * 1024:
+        sys.stderr.write("tendril --link-fetch: refusing: implausible APK size\n")
+        return 1
+    workdir = tempfile.mkdtemp(prefix="tendril-link-fetch-")
+    try:
+        try:
+            apk = get("tendril-link.apk", size)
+        except (OSError, ValueError) as exc:
+            sys.stderr.write("tendril --link-fetch: could not download the APK "
+                             "(%s)\n" % exc)
+            return 1
+        with open(os.path.join(workdir, "tendril-link.apk"), "wb") as f:
+            f.write(apk)
+        with open(os.path.join(workdir, "tendril-link.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump(doc, f)
+        if tendril_apk is None:
+            sys.stderr.write("tendril --link-fetch: tendril_apk.py is missing - "
+                             "re-run ./install\n")
+            return 1
+        return link_stage(workdir)        # sha256/size/schema/signer/pin rules
+    finally:
+        for name in ("tendril-link.apk", "tendril-link.json"):
+            try:
+                os.remove(os.path.join(workdir, name))
+            except OSError:
+                pass
+        try:
+            os.rmdir(workdir)
+        except OSError:
+            pass
 
 
 # ---------------------------------------------------------------- main
@@ -824,6 +1095,11 @@ def main(argv=None):
             return refuse_snapshot()
         sys.stdout.write(phone_script(argv[1]))
         return 0
+    if head == "--link-fetch":
+        if len(argv) > 2:
+            sys.stderr.write(USAGE + "\n")
+            return 2
+        return link_fetch(argv[1] if len(argv) == 2 else None)
     if head == "--link-stage":
         if len(argv) != 2:
             sys.stderr.write(USAGE + "\n")

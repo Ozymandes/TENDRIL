@@ -29,8 +29,19 @@ import tendril_phone as tp  # noqa: E402
 
 REMOTE_AGENTS = os.path.join(BIN, "remote-agents")
 LAUNCHER = os.path.join(REPO, "phone", "tendril")
-SIGNER = "d34e1f5aae91a43c5facef74886216d3389dbedb3b0850531747e97d0132c570"
-APK_BYTES = b"TENDRIL-LINK-APK-BYTES-" * 8
+TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if TESTS_DIR not in sys.path:
+    sys.path.insert(0, TESTS_DIR)
+from apkfixture import make_signed_apk, signer_of  # noqa: E402
+
+# a real APK-shaped zip with a real (v2-layout) signing block: --link-stage
+# reads the ACTUAL signer since v0.2.1, so fixtures must carry one
+CERT = b"TENDRIL-TEST-CERT"
+APK_BYTES = make_signed_apk(CERT, payload=b"TENDRIL-LINK-APK-BYTES-" * 8)
+SIGNER = signer_of(CERT)
+OTHER_CERT = b"SOMEONE-ELSES-CERT"
+RELEASE_CERT = b"TENDRIL-RELEASE-CERT"
+RELEASE_SIGNER = signer_of(RELEASE_CERT)
 LAUNCHERS = ("tendril", "termux-url-opener", "agent")
 
 LAUNCHER_BODIES = {
@@ -79,6 +90,7 @@ class PhoneEnv(unittest.TestCase):
         self.open_log = os.path.join(self.tmp, "open.log")
         self.cmd_log = os.path.join(self.tmp, "cmd.log")
         self.reload_log = os.path.join(self.tmp, "reload.log")
+        self.am_log = os.path.join(self.tmp, "am.log")
         self.vc_file = os.path.join(self.tmp, "vc.count")
 
     # -- paths ------------------------------------------------------------
@@ -143,6 +155,8 @@ class PhoneEnv(unittest.TestCase):
         self.stub("ssh", SSH_STUB)
         self.stub("termux-open", OPEN_STUB)
         self.stub("cmd", CMD_STUB)
+        self.stub("pm", PM_STUB)
+        self.stub("am", AM_STUB)
         self.stub("termux-reload-settings", RELOAD_STUB)
 
     # -- environment --------------------------------------------------------
@@ -158,8 +172,10 @@ class PhoneEnv(unittest.TestCase):
         e["TENDRIL_CMD_LOG"] = self.cmd_log
         e["TENDRIL_RELOAD_LOG"] = self.reload_log
         e["TENDRIL_VC_FILE"] = self.vc_file
+        e["TENDRIL_AM_LOG"] = self.am_log
         for k in ("TENDRIL_ALIAS", "AGENT_ALIAS", "PREFIX", "TENDRIL_FAKE_VC",
-                  "TENDRIL_FAKE_VC2", "TENDRIL_CORRUPT", "TENDRIL_SSH_FAIL"):
+                  "TENDRIL_FAKE_VC2", "TENDRIL_FAKE_PM", "TENDRIL_FAKE_CMD",
+                  "TENDRIL_CORRUPT", "TENDRIL_SSH_FAIL"):
             e.pop(k, None)
         e.update(over)
         return e
@@ -251,8 +267,36 @@ printf 'termux-reload-settings\\n' >> "$TENDRIL_RELOAD_LOG"
 exit 0
 """
 
+AM_STUB = """#!/bin/sh
+{ printf 'am'; for a in "$@"; do printf ' <%s>' "$a"; done; printf '\\n'; } >> "$TENDRIL_AM_LOG"
+exit 0
+"""
+
+PM_STUB = """#!/bin/sh
+# Android package-manager reality, faked (TENDRIL_FAKE_PM):
+#   1 (default) = present  -> `pm path` prints the package: line, exit 0
+#   0           = absent   -> exit 0, prints nothing (a CLEAN empty answer)
+#   fail        = FAILED   -> stderr 'Failed transaction (2147483646)', exit 1
+#                            (the real Samsung+Termux shape)
+#   garbage     = FAILED   -> stdout 'Failed transaction (2147483646)', exit 0
+#                            (unparseable output - must be UNKNOWN too)
+if [ "$1" = "path" ] && [ "$2" = "app.tendril.link" ]; then
+    case "${TENDRIL_FAKE_PM:-1}" in
+        1) printf 'package:/data/app/~~fake~~/app.tendril.link/base.apk\\n' ;;
+        0) : ;;
+        fail) printf 'Failed transaction (2147483646)\\n' >&2; exit 1 ;;
+        garbage) printf 'Failed transaction (2147483646)\\n' ;;
+    esac
+fi
+exit 0
+"""
+
 CMD_STUB = """#!/bin/sh
 { printf 'cmd'; for a in "$@"; do printf ' <%s>' "$a"; done; printf '\\n'; } >> "$TENDRIL_CMD_LOG"
+if [ "${TENDRIL_FAKE_CMD:-}" = "fail" ]; then
+    printf 'SecurityException: INTERACT_ACROSS_USERS\\n' >&2
+    exit 7
+fi
 case "$*" in
     *"list packages"*)
         _n=$(cat "$TENDRIL_VC_FILE" 2>/dev/null)
@@ -268,6 +312,7 @@ case "$*" in
 esac
 exit 0
 """
+
 
 
 class Manifest(PhoneEnv):
@@ -542,13 +587,52 @@ class LinkStage(PhoneEnv):
     def test_signer_change_refused(self):
         d, _ = self.pkg()
         self.assertEqual(self.run_cli("--link-stage", d)[0], 0)
-        d2, _ = self.pkg(doc_over={"signer_sha256": "e" * 64}, name="pkg2")
+        other = make_signed_apk(OTHER_CERT)
+        d2, _ = self.pkg(doc_over={"signer_sha256": signer_of(OTHER_CERT)},
+                         apk=other, name="pkg2")
         rc, out, err = self.run_cli("--link-stage", d2)
         self.assertNotEqual(rc, 0)
         self.assertIn("signing key changed", err)
         self.assertIn("Android would refuse an in-place update", err)
         with open(os.path.join(self.link(), "tendril-link.json")) as f:
             self.assertEqual(json.load(f)["signer_sha256"], SIGNER)
+
+    def test_manifest_lying_about_the_signer_is_refused(self):
+        # v0.2.1: the manifest names SIGNER, but the APK is signed by another
+        # key - the signing block decides, never the manifest
+        other = make_signed_apk(OTHER_CERT)
+        d, _ = self.pkg(apk=other)               # make_doc keeps SIGNER
+        rc, out, err = self.run_cli("--link-stage", d)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("the APK is signed by", err)
+        self.assertFalse(os.path.exists(self.link()))
+
+    def test_unsigned_or_non_apk_bytes_are_refused(self):
+        d, _ = self.pkg(apk=b"not an apk at all")
+        rc, _, err = self.run_cli("--link-stage", d)
+        self.assertNotEqual(rc, 0)
+        self.assertIn("cannot read the APK signer", err)
+        self.assertFalse(os.path.exists(self.link()))
+
+    def test_rotation_to_the_release_key_is_the_one_allowed_change(self):
+        from unittest import mock
+        d, _ = self.pkg()
+        self.assertEqual(self.run_cli("--link-stage", d)[0], 0)   # dev pin
+        release_cert = b"TENDRIL-RELEASE-CERT"
+        rel = make_signed_apk(release_cert, payload=b"release build")
+        d2, _ = self.pkg(doc_over={"signer_sha256": signer_of(release_cert),
+                                   "versionCode": 43},
+                         apk=rel, name="pkg2")
+        with mock.patch.object(tp, "LINK_RELEASE_SIGNER", signer_of(release_cert)):
+            rc = self.call_tp(tp.link_stage, d2)
+            self.assertEqual(rc, 0)
+            with open(os.path.join(self.link(), "signer.sha256")) as f:
+                self.assertEqual(f.read().strip(), signer_of(release_cert))
+            # ...and once on the release key, nothing else is ever accepted
+            d3, _ = self.pkg(apk=make_signed_apk(OTHER_CERT),
+                             doc_over={"signer_sha256": signer_of(OTHER_CERT),
+                                       "versionCode": 44}, name="pkg3")
+            self.assertNotEqual(self.call_tp(tp.link_stage, d3), 0)
 
     def test_versioncode_downgrade_refused(self):
         d, _ = self.pkg()
@@ -566,6 +650,123 @@ class LinkStage(PhoneEnv):
         rc, _, err = self.run_cli("--link-stage", d)
         self.assertNotEqual(rc, 0)
         self.assertIn("tendril-link.apk", err)
+
+
+class LinkFetch(PhoneEnv):
+    """tendril --link-fetch: the OFFICIAL release path — pinned signer
+    only, everything re-verified by link_stage. Runs against a fake
+    opener; no test ever touches the network."""
+
+    def fake_release(self, apk=None, doc_over=None):
+        """A fake opener serving tendril-link.json + tendril-link.apk
+        exactly as the GitHub release would: the APK is signed by the
+        release key and the manifest names that signer."""
+        if apk is None:
+            apk = make_signed_apk(RELEASE_CERT, payload=b"release build")
+        doc = make_doc(apk=apk,
+                       **{"signer_sha256": RELEASE_SIGNER,
+                          **(doc_over or {})})
+
+        class Resp:
+            def __init__(self, body):
+                self.body = body
+
+            def read(self, limit=-1):
+                return self.body
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        served = []
+
+        def opener(req, timeout=60):
+            name = req.full_url.rsplit("/", 1)[-1]
+            served.append(name)
+            if name == "tendril-link.json":
+                return Resp(json.dumps(doc).encode())
+            if name == "tendril-link.apk":
+                return Resp(apk)
+            raise OSError("404 " + name)
+
+        opener.served = served
+        return opener, doc
+
+    def fetch(self, opener, tag=None):
+        import io
+        out = io.StringIO()
+        rc = self.call_tp(lambda: tp.link_fetch(tag, opener=opener, out=out))
+        return rc, out.getvalue()
+
+    def pinned(self):
+        return mock.patch.object(tp, "LINK_RELEASE_SIGNER", RELEASE_SIGNER)
+
+    def test_unpinned_refuses_before_any_network(self):
+        # the pre-release truth: LINK_RELEASE_SIGNER == "" — nothing is
+        # fetched, nothing is staged
+        opener, _ = self.fake_release()
+        with mock.patch.object(tp, "LINK_RELEASE_SIGNER", ""):
+            rc, _ = self.fetch(opener)
+        self.assertEqual(rc, 1)
+        self.assertEqual(opener.served, [])          # never even looked
+        self.assertFalse(os.path.exists(self.link()))
+
+    def test_bad_tag_is_a_usage_error(self):
+        opener, _ = self.fake_release()
+        with self.pinned():
+            rc, _ = self.fetch(opener, tag="../evil")
+        self.assertEqual(rc, 2)
+        self.assertEqual(opener.served, [])
+
+    def test_manifest_naming_another_signer_is_refused(self):
+        opener, doc = self.fake_release(
+            apk=make_signed_apk(OTHER_CERT),
+            doc_over={"signer_sha256": signer_of(OTHER_CERT)})
+        with self.pinned():
+            rc, _ = self.fetch(opener)
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.exists(self.link()))
+
+    def test_implausible_size_refuses_before_the_download(self):
+        opener, _ = self.fake_release(doc_over={"size": 500 * 1024 * 1024})
+        with self.pinned():
+            rc, _ = self.fetch(opener)
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.exists(self.link()))
+
+    def test_happy_path_stages_the_release(self):
+        opener, doc = self.fake_release()
+        with self.pinned():
+            rc, out = self.fetch(opener)
+        self.assertEqual(rc, 0, out)
+        with open(os.path.join(self.link(), "tendril-link.json")) as f:
+            staged = json.load(f)
+        self.assertEqual(staged["sha256"], doc["sha256"])
+        self.assertEqual(staged["signer_sha256"], RELEASE_SIGNER)
+        with open(os.path.join(self.link(), "signer.sha256")) as f:
+            self.assertEqual(f.read().strip(), RELEASE_SIGNER)
+
+    def test_already_staged_is_a_no_op(self):
+        opener, doc = self.fake_release()
+        with self.pinned():
+            rc, _ = self.fetch(opener)
+            self.assertEqual(rc, 0)
+            opener.served.clear()
+            rc, out = self.fetch(opener)
+        self.assertEqual(rc, 0)
+        self.assertIn("already staged", out)
+
+    def test_lying_bytes_are_refused_by_link_stage(self):
+        garbage = b"not an apk at all"
+        opener, _ = self.fake_release(
+            apk=garbage,
+            doc_over={"sha256": sha_bytes(garbage), "size": len(garbage)})
+        with self.pinned():
+            rc, _ = self.fetch(opener)
+        self.assertEqual(rc, 1)
+        self.assertFalse(os.path.exists(self.link()))
 
 
 class GeneratedScriptBasics(PhoneEnv):
@@ -688,11 +889,12 @@ class UpgradeScriptRun(PhoneEnv):
         self.assertIn("<-o> <BatchMode=yes>", calls[0])
 
     def test_staged_apk_downloaded_verified_and_opened(self):
-        # Android 11+ package visibility: cmd usually answers nothing, so
-        # the recorded sha (written after the user presses Enter) decides
+        # An OLDER installed build: the staged APK downloads, verifies,
+        # opens and the versionCode is confirmed after the user's Enter
+        # (presence itself is `pm path` reality, never the recorded sha).
         self.fresh_phone(recorded=False)
         p = self.run_generated("upgrade", stdin="\n", tty=True,
-                               TENDRIL_FAKE_VC="")
+                               TENDRIL_FAKE_VC="5", TENDRIL_FAKE_VC2="42")
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
         apk = os.path.join(self.home, ".cache", "tendril",
@@ -705,7 +907,7 @@ class UpgradeScriptRun(PhoneEnv):
         self.assertIn("<application/vnd.android.package-archive>", opens[0])
         self.assertIn(apk, opens[0])
         self.assertIn("Tap Update, then press Enter here", p.stdout)
-        self.assertIn("recorded the APK sha", p.stdout)
+        self.assertIn("recorded (versionCode 42 installed)", p.stdout)
         rec = os.path.join(self.home, ".config", "tendril",
                            "link-apk.sha256")
         with open(rec) as f:
@@ -728,7 +930,7 @@ class UpgradeScriptRun(PhoneEnv):
         # start) and then blocked on `read`. Headless now: verify, park,
         # print the handoff, exit — no installer from Termux, no prompt.
         doc = self.fresh_phone(recorded=False)
-        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="")
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="5")
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
         apk = os.path.join(self.home, ".cache", "tendril",
@@ -760,7 +962,7 @@ class UpgradeScriptRun(PhoneEnv):
         proc = subprocess.Popen(
             ["sh", path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True,
-            env=self.env(TENDRIL_ALIAS="stubhost", TENDRIL_FAKE_VC=""))
+            env=self.env(TENDRIL_ALIAS="stubhost", TENDRIL_FAKE_VC="5"))
         try:
             rc = proc.wait(timeout=60)                # stdin still open
         except subprocess.TimeoutExpired:
@@ -784,7 +986,7 @@ class UpgradeScriptRun(PhoneEnv):
 
     def test_headless_corrupt_download_refuses_without_handoff(self):
         self.fresh_phone(recorded=False)
-        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="",
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="5",
                                TENDRIL_CORRUPT="link-apk")
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 1, out)
@@ -797,12 +999,15 @@ class UpgradeScriptRun(PhoneEnv):
         p = self.run_generated("upgrade", stdin="\n", tty=True,
                                TENDRIL_FAKE_VC="5")
         out = p.stdout + p.stderr
-        self.assertEqual(p.returncode, 0, out)
+        # NOT a success: the update did not complete, and nothing was
+        # launched (the package presence was never confirmed)
+        self.assertEqual(p.returncode, 1, out)
         self.assertIn("not installed yet - run  tendril --upgrade  again",
                       p.stdout)
         self.assertFalse(os.path.exists(
             os.path.join(self.home, ".config", "tendril",
                          "link-apk.sha256")))
+        self.assertEqual(self.log_lines(self.am_log), [])
 
     def test_staged_apk_versioncode_verified_after_enter(self):
         self.fresh_phone(recorded=False)
@@ -814,6 +1019,9 @@ class UpgradeScriptRun(PhoneEnv):
         with open(os.path.join(self.home, ".config", "tendril",
                                "link-apk.sha256")) as f:
             self.assertEqual(f.read().strip(), sha_bytes(APK_BYTES))
+        # a CONFIRMED install may launch the exact MainActivity
+        self.assertEqual(self.log_lines(self.am_log),
+                         ["am <start> <-n> <app.tendril.link/.MainActivity>"])
 
     def test_upgrade_enables_external_apps_only_when_opening(self):
         # without a pending APK the upgrade must not touch ~/.termux at all
@@ -850,12 +1058,135 @@ class UpgradeScriptRun(PhoneEnv):
         self.assertFalse(os.path.exists(
             os.path.join(self.home, ".cache", "tendril")))
 
-    def test_staged_apk_current_when_recorded_sha_matches(self):
+    def test_recorded_sha_is_never_install_evidence_when_package_absent(self):
+        # THE physical regression (v0.2.1 RC): the app was manually
+        # uninstalled, the recorded sha from the PAST install matched the
+        # staged manifest, and `tendril install` said "current" and then
+        # failed to launch a package that was not there. Android package
+        # reality (pm path) decides - the recorded sha never overrides it.
         self.fresh_phone(recorded=True)
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="",
+                               TENDRIL_FAKE_PM="0")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("  TENDRIL Link   not installed - installer ready",
+                      p.stdout)
+        self.assertNotIn("  TENDRIL Link   current", out)
+        # the APK was re-fetched (no cached copy) and handed off
+        self.assertIn("  handoff: app", out)
+
+    def test_cached_apk_is_reused_when_the_package_is_absent(self):
+        # A cached copy passes the same sha256+size check and is handed to
+        # Android's installer WITHOUT a re-download - the manual-uninstall
+        # recovery is exactly `tendril install`, zero re-download.
+        doc = self.fresh_phone(recorded=True)
+        cache = os.path.join(self.home, ".cache", "tendril")
+        os.makedirs(cache, exist_ok=True)
+        parked = os.path.join(cache, "tendril-link-%s.apk" % doc["versionName"])
+        with open(parked, "wb") as f:
+            f.write(APK_BYTES)
+        calls_before = len(self.asset_calls())
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="",
+                               TENDRIL_FAKE_PM="0")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(len(self.asset_calls()), calls_before)   # no re-download
+        self.assertIn("  APK saved: %s" % parked, p.stdout)
+        self.assertIn("  APK verified: %d %s %d %s" % (
+            doc["versionCode"], doc["sha256"], doc["size"],
+            doc["signer_sha256"]), p.stdout)
+        self.assertIn("  handoff: app", out)
+
+    def test_newer_installed_build_is_never_downgraded(self):
+        # the phone runs a NEWER production build than the host has staged:
+        # no download, no installer, one honest row, exit 0
+        self.fresh_phone(recorded=False)
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="99")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("  TENDRIL Link   phone has 99 > staged 42 - kept",
+                      p.stdout)
+        self.assertEqual(
+            [c for c in self.asset_calls() if "link-apk" in c], [])
+        self.assertEqual(self.log_lines(self.open_log), [])
+        self.assertNotIn("handoff", out)
+
+    def test_present_but_unreadable_version_is_left_alone(self):
+        # pm path proves PRESENCE while the versionCode listing cannot
+        # answer: never reinstall over an unknown version from Termux
+        self.fresh_phone(recorded=False)
         p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="")
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertEqual(self.asset_calls(), [])
-        self.assertIn("  TENDRIL Link   current", p.stdout)
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("  TENDRIL Link   installed", p.stdout)
+        self.assertEqual(
+            [c for c in self.asset_calls() if "link-apk" in c], [])
+        self.assertNotIn("handoff", out)
+
+    # ---- probe FAILURE is UNKNOWN - never installed, never absent ------
+
+    def test_failed_probes_are_unknown_and_change_nothing(self):
+        # The real S21 shape: `pm path` dies with "Failed transaction
+        # (2147483646)" and `cmd` dies with INTERACT_ACROSS_USERS.
+        # installed-vs-absent is UNKNOWABLE: no download, no installer,
+        # no launch, one truthful row + guidance, non-zero exit.
+        self.fresh_phone(recorded=False)
+        p = self.run_generated("upgrade", stdin="",
+                               TENDRIL_FAKE_PM="fail", TENDRIL_FAKE_CMD="fail")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn("  TENDRIL Link   state unknown - Android probes refused",
+                      p.stdout)
+        self.assertIn("installed-vs-absent is UNKNOWN", out)
+        self.assertEqual(
+            [c for c in self.asset_calls() if "link-apk" in c], [])
+        self.assertEqual(self.log_lines(self.open_log), [])
+        self.assertNotIn("handoff", out)
+
+    def test_unparseable_probe_output_is_unknown_never_installed(self):
+        # THE false-positive shape: the transaction error text lands on
+        # STDOUT and exit 0 - non-empty garbage must never count as
+        # presence evidence (the old code read it as "installed").
+        self.fresh_phone(recorded=False)
+        p = self.run_generated("upgrade", stdin="",
+                               TENDRIL_FAKE_PM="garbage", TENDRIL_FAKE_CMD="fail")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn("  TENDRIL Link   state unknown - Android probes refused",
+                      p.stdout)
+        self.assertNotIn("  TENDRIL Link   installed", out)
+        self.assertNotIn("  TENDRIL Link   current", out)
+        self.assertEqual(self.log_lines(self.am_log), [])
+
+    def test_unknown_with_a_cached_apk_points_at_it(self):
+        # UNKNOWN cannot act, but it can be honest about the one safe
+        # manual path: the already-verified cached APK.
+        doc = self.fresh_phone(recorded=False)
+        cache = os.path.join(self.home, ".cache", "tendril")
+        os.makedirs(cache, exist_ok=True)
+        parked = os.path.join(cache, "tendril-link-%s.apk" % doc["versionName"])
+        with open(parked, "wb") as f:
+            f.write(APK_BYTES)
+        p = self.run_generated("upgrade", stdin="",
+                               TENDRIL_FAKE_PM="fail", TENDRIL_FAKE_CMD="fail")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 1, out)
+        self.assertIn("termux-open", out)
+        self.assertIn(parked, out)
+        self.assertEqual(self.log_lines(self.open_log), [])   # not opened FOR you
+
+    def test_one_clean_absent_answer_outweighs_failed_others(self):
+        # `pm path` ran CLEAN (exit 0, empty) - that alone is absence
+        # evidence, even when the cmd probes are denied; the fallback
+        # download then opens the installer (the safe direction).
+        self.fresh_phone(recorded=False)
+        p = self.run_generated("upgrade", stdin="",
+                               TENDRIL_FAKE_PM="0", TENDRIL_FAKE_CMD="fail")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("  TENDRIL Link   not installed - installer ready",
+                      p.stdout)
+        self.assertIn("  handoff: app", out)
 
     def test_link_not_staged_row(self):
         self.seed_snapshot()
@@ -929,7 +1260,11 @@ class SetupScriptRun(PhoneEnv):
         self.assertEqual(stat.S_IMODE(os.stat(alias).st_mode), 0o600)
         props = os.path.join(self.home, ".termux", "termux.properties")
         with open(props) as f:
-            self.assertEqual(f.read(), "allow-external-apps = true\n")
+            self.assertEqual(f.read(),
+                             "extra-keys = [['ESC','/',{key: '-', popup: '|'},"
+                             "'HOME','UP','END','PGUP','KEYBOARD'], "
+                             "['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]\n"
+                             "allow-external-apps = true\n")
         self.assertEqual(self.log_lines(self.reload_log),
                          ["termux-reload-settings"])
         bashrc = os.path.join(self.home, ".bashrc")
@@ -940,14 +1275,16 @@ class SetupScriptRun(PhoneEnv):
         self.assertIn("LINK READY", p.stdout)
 
     def test_setup_installs_staged_link_apk(self):
-        # a brand-new phone gets TENDRIL Link from the same verified path
+        # a brand-new phone has NO app.tendril.link package (pm path
+        # answers nothing): the staged APK downloads, verifies and opens
         self.host_ready()
         self.stage()
         p = self.run_generated("setup", stdin="\n", tty=True,
-                               TENDRIL_FAKE_VC="")
+                               TENDRIL_FAKE_VC="", TENDRIL_FAKE_PM="0")
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
-        self.assertIn("  TENDRIL Link   update ready", p.stdout)
+        self.assertIn("  TENDRIL Link   not installed - installer ready",
+                      p.stdout)
         opens = self.log_lines(self.open_log)
         self.assertEqual(len(opens), 1)
         self.assertIn("<application/vnd.android.package-archive>", opens[0])
@@ -1021,8 +1358,42 @@ class SetupScriptRun(PhoneEnv):
         self.assertEqual(lines[1], "allow-external-apps = true")
         self.assertEqual(lines[2],
                          "# allow-external-apps = false (kept as a comment)")
-        self.assertEqual(len(lines), 3)
+        # the keyboard toggle: the user had no extra-keys layout, so the
+        # default row + KEYBOARD lands AFTER their untouched lines
+        self.assertTrue(lines[3].startswith("extra-keys = [["), lines[3])
+        self.assertIn("'KEYBOARD'", lines[3])
+        self.assertEqual(len(lines), 4)
         self.assertEqual(len(self.log_lines(self.reload_log)), 1)
+
+    def test_setup_preserves_a_custom_extra_keys_layout(self):
+        # a user's own extra-keys layout is THEIRS: the keyboard toggle is
+        # only guaranteed when no extra-keys line exists at all
+        self.host_ready()
+        props = os.path.join(self.home, ".termux", "termux.properties")
+        os.makedirs(os.path.dirname(props), exist_ok=True)
+        with open(props, "w") as f:
+            f.write("allow-external-apps = false\nextra-keys = [[CTRL]]\n")
+        p = self.run_generated("setup", stdin="")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(props) as f:
+            self.assertEqual(f.read(),
+                             "allow-external-apps = true\nextra-keys = [[CTRL]]\n")
+
+    def test_setup_extra_keys_is_idempotent(self):
+        self.host_ready()
+        self.assertEqual(self.run_generated("setup", stdin="").returncode, 0)
+        props = os.path.join(self.home, ".termux", "termux.properties")
+        with open(props) as f:
+            first = f.read()
+        self.assertEqual(first.count("extra-keys"), 1)
+        self.assertIn("'KEYBOARD'", first)
+        reloads_after_run1 = len(self.log_lines(self.reload_log))
+        self.assertEqual(self.run_generated("setup", stdin="").returncode, 0)
+        with open(props) as f:
+            self.assertEqual(f.read(), first)          # byte-identical
+        # nothing left to reload on the second run
+        self.assertEqual(len(self.log_lines(self.reload_log)),
+                         reloads_after_run1)
 
     def test_setup_never_touches_ssh(self):
         self.host_ready()

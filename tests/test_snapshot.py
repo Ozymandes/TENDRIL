@@ -442,27 +442,44 @@ class OptionalSections(unittest.TestCase):
 
     def test_tuple_contract_registers_section_and_capability(self):
         sec = {"generated_at": 1, "providers": []}
-        extra, caps = self.call(cap=lambda budget_s=1.0: (sec, "capacity"))
+        extra, caps = self.call(cap=lambda budget_s=1.0, discovered=None: (sec, "capacity"))
         self.assertEqual(extra, {"capacity": sec})
         self.assertEqual(caps, ["capacity"])
 
+    def test_active_provider_hints_reach_capacity_discovery(self):
+        seen = []
+
+        def capacity(budget_s=1.0, discovered=None):
+            seen.extend(discovered or [])
+            return {"generated_at": 1, "providers": []}, "capacity"
+
+        hint = {"provider": "openai", "model": "gpt-5.6-sol",
+                "harness": "pi", "source": "active_sessions"}
+        with mock.patch.dict(sys.modules, {
+                "tendril_capacity": _fake_module("tendril_capacity", capacity),
+                "tendril_schedule": None, "tendril_health": None}):
+            extra, caps = ra._optional_sections(provider_hints=[hint])
+        self.assertEqual(seen, [hint])
+        self.assertEqual(caps, ["capacity"])
+        self.assertIn("capacity", extra)
+
     def test_none_section_registers_nothing(self):
-        self.assertEqual(self.call(cap=lambda budget_s=1.0: (None,
+        self.assertEqual(self.call(cap=lambda budget_s=1.0, discovered=None: (None,
                                                              "capacity")),
                          ({}, []))
 
     def test_empty_section_registers_no_capability(self):
-        self.assertEqual(self.call(cap=lambda budget_s=1.0: ({}, "capacity")),
+        self.assertEqual(self.call(cap=lambda budget_s=1.0, discovered=None: ({}, "capacity")),
                          ({}, []))
 
     def test_bare_dict_section_is_tolerated(self):
         sec = {"generated_at": 2, "providers": [{"id": "claude"}]}
-        extra, caps = self.call(cap=lambda budget_s=1.0: sec)
+        extra, caps = self.call(cap=lambda budget_s=1.0, discovered=None: sec)
         self.assertEqual(extra, {"capacity": sec})
         self.assertEqual(caps, ["capacity"])
 
     def test_hook_exception_is_swallown_and_does_not_block_the_sibling(self):
-        def boom(budget_s=1.0):
+        def boom(budget_s=1.0, discovered=None):
             raise RuntimeError("boom")
         sec = {"available": True, "tasks": []}
         extra, caps = self.call(cap=boom,
@@ -483,7 +500,7 @@ class OptionalSections(unittest.TestCase):
 
         with mock.patch.dict(sys.modules, {
                 "tendril_capacity": _fake_module("tendril_capacity",
-                                                 lambda budget_s=1.0: cap),
+                                                 lambda budget_s=1.0, discovered=None: cap),
                 "tendril_schedule": _fake_module("tendril_schedule",
                                                  lambda snap=None: sched),
                 "tendril_health": _fake_module("tendril_health",
@@ -502,7 +519,7 @@ class OptionalSections(unittest.TestCase):
         self.assertLessEqual(ra._doc_bytes(doc), ra._SNAPSHOT_MAX_BYTES)
 
     def test_hook_failure_omits_the_section_from_the_doc(self):
-        def boom(budget_s=1.0):
+        def boom(budget_s=1.0, discovered=None):
             raise RuntimeError("boom")
 
         def fake_run(args, timeout=6):

@@ -171,6 +171,144 @@ link_nonce() {
     return 0
 }
 
+# enroll_phone <user@host> <ntfy-url> <topic> <secret> <fp|-> - first-time
+# pairing (v0.2.1), run by TENDRIL Link after it scans the host's QR. Never
+# typed by hand. Pins the host key from the QR, writes the alias, publishes
+# this phone's PUBLIC key with a proof of the one-time secret, then waits
+# until the host has installed it. Last line: `ENROLL ok` or `ENROLL <why>`.
+enroll_fail() { echo "ENROLL $1"; [ -n "${2:-}" ] && echo "[tendril] $2" >&2; exit "$3"; }
+enroll_phone() {
+    _e_target=$1 _e_url=$2 _e_topic=$3 _e_secret=$4 _e_fp=$5
+    LC_ALL=C; export LC_ALL
+    printf '%s' "$_e_target" | grep -qE '^[A-Za-z0-9._-]{1,64}@[A-Za-z0-9._-]{1,253}$' \
+        || enroll_fail usage "bad ssh target" 2
+    printf '%s' "$_e_url" | grep -qE '^https?://[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?$' \
+        || enroll_fail usage "bad notification server url" 2
+    printf '%s' "$_e_topic" | grep -qE '^tendril-enroll-[A-Za-z0-9_-]{16,48}$' \
+        || enroll_fail usage "bad enrollment topic" 2
+    printf '%s' "$_e_secret" | grep -qE '^[A-Za-z0-9_-]{24,64}$' \
+        || enroll_fail usage "bad enrollment secret" 2
+    [ "$_e_fp" = "-" ] || printf '%s' "$_e_fp" | grep -qE '^SHA256:[A-Za-z0-9+/]{43}$' \
+        || enroll_fail usage "bad host key fingerprint" 2
+    command -v ssh >/dev/null 2>&1 && command -v ssh-keygen >/dev/null 2>&1 \
+        || enroll_fail openssh "openssh is missing - run the TENDRIL phone setup again" 3
+    _e_host=${_e_target#*@}
+    (umask 077 && mkdir -p "$HOME/.ssh") || enroll_fail ssh-dir "cannot create ~/.ssh" 3
+    if [ ! -f "$HOME/.ssh/id_ed25519" ]; then
+        ssh-keygen -q -t ed25519 -N '' -C termux -f "$HOME/.ssh/id_ed25519" </dev/null \
+            || enroll_fail keygen "could not create an SSH key" 3
+    fi
+    _e_known="-o StrictHostKeyChecking=yes"
+    if [ "$_e_fp" = "-" ]; then
+        _e_known="-o StrictHostKeyChecking=accept-new"   # host has no ed25519 key
+    else
+        _e_line=$(ssh-keyscan -t ed25519 -T 6 "$_e_host" 2>/dev/null | grep -v '^#' | head -n 1)
+        [ -n "$_e_line" ] || enroll_fail unreachable \
+            "cannot reach $_e_host - is Tailscale connected on this phone?" 4
+        _e_got=$(printf '%s\n' "$_e_line" | ssh-keygen -lf - 2>/dev/null | awk '{print $2}')
+        [ "$_e_got" = "$_e_fp" ] || enroll_fail hostkey \
+            "$_e_host presented a different host key than the pairing QR - refusing" 5
+        # the QR is the authority: drop any stale entry, pin the verified key
+        ssh-keygen -R "$_e_host" >/dev/null 2>&1
+        printf '%s\n' "$_e_line" >> "$HOME/.ssh/known_hosts"
+        chmod 600 "$HOME/.ssh/known_hosts" 2>/dev/null
+    fi
+    mkdir -p "$HOME/.config/tendril" || enroll_fail alias "cannot create ~/.config/tendril" 3
+    printf '%s\n' "$_e_target" > "$HOME/.config/tendril/alias.new.$$" \
+        && mv -f "$HOME/.config/tendril/alias.new.$$" "$HOME/.config/tendril/alias" \
+        || enroll_fail alias "cannot write ~/.config/tendril/alias" 3
+    # shellcheck disable=SC2086  # _e_known is a fixed option pair
+    if ssh -o BatchMode=yes -o ConnectTimeout=6 $_e_known "$_e_target" true 2>/dev/null; then
+        echo "ENROLL ok"; return 0            # already enrolled: nothing to publish
+    fi
+    _e_pub=$(cat "$HOME/.ssh/id_ed25519.pub" 2>/dev/null)
+    _e_type=$(printf '%s' "$_e_pub" | awk '{print $1}')
+    _e_b64=$(printf '%s' "$_e_pub" | awk '{print $2}')
+    [ "$_e_type" = "ssh-ed25519" ] && [ -n "$_e_b64" ] \
+        || enroll_fail keygen "the phone key id_ed25519.pub is not an ed25519 key" 3
+    _e_label=$(getprop ro.product.model 2>/dev/null | tr -c 'A-Za-z0-9._-' '-' | cut -c1-32)
+    _e_label=${_e_label%-}
+    [ -n "$_e_label" ] || _e_label=termux
+    _e_proof=$(printf '%s\n%s %s' "$_e_secret" "$_e_type" "$_e_b64" | sha256sum | cut -d ' ' -f1)
+    curl -fsS --max-time 15 -o /dev/null \
+        -d "tendril-enroll-1 $_e_type $_e_b64 $_e_label $_e_proof" "$_e_url/$_e_topic" \
+        || enroll_fail notify "could not reach the notification server $_e_url" 6
+    _e_n=0
+    while [ "$_e_n" -lt 45 ]; do          # ~90 s: the --pair waiter (2 s) or the guardian (30 s)
+        sleep 2
+        # shellcheck disable=SC2086
+        if ssh -o BatchMode=yes -o ConnectTimeout=6 $_e_known "$_e_target" true 2>/dev/null; then
+            echo "ENROLL ok"; return 0
+        fi
+        _e_n=$((_e_n + 1))
+    done
+    enroll_fail waiting "the host did not accept this phone - is the pairing QR still on screen? (tendril --pair)" 7
+}
+
+# install_phone - `tendril install` in Termux (v0.2.1): THE phone install /
+# repair / update command. A phone that knows its host takes the installer
+# from THAT host's own staged snapshot (`ssh <alias> remote-agents
+# --phone-script setup` - the same auditable script --upgrade runs): the
+# launchers, deep links, alias, the verified release-signed TENDRIL Link
+# APK and Android's installer, always in step with the release the host
+# actually runs, published or not. Only a phone with no host yet falls
+# back to the public bootstrap: ONE NAMED FILE on GitHub raw - a raw
+# DIRECTORY URL (ending in /phone) is always a 404 and is never
+# constructed here (tests/test_phone_install.py pins that forever).
+# Idempotent: re-running refreshes what moved and skips what is current.
+install_phone() {
+    case "${PREFIX:-}" in
+        */com.termux/*) ;;
+        *)
+            echo "[tendril] 'tendril install' here sets up an Android phone and runs in Termux."
+            echo "  On a TENDRIL host:  tendril install   (the host command)"
+            echo "  On a Mac client:    ./install --client   (from the TENDRIL checkout)"
+            exit 2 ;;
+    esac
+    _i_tmp="${TMPDIR:-$PREFIX/tmp}/tendril-setup.$$.sh"
+    _i_alias=${TENDRIL_ALIAS:-${AGENT_ALIAS:-$CONF_ALIAS}}
+    if [ -n "$_i_alias" ]; then
+        case $_i_alias in
+            -*) echo "[tendril] '$_i_alias' is not an SSH alias (leading '-')"; exit 2 ;;
+        esac
+        if ! command -v ssh >/dev/null 2>&1; then
+            echo "[tendril] ssh is missing - run: pkg install -y openssh mosh, then tendril install again."
+            exit 1
+        fi
+        # HOST FIRST: the paired host is the authority on what this phone
+        # should run. Its installer is fetched fully, then run - never a
+        # partial stream piped into sh - and GitHub is never consulted
+        # behind the host's back.
+        if ssh -o BatchMode=yes -o ConnectTimeout=8 "$_i_alias" \
+            "remote-agents --phone-script setup" > "$_i_tmp" \
+           && [ -s "$_i_tmp" ] && sh -n "$_i_tmp"; then
+            sh "$_i_tmp"
+            _i_rc=$?
+            rm -f "$_i_tmp"
+            # Interactive only: Android suppresses activity starts from a
+            # background (headless RUN_COMMAND) context anyway.
+            if [ "$_i_rc" -eq 0 ] && [ -t 0 ]; then
+                open_link_app
+            fi
+            exit "$_i_rc"
+        fi
+        rm -f "$_i_tmp"
+        echo "[tendril] could not fetch the installer from $_i_alias - is the host up and Tailscale connected?"
+        echo "  (a paired phone installs from its host; GitHub is used only before the first pairing)"
+        exit 1
+    fi
+    _i_url="${TENDRIL_RAW:-https://raw.githubusercontent.com/Ozymandes/TENDRIL/${TENDRIL_REF:-main}/phone}/setup.sh"
+    if ! curl -fsSL --max-time 60 -o "$_i_tmp" "$_i_url" || ! sh -n "$_i_tmp"; then
+        rm -f "$_i_tmp"
+        echo "[tendril] could not download the phone installer from $_i_url - is the phone online?"
+        exit 1
+    fi
+    sh "$_i_tmp"
+    _i_rc=$?
+    rm -f "$_i_tmp"
+    exit "$_i_rc"
+}
+
 # finish_interactive <rc> - end an interactive session: the selector's Link
 # key (LINK_OPEN_STATUS) opens the app here on the phone; every other
 # status passes through untouched.
@@ -199,7 +337,7 @@ no_alias_help() {
     echo "                  (or: echo 'export TENDRIL_ALIAS=<alias>' >> ~/.bashrc)"
     echo "usage: tendril [<alias>] [attach|enter|resolve|focus|link <session-id>|snapshot] | tendril ssh <alias>"
     echo "       tendril [<alias>] [schedule show|cancel <id> | schedule add <payload> | capacity | health | herdr restart | rename <pane> <title|--clear>] | tendril link"
-    echo "first time: see docs/ANDROID.md or docs/MACOS.md — create a key, then: ssh-copy-id <alias>"
+    echo "first time on a phone: tendril install, then scan the host's pairing QR in TENDRIL Link"
 }
 
 # --version / --upgrade are flags, never aliases: they are handled before
@@ -217,6 +355,13 @@ case "${1:-}" in
             echo "tendril-phone unknown"
         fi
         exit 0 ;;
+    install)
+        [ "$#" -eq 1 ] || { echo "usage: tendril install"; exit 2; }
+        install_phone ;;
+    enroll)
+        [ "$#" -eq 6 ] || { echo "usage: tendril enroll <user@host> <ntfy-url> <topic> <secret> <fp|->"; exit 2; }
+        enroll_phone "$2" "$3" "$4" "$5" "$6"
+        exit $? ;;
     link)
         # LINK-CONTRACT-0.2 §4: NO args = LOCAL ONLY - fixed component,
         # never a URI built from input, no ssh, no alias. `tendril link
@@ -532,10 +677,13 @@ if [ -z "$FORCE_SSH" ] && command -v mosh >/dev/null 2>&1; then
     _t_log transport-chosen-mosh
     _t_log mosh-exec
     NONCE=$(link_nonce)
-    if [ -n "$NONCE" ]; then
-        MOSH_CMD="export TENDRIL_LINK_NONCE=$NONCE; exec $REMOTE_CMD"
-    else
-        MOSH_CMD="exec $REMOTE_CMD"
+    MOSH_CMD="exec $REMOTE_CMD"
+    [ -n "$NONCE" ] && MOSH_CMD="export TENDRIL_LINK_NONCE=$NONCE; $MOSH_CMD"
+    # Touch scrolling: Termux only tracks mouse modes 1000/1002 and Mosh
+    # forwards just Herdr's 1003, so swipes became arrow keys. Tell the
+    # host bridge this client is Termux; it then asks for 1002 instead.
+    if [ -n "${TERMUX_VERSION:-}" ] || case "${PREFIX:-}" in */com.termux/*) true ;; *) false ;; esac; then
+        MOSH_CMD="export TENDRIL_CLIENT=termux; $MOSH_CMD"
     fi
     if mosh --ssh="ssh $SESSION_CM_OPTS" "$ALIAS" \
         -- sh -lc "$MOSH_CMD"; then

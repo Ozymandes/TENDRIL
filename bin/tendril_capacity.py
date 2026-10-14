@@ -61,7 +61,11 @@ Privacy contract (structural, like tendril_telemetry):
   model names — nothing else.
 
 Never fabricate: a field that cannot be derived reliably is omitted (the key
-is absent). Providers with no data on this host do not appear at all.
+is absent). Provider presence is independent from metrics: an active,
+configured or recently observed identity may appear with models/harnesses and
+UNKNOWN state even when no quota percentage exists. Identity-only sightings
+expire after 24 h; current 7-day usage or configured adapters retain their
+provider independently.
 
 Performance: transcripts are scanned INCREMENTALLY — a cache
 (~/.cache/tendril/capacity.json, 0600, atomic) stores per-file accumulators
@@ -126,44 +130,80 @@ PRESSURE_PCT, CRITICAL_PCT, EXHAUSTED_PCT = 70.0, 90.0, 98.0
 # bumped whenever token accounting or window semantics change (the cache
 # holds per-file accumulators; a definition change must not be mixed with
 # numbers accumulated under the old definition)
-ACC_VERSION = 4               # 4: by_model windowed to the same 7 local
-#                             days as tokens_by_day + per-model/per-day
-#                             components {input,output,cache_write,
-#                             cache_read} + per-harness attribution;
-#                             old caches rebuild from scratch
+ACC_VERSION = 5               # 5: provider discovery sightings are cached
+#                             separately from adapter metrics; v4 token
+#                             accounting remains unchanged. Old caches rebuild
+#                             so identities cannot inherit stale assumptions.
 MDAY_KEEP_DAYS = 35           # per-model day buckets kept in the cache
 #                             (7 emitted; 35 bounds growth across idle
 #                             months while leaving prune headroom)
 
-# fixed provider ids (contract §1) + the pi providers seen on this host that
-# are not zai become their own provider ids (tokens only, state unknown
-# unless windows are known).
-FIXED_PROVIDERS = {"claude": "Claude", "codex": "Codex", "zai": "Z.AI"}
+# Provider identity and capacity acquisition are deliberately separate.
+# Discovery answers "which upstream providers are present/in use?" from
+# session metadata, transcripts, configured adapters and active Herdr hints.
+# Adapters answer the narrower question "which authoritative measurements can
+# this provider expose?". Adding a provider is one registry row; an adapter is
+# optional. Unknown identities remain visible through the generic projection.
+PROVIDER_REGISTRY = {
+    "claude": {
+        "label": "Claude",
+        "aliases": ("anthropic", "claude", "claude-bridge"),
+        "adapter": "claude_oauth",
+        "default_harness": "claude",
+    },
+    "codex": {
+        "label": "OpenAI / Codex",
+        "aliases": ("openai", "openai-codex", "codex"),
+        "adapter": "codex_wham",
+        "default_harness": "codex",
+    },
+    "zai": {
+        "label": "Z.AI",
+        "aliases": ("zai", "z.ai"),
+        "adapter": "zai_quota",
+        "default_harness": "pi",
+    },
+}
+_PROVIDER_ALIAS = {
+    alias: pid
+    for pid, spec in PROVIDER_REGISTRY.items()
+    for alias in spec["aliases"]
+}
+FIXED_PROVIDERS = {
+    pid: spec["label"] for pid, spec in PROVIDER_REGISTRY.items()
+}
+DISCOVERY_RETENTION_S = 24 * 3600
+MAX_DISCOVERED_PROVIDERS = 64
 
-# opt-in network adapters: id -> (endpoint, credential file, key path,
-# extra headers, parser). Default OFF; enabled via CONFIG_FILE.
+# Opt-in usage adapters. Registry rows own provider association and credential
+# location; fetch/parsing stays adapter-specific. Default OFF; enabled via
+# CONFIG_FILE. A provider can exist without any adapter.
 CLAUDE_OAUTH_URL = "https://api.anthropic.com/api/oauth/usage"
 CODEX_WHAM_URL = "https://chatgpt.com/backend-api/wham/usage"
 ZAI_QUOTA_URL = "https://api.z.ai/api/monitor/usage/quota/limit"
-NET_IDS = ("claude_oauth", "codex_wham", "zai_quota")
-_NET_SPECS = {
+ADAPTER_REGISTRY = {
     "claude_oauth": {
+        "provider": "claude", "endpoint": CLAUDE_OAUTH_URL,
         "cred": ".claude/.credentials.json",
         "path": ("claudeAiOauth", "accessToken"),
         "plan": ("claudeAiOauth", "subscriptionType"),
         "headers": {"anthropic-beta": "oauth-2025-04-20"},
     },
     "codex_wham": {
+        "provider": "codex", "endpoint": CODEX_WHAM_URL,
         "cred": ".codex/auth.json",
         "path": ("tokens", "access_token"),
         "headers": {},
     },
     "zai_quota": {
+        "provider": "zai", "endpoint": ZAI_QUOTA_URL,
         "cred": ".pi/agent/auth.json",
         "path": ("zai", "key"),
         "headers": {},
     },
 }
+NET_IDS = tuple(ADAPTER_REGISTRY)
+_NET_SPECS = ADAPTER_REGISTRY       # compatibility for focused tests
 
 
 def _time():
@@ -241,7 +281,9 @@ def _local_date(ts):
 
 def _sanitize_id(name):
     """Provider id for the wire: [a-z0-9._-], ≤ 32, never empty."""
-    out = re.sub(r"[^a-z0-9._-]+", "-", str(name).lower()).strip("-")[:32]
+    if not isinstance(name, str):
+        return None
+    out = re.sub(r"[^a-z0-9._-]+", "-", name.lower()).strip("-")[:32]
     return out.strip("._-") or None
 
 
@@ -251,6 +293,96 @@ def _sanitize_token(name, cap=120):
         return None
     out = re.sub(r"[^A-Za-z0-9._-]+", "-", name)[:cap].strip("-.")
     return out or None
+
+
+def canonical_provider_id(raw):
+    """Registry canonical id for an observed provider identity. Known
+    aliases fold into one upstream provider; a previously unseen safe token
+    stays itself so discovery never depends on a hard-coded provider list."""
+    pid = _sanitize_id(raw)
+    if pid is None:
+        return None
+    return _PROVIDER_ALIAS.get(pid, pid)
+
+
+def provider_label(pid):
+    """Stable display label for known providers; a safe generic identity for
+    future providers. Never title-cases dotted ids into a false brand claim."""
+    spec = PROVIDER_REGISTRY.get(pid)
+    if spec:
+        return spec["label"]
+    return pid.replace("-", " ").replace("_", " ").strip().title()[:32] or pid
+
+
+def _record_discovery(cache, hints, now):
+    """Merge sanitized provider sightings into the bounded presence cache.
+
+    `hints` is metadata only: {provider, model?, harness?, source?, seen_at?}.
+    No prompt/session content or credential values are accepted or retained.
+    One malformed hint drops alone.
+    """
+    if not isinstance(hints, (list, tuple)):
+        return False
+    presence = cache.setdefault("presence", {})
+    before = json.dumps(presence, sort_keys=True, separators=(",", ":"))
+    for hint in hints:
+        if not isinstance(hint, dict):
+            continue
+        pid = canonical_provider_id(hint.get("provider"))
+        if pid is None:
+            continue
+        seen = _any_ts(hint.get("seen_at")) or now
+        if seen > now + 300 or now - seen > DISCOVERY_RETENTION_S:
+            continue
+        rec = presence.get(pid)
+        if not isinstance(rec, dict):
+            rec = {"last_seen_at": 0, "models": [], "harnesses": [],
+                   "sources": []}
+        previous_seen = rec.get("last_seen_at") or 0
+        # Presence freshness is minute-granular like transcript scans. This
+        # keeps the snapshot etag stable during 2 s foreground polling while
+        # still bounding disappeared identity retention honestly.
+        if previous_seen == 0 or seen - previous_seen >= LOCAL_MIN_S:
+            rec["last_seen_at"] = max(previous_seen, int(seen))
+        model = _sanitize_token(hint.get("model"))
+        harness = _sanitize_id(hint.get("harness"))
+        source = _sanitize_id(hint.get("source")) or "session_metadata"
+        if model and model not in rec["models"]:
+            rec["models"] = (rec["models"] + [model])[-8:]
+        if harness and harness not in rec["harnesses"]:
+            rec["harnesses"] = (rec["harnesses"] + [harness])[-8:]
+        if source not in rec["sources"]:
+            rec["sources"] = (rec["sources"] + [source])[-8:]
+        presence[pid] = rec
+    # A partial provider is useful only for a bounded period after the last
+    # active/session sighting. Current usage/adapters retain providers through
+    # their own authoritative data independently of this cache.
+    for pid in list(presence):
+        rec = presence.get(pid)
+        if not isinstance(rec, dict) or now - (rec.get("last_seen_at") or 0) > DISCOVERY_RETENTION_S:
+            presence.pop(pid, None)
+    while len(presence) > MAX_DISCOVERED_PROVIDERS:
+        oldest = min(presence, key=lambda p: presence[p].get("last_seen_at") or 0)
+        presence.pop(oldest, None)
+    after = json.dumps(presence, sort_keys=True, separators=(",", ":"))
+    return before != after
+
+
+def _configured_discovery(home, now):
+    """Provider identities implied by configured adapter credentials. Only
+    file presence is inspected here; credential contents remain adapter-only."""
+    out = []
+    for aid, spec in ADAPTER_REGISTRY.items():
+        path = os.path.join(home, spec["cred"])
+        try:
+            st = os.stat(path)
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode):
+            out.append({"provider": spec["provider"],
+                        "harness": PROVIDER_REGISTRY[spec["provider"]]["default_harness"],
+                        "source": "configured_adapter", "seen_at": now})
+    return out
 
 
 # ---------- per-day accumulators ----------
@@ -632,24 +764,16 @@ _RE_PI_MS_TS = re.compile(rb'"timestamp":(\d{10,16})')
 _RE_ISO_TS = re.compile(rb'"timestamp":"([0-9T:.+\-Z]{10,40})"')
 
 
-_PI_PID_OF = {
-    # §7.1: a bridge/route name is NEVER a provider. Pi-local usage is
-    # attributed to the upstream provider's capacity entry, so its
-    # adapters (claude_oauth, codex_wham, zai_quota) answer for it. A
-    # gateway route with no upstream of its own (optollm) maps to None:
-    # those tokens are attributed nowhere rather than becoming a fake
-    # provider with reason feature_missing.
-    "claude-bridge": "claude",
-    "openai-codex": "codex",
-    "optollm": None,
-}
+_NON_PROVIDER_ROUTES = {"optollm"}
 
 
 def _capacity_pid(pid):
-    """Canonical capacity provider id for a pi transcript provider token
-    (already sanitized). Bridges/routes fold into the upstream provider;
-    unknown tokens stay themselves (zai, google, …)."""
-    return _PI_PID_OF.get(pid, pid)
+    """Canonical provider id for a harness token. Routes without an
+    observable upstream are omitted; known aliases use the registry; future
+    identities pass through generically."""
+    if pid in _NON_PROVIDER_ROUTES:
+        return None
+    return canonical_provider_id(pid)
 
 
 def _pi_prov_new(entry, pid):
@@ -1122,14 +1246,9 @@ def _valid_net(st):
 
 
 def _net_phase(cache, now, allow_network, home, net_deadline=None):
-    """Attempt each enabled, due network adapter at most once. 401 marks the
-    adapter failed until the credential file changes (or it is re-enabled);
-    other failures double the backoff, capped. net_deadline (a monotonic
-    stamp) bounds the pass: an adapter's fetch is only started while a full
-    10 s timeout still fits, so a multi-adapter sweep cannot overrun its
-    budget (the background tick's refresh stays ≤ its 12 s bound; a skipped
-    adapter simply waits for the next call — its own interval gates mean it
-    loses no freshness that matters)."""
+    """Attempt each enabled, due adapter at most once. Every adapter owns a
+    failure boundary: a bug or malformed response in one provider can never
+    stop later providers from refreshing or remove them from Capacity."""
     if not allow_network:
         return
     enabled = set(enabled_ids(home))
@@ -1139,50 +1258,61 @@ def _net_phase(cache, now, allow_network, home, net_deadline=None):
             continue
         if net_deadline is not None \
                 and _mono() + NET_TIMEOUT_S > net_deadline:
-            break                              # out of budget for this pass
-        st = states.get(aid)
-        if not _valid_net(st):
-            st = _fresh_net_state()
-        spec = _NET_SPECS[aid]
-        token, plan, mtime = _read_credential(home, spec)
-        if token is None:
-            st["fail"], st["windows"], st["observed_at"] = "nocred", [], 0
+            break
+        try:
+            _run_net_adapter(states, aid, now, home)
+        except Exception:
+            # Store only a classification word — never exception text.
+            st = states.get(aid)
+            if not _valid_net(st):
+                st = _fresh_net_state()
+            _net_fail(st, now, "net")
             states[aid] = st
-            continue
-        if st.get("fail") == "auth" \
-                and st.get("cred_mtime") is not None \
-                and mtime is not None and mtime == st.get("cred_mtime"):
-            states[aid] = st
-            continue                          # 401: never retry until it changes
-        nxt = st.get("next_ok_at")
-        if nxt is not None and now < nxt:
-            states[aid] = st
-            continue                          # backing off (None = dead 401)
-        if st.get("observed_at") \
-                and now - st["observed_at"] < NET_MIN_S:
-            states[aid] = st
-            continue
-        st["cred_mtime"] = mtime
-        kind, data = _http_get_json(_endpoint(aid), token, spec["headers"])
-        if kind == "ok":
-            windows = []
-            try:
-                windows = _PARSERS[aid](data, now) or []
-            except Exception:
-                windows = []
-            if windows:
-                st["windows"] = windows
-                st["observed_at"] = now
-                st["fail"] = None
-                st["backoff"] = BACKOFF_BASE_S
-                st["next_ok_at"] = 0
-                if plan:
-                    st["plan"] = plan
-            else:
-                _net_fail(st, now, "shape")
-        else:
-            _net_fail(st, now, kind)
+
+
+def _run_net_adapter(states, aid, now, home):
+    """One adapter transaction. Called behind _net_phase's isolation wall."""
+    st = states.get(aid)
+    if not _valid_net(st):
+        st = _fresh_net_state()
+    spec = ADAPTER_REGISTRY[aid]
+    token, plan, mtime = _read_credential(home, spec)
+    if token is None:
+        st["fail"], st["windows"], st["observed_at"] = "nocred", [], 0
         states[aid] = st
+        return
+    if st.get("fail") == "auth" \
+            and st.get("cred_mtime") is not None \
+            and mtime is not None and mtime == st.get("cred_mtime"):
+        states[aid] = st
+        return
+    nxt = st.get("next_ok_at")
+    if nxt is not None and now < nxt:
+        states[aid] = st
+        return
+    if st.get("observed_at") and now - st["observed_at"] < NET_MIN_S:
+        states[aid] = st
+        return
+    st["cred_mtime"] = mtime
+    kind, data = _http_get_json(spec["endpoint"], token, spec["headers"])
+    if kind == "ok":
+        try:
+            windows = _PARSERS[aid](data, now) or []
+        except Exception:
+            windows = []
+        if windows:
+            st["windows"] = windows
+            st["observed_at"] = now
+            st["fail"] = None
+            st["backoff"] = BACKOFF_BASE_S
+            st["next_ok_at"] = 0
+            if plan:
+                st["plan"] = plan
+        else:
+            _net_fail(st, now, "shape")
+    else:
+        _net_fail(st, now, kind)
+    states[aid] = st
 
 
 def _net_fail(st, now, kind):
@@ -1200,8 +1330,7 @@ def _net_fail(st, now, kind):
 
 
 def _endpoint(aid):
-    return {"claude_oauth": CLAUDE_OAUTH_URL, "codex_wham": CODEX_WHAM_URL,
-            "zai_quota": ZAI_QUOTA_URL}[aid]
+    return ADAPTER_REGISTRY[aid]["endpoint"]
 
 
 # ---------- enabled-adapters config ----------
@@ -1298,7 +1427,9 @@ def _group_new(pid, harness):
             "windows": [], "plan": None, "last_ts": 0,
             "hdays": {},                    # harness → {date: {tok}} (§12)
             "srcs": [],                     # contributing transcript sources
-            "models_seen": False}
+            "models_seen": False,
+            "models": [], "harnesses": [], "discovered_from": [],
+            "last_seen_at": 0}
 
 
 def _merge_group_days(group, agg, harness=None, src=None):
@@ -1331,8 +1462,23 @@ def _merge_group_days(group, agg, harness=None, src=None):
             if not isinstance(gb, dict):
                 gb = gm[date] = {}
             _comp_add(gb, comp)
+    if harness and harness not in group["harnesses"]:
+        group["harnesses"].append(harness)
     if src and src not in group["srcs"]:
         group["srcs"].append(src)
+
+
+def _merge_presence(group, rec):
+    """Identity-only metadata, independent of metrics."""
+    group["last_seen_at"] = max(group.get("last_seen_at") or 0,
+                                rec.get("last_seen_at") or 0)
+    for field in ("models", "harnesses"):
+        for value in rec.get(field) or []:
+            if value not in group[field]:
+                group[field].append(value)
+    for source in rec.get("sources") or []:
+        if source not in group["discovered_from"]:
+            group["discovered_from"].append(source)
 
 
 def _state_for(windows, r429, now):
@@ -1404,6 +1550,20 @@ def _assemble(cache, now, enabled=None):
     today = _local_date(now)
     groups = {}
     entries = cache.get("files") or {}
+    # Discovery is a first-class input, not an accidental side effect of a
+    # successful quota fetch. Recently active/configured providers seed a
+    # generic group even when they have no capacity adapter or no usage yet.
+    for pid, seen in (cache.get("presence") or {}).items():
+        pid = canonical_provider_id(pid)
+        if pid is None or not isinstance(seen, dict):
+            continue
+        if now - (seen.get("last_seen_at") or 0) > DISCOVERY_RETENTION_S:
+            continue
+        spec = PROVIDER_REGISTRY.get(pid) or {}
+        harnesses = seen.get("harnesses") or []
+        harness = harnesses[0] if harnesses else spec.get("default_harness")
+        g = groups.setdefault(pid, _group_new(pid, harness))
+        _merge_presence(g, seen)
     # fixed-kind files (claude/codex rollouts) seed their groups first so
     # the harness of a shared provider id (pi usage folded into it) is
     # deterministic — and so the "claude" group exists even when the
@@ -1457,15 +1617,22 @@ def _assemble(cache, now, enabled=None):
                 r429_by_group["claude"] = e["r429"]
     # network windows + plans
     net = cache.get("net") or {}
-    net_map = {"claude_oauth": ("claude", "claude_oauth"),
-               "codex_wham": ("codex", "codex_wham"),
-               "zai_quota": ("zai", "zai_quota")}
-    for aid, (pid, source) in net_map.items():
+    enabled_set = set(enabled or [])
+    for aid, spec in ADAPTER_REGISTRY.items():
+        pid = spec["provider"]
         st = net.get(aid)
+        # Enabled/configured adapters establish provider presence even before
+        # the first usable sample. A failed adapter never erases identity.
+        if aid in enabled_set or _valid_net(st):
+            pdef = PROVIDER_REGISTRY.get(pid) or {}
+            g = groups.setdefault(pid, _group_new(
+                pid, pdef.get("default_harness")))
+            if "configured_adapter" not in g["discovered_from"]:
+                g["discovered_from"].append("configured_adapter")
+        else:
+            continue
         if not _valid_net(st) or not st.get("observed_at"):
             continue
-        g = groups.setdefault(pid, _group_new(
-            pid, "pi" if pid == "zai" else pid))
         for w in st.get("windows") or []:
             if isinstance(w, dict):
                 g["windows"].append(dict(
@@ -1480,15 +1647,34 @@ def _assemble(cache, now, enabled=None):
         _prune_days(g["days"], today)
         r429 = r429_by_group.get(pid) if pid == "claude" else None
         state, driver = _state_for(g["windows"], r429, now)
+        aid = (PROVIDER_REGISTRY.get(pid) or {}).get("adapter")
+        net_state = net.get(aid) if aid else None
         day_keys = [_local_date(now - i * 86400) for i in range(7)]
         has_tokens = any(g["days"].get(d, {}).get("tok") for d in day_keys)
         has_windows = bool([w for w in g["windows"]
                             if _window_trusted(w, now)])
+        discovered = bool(g.get("last_seen_at") or g.get("discovered_from"))
         if not has_tokens and not has_windows and state == "unknown" \
-                and not r429:
-            continue                          # nothing to say about it
-        rec = {"id": pid, "label": FIXED_PROVIDERS.get(pid, pid),
+                and not r429 and not discovered:
+            continue                          # nothing truthful to say about it
+        reason, enable = _unknown_reason(pid, net, enabled, now)
+        # A provider whose expected adapter is stale or actively broken is
+        # unavailable, not mysteriously unknown. Identity-only and unsupported
+        # providers remain UNKNOWN — no pressure classification is invented.
+        if state == "unknown" and reason in ("auth_error", "network_error", "stale"):
+            state = "unavailable"
+        rec = {"id": pid, "label": provider_label(pid),
                "harness": g["harness"], "state": state}
+        models = list(dict.fromkeys(g.get("models") or []))[:8]
+        harnesses = list(dict.fromkeys(g.get("harnesses") or []))[:8]
+        if models:
+            rec["models"] = models
+        if harnesses:
+            rec["harnesses"] = harnesses
+        if g.get("discovered_from"):
+            rec["discovered_from"] = list(dict.fromkeys(g["discovered_from"]))[:8]
+        if g.get("last_seen_at"):
+            rec["last_seen_at"] = int(g["last_seen_at"])
         # windows: trusted ones, plus the active-429 window (no used_pct —
         # never fabricated) when it exhausts the provider
         out_windows = []
@@ -1524,15 +1710,22 @@ def _assemble(cache, now, enabled=None):
                            [w.get("observed_at") or 0
                             for w in g["windows"]
                             if _window_trusted(w, now)])
+        observed = max(observed or 0, g.get("last_seen_at") or 0,
+                       (net_state or {}).get("observed_at") or 0)
         if observed:
             rec["observed_at"] = int(observed)
-        if state == "unknown":
-            rec["source"] = {"claude": "claude_local",
-                             "codex": "codex_rollout"}.get(pid, "pi_local")
-        elif driver == "r429":
+        local_source = {"claude": "claude_local",
+                        "codex": "codex_rollout"}.get(pid, "pi_local")
+        if driver == "r429":
             rec["source"] = "claude_local"
-        else:
+        elif isinstance(driver, dict):
             rec["source"] = driver.get("source")
+        elif has_tokens:
+            rec["source"] = local_source
+        elif aid and _valid_net(net_state):
+            rec["source"] = aid
+        elif g.get("discovered_from"):
+            rec["source"] = g["discovered_from"][-1]
         if has_tokens:
             days = []
             for d in day_keys:                # all 7 days: stable chart
@@ -1578,6 +1771,14 @@ def _assemble(cache, now, enabled=None):
         models.sort(key=lambda m: -m["tokens"])
         if models:
             rec["by_model"] = models[:5]
+            # Current model identity is the union of active/session discovery
+            # and models with usage inside this exact 7-day window — never
+            # stale 35-day cache names.
+            names = list(rec.get("models") or [])
+            for row in models:
+                if row["model"] not in names:
+                    names.append(row["model"])
+            rec["models"] = names[:8]
         elif has_tokens:
             # §12: the labelled sources recorded no per-model attribution
             # in the window — a sentence, never a fabricated list
@@ -1599,10 +1800,9 @@ def _assemble(cache, now, enabled=None):
                 rec["cost_today_usd"] = round(cost, 4)
         if g["plan"]:
             rec["plan"] = g["plan"]
-        if state == "unknown":
-            # §7.5: say WHY the state is unknown, and hand the user the
-            # exact adapter id when enabling it would fix it.
-            reason, enable = _unknown_reason(pid, cache.get("net"), enabled)
+        if state in ("unknown", "unavailable"):
+            # Say why classification is absent; only a real registered
+            # adapter may produce an enable command.
             rec["reason"] = reason
             if enable:
                 rec["enable"] = enable
@@ -1610,26 +1810,33 @@ def _assemble(cache, now, enabled=None):
     return {"generated_at": int(now), "providers": providers}
 
 
-_ADAPTER_OF = {"claude": "claude_oauth", "codex": "codex_wham",
-              "zai": "zai_quota"}
+_ADAPTER_OF = {
+    pid: spec.get("adapter") for pid, spec in PROVIDER_REGISTRY.items()
+    if spec.get("adapter")
+}
 
 
-def _unknown_reason(pid, net, enabled):
-    """(reason, enable|None) for a provider whose state is unknown
-    (§7.5): a disabled adapter → adapter_disabled + the id to enable; an
-    enabled adapter's recorded 401 → auth_error; network failures →
-    network_error; an adapter with no usable sample → no_data; a
-    provider with no measurement path on this host → feature_missing."""
+def _unknown_reason(pid, net, enabled, now=None):
+    """(reason, enable|None) when pressure cannot be classified. Stale and
+    broken adapter results are explicitly unavailable; a provider with no
+    adapter remains visible as unsupported/partial without invented limits."""
     aid = _ADAPTER_OF.get(pid)
     if aid is None:
         return "feature_missing", None
     if aid not in (enabled or []):
         return "adapter_disabled", aid
-    fail = ((net or {}).get(aid) or {}).get("fail")
+    st = (net or {}).get(aid) or {}
+    fail = st.get("fail")
     if fail == "auth":
         return "auth_error", None
-    if fail == "net":
+    if fail in ("net", "http", "rate", "shape"):
         return "network_error", None
+    observed = st.get("observed_at")
+    now = _time() if now is None else now
+    if observed and not any(_window_trusted(dict(w, observed_at=observed,
+                                                  net=True), now)
+                            for w in st.get("windows") or []):
+        return "stale", None
     return "no_data", None
 
 
@@ -1690,7 +1897,7 @@ def _save_cache(cache, path=None):
 
 # ---------- public API ----------
 def collect(refresh=False, budget_s=None, now=None, home=None,
-            cache_path=None):
+            cache_path=None, discovered=None):
     """Build the capacity section. Local transcripts are rescanned when the
     60 s min interval has passed (or refresh=True); enabled network adapters
     are checked only when the budget can cover a 10 s fetch (CLI --refresh,
@@ -1710,6 +1917,8 @@ def collect(refresh=False, budget_s=None, now=None, home=None,
     if cache.get("acc_ver") != ACC_VERSION:
         cache = {"acc_ver": ACC_VERSION}   # definition changed: start clean
         cache["scanned_at"] = 0
+    _record_discovery(cache, _configured_discovery(home, now), now)
+    _record_discovery(cache, discovered or [], now)
     scanned_at = _num(cache.get("scanned_at")) or 0
     if refresh or now - scanned_at >= LOCAL_MIN_S:
         _scan_all(cache, deadline, hard, now, home)
@@ -1735,7 +1944,7 @@ def collect(refresh=False, budget_s=None, now=None, home=None,
 
 
 def snapshot_section(budget_s=BUDGET_S, now=None, home=None,
-                     cache_path=None):
+                     cache_path=None, discovered=None):
     """(section|None, "capacity") for the snapshot assembler. Serves the
     cached section when fresh; otherwise refreshes within the budget (files
     past the deadline advance on later calls). Never raises."""
@@ -1745,9 +1954,17 @@ def snapshot_section(budget_s=BUDGET_S, now=None, home=None,
         built_at = _num(cache.get("built_at")) or 0
         if cache.get("section") and cache.get("acc_ver") == ACC_VERSION \
                 and now - built_at < LOCAL_MIN_S:
-            return cache["section"], "capacity"
+            changed = _record_discovery(
+                cache, _configured_discovery(home or HOME, now), now)
+            changed = _record_discovery(cache, discovered or [], now) or changed
+            if not changed:
+                return cache["section"], "capacity"
+            section = _assemble(cache, now, enabled=enabled_ids(home))
+            cache["section"], cache["built_at"] = section, now
+            _save_cache(cache, cache_path or CACHE_FILE)
+            return section, "capacity"
         return collect(budget_s=budget_s, now=now, home=home,
-                       cache_path=cache_path), "capacity"
+                       cache_path=cache_path, discovered=discovered), "capacity"
     except Exception:
         return None, "capacity"
 

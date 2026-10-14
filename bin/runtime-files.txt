@@ -20,3 +20,7 @@ tendril_schedule.py
 tendril_capacity.py
 tendril_health.py
 tendril_titles.py
+tendril_qr.py
+tendril_qrcodegen.py
+tendril_enroll.py
+tendril_apk.py

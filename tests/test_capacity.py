@@ -133,9 +133,11 @@ class Base(unittest.TestCase):
             self.assertTrue(tc.set_enabled(aid, True, home=self.home))
 
     # ----- drivers ------------------------------------------------------
-    def collect(self, refresh=False, budget_s=30.0, now=NOW):
+    def collect(self, refresh=False, budget_s=30.0, now=NOW,
+                discovered=None):
         return tc.collect(refresh=refresh, budget_s=budget_s, now=now,
-                          home=self.home, cache_path=self.cache)
+                          home=self.home, cache_path=self.cache,
+                          discovered=discovered)
 
     def prov(self, pid, now=NOW):
         sec = self.collect(now=now)
@@ -182,6 +184,105 @@ def fake_urllib(body=None, code=200, exc=None):
 
     handler.calls = calls
     return handler
+
+
+# ---------- provider discovery registry ---------------------------------
+class TestProviderDiscovery(Base):
+    """Presence is discovered independently from adapter metrics."""
+
+    def ids(self, section):
+        return [p["id"] for p in section["providers"]]
+
+    def test_claude_only(self):
+        self.put_fixture(".claude/projects/p1/s1.jsonl", "claude_week.jsonl")
+        self.assertEqual(self.ids(self.collect()), ["claude"])
+
+    def test_claude_and_zai(self):
+        self.put_fixture(".claude/projects/p1/s1.jsonl", "claude_week.jsonl")
+        self.put_fixture(".pi/agent/sessions/s1/chunk.jsonl", "pi_two.jsonl")
+        ids = self.ids(self.collect())
+        self.assertIn("claude", ids)
+        self.assertIn("zai", ids)
+
+    def test_openai_codex_active_session_appears_automatically(self):
+        sec = self.collect(discovered=[{
+            "provider": "openai", "model": "gpt-5.6-sol",
+            "harness": "pi", "source": "active_sessions",
+            "seen_at": NOW,
+        }])
+        rec = sec["providers"][0]
+        self.assertEqual(rec["id"], "codex")
+        self.assertEqual(rec["label"], "OpenAI / Codex")
+        self.assertEqual(rec["models"], ["gpt-5.6-sol"])
+        self.assertEqual(rec["state"], "unknown")
+        self.assertNotIn("windows", rec)
+
+    def test_unseen_provider_appears_as_generic_partial(self):
+        rec = self.collect(discovered=[{
+            "provider": "future-labs", "model": "nova-1",
+            "harness": "pi", "source": "active_sessions",
+            "seen_at": NOW,
+        }])["providers"][0]
+        self.assertEqual(rec["id"], "future-labs")
+        self.assertEqual(rec["label"], "Future Labs")
+        self.assertEqual(rec["models"], ["nova-1"])
+        self.assertEqual(rec["state"], "unknown")
+        self.assertEqual(rec["reason"], "feature_missing")
+        self.assertNotIn("used_pct", json.dumps(rec))
+        self.assertNotIn("enable", rec)
+
+    def test_provider_without_adapter_keeps_metadata_not_fake_percentages(self):
+        rec = self.collect(discovered=[{
+            "provider": "local-llm", "model": "truth-7b",
+            "harness": "custom", "seen_at": NOW,
+        }])["providers"][0]
+        self.assertEqual(rec["harnesses"], ["custom"])
+        self.assertEqual(rec["source"], "session_metadata")
+        self.assertNotIn("windows", rec)
+        self.assertNotIn("tokens_today", rec)
+
+    def test_disappeared_active_provider_retained_by_current_usage(self):
+        line = json.dumps({
+            "type": "message", "message": {"role": "assistant",
+                "provider": "future-labs", "model": "nova-1",
+                "timestamp": NOW * 1000,
+                "usage": {"input": 10, "output": 2}}},
+            separators=(",", ":")) + "\n"
+        self.put(".pi/agent/sessions/future/s.jsonl", line)
+        self.collect(discovered=[{"provider": "future-labs",
+                                  "seen_at": NOW}])
+        rec = self.prov("future-labs", now=NOW + tc.DISCOVERY_RETENTION_S + 1)
+        self.assertIsNotNone(rec)
+        self.assertEqual(sum(d["tokens"] for d in rec["tokens_by_day"]), 12)
+
+    def test_stale_adapter_result_is_unavailable_without_old_percentages(self):
+        st = tc._fresh_net_state()
+        st.update({"observed_at": NOW - tc.NET_STALE_S - 1,
+                   "windows": [{"kind": "session", "used_pct": 99.0}],
+                   "fail": None})
+        cache = {"net": {"codex_wham": st}, "presence": {
+            "codex": {"last_seen_at": NOW, "models": ["gpt-5.6-sol"],
+                      "harnesses": ["pi"], "sources": ["active_sessions"]}}}
+        rec = tc._assemble(cache, NOW, enabled=["codex_wham"])["providers"][0]
+        self.assertEqual(rec["state"], "unavailable")
+        self.assertEqual(rec["reason"], "stale")
+        self.assertNotIn("windows", rec)
+
+    def test_one_broken_adapter_does_not_break_other_providers(self):
+        self.cred("claude")
+        self.cred("codex")
+        self.enable("claude_oauth", "codex_wham")
+
+        def fetch(url, token, headers, timeout=tc.NET_TIMEOUT_S):
+            if url == tc.CLAUDE_OAUTH_URL:
+                raise RuntimeError("synthetic adapter failure")
+            return "ok", json.loads(self.fixture("wham.json"))
+
+        with mock.patch.object(tc, "_http_get_json", side_effect=fetch):
+            sec = self.collect(refresh=True, budget_s=30)
+        recs = {p["id"]: p for p in sec["providers"]}
+        self.assertEqual(recs["claude"]["state"], "unavailable")
+        self.assertEqual(recs["codex"]["state"], "ready")
 
 
 # ---------- token accounting: cache reads are NEVER counted ----------
@@ -1101,7 +1202,12 @@ class TestNetwork(Base):
         fake = fake_urllib(body="this is not json")
         with mock.patch.object(tc._OPENER, "open", fake):
             rec = self.prov("claude")
-        self.assertIsNone(rec)                         # no data ⇒ absent
+        # Presence is independent from metrics: the configured provider stays
+        # visible, but a malformed adapter result is unavailable and carries
+        # no fabricated window.
+        self.assertEqual(rec["state"], "unavailable")
+        self.assertEqual(rec["reason"], "network_error")
+        self.assertNotIn("windows", rec)
         st = tc._load_cache(self.cache)["net"]["claude_oauth"]
         self.assertEqual(st["fail"], "shape")
         self.assertEqual(st["backoff"], 600)           # 2 × 300 s
