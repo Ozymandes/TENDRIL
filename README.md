@@ -4,9 +4,9 @@
        width="640">
 </p>
 
-<p align="center">
-  <strong>A handheld control plane for persistent AI agents.</strong>
-</p>
+# TENDRIL
+
+**A handheld control plane for persistent AI agents.**
 
 <p align="center">
   <a href="https://github.com/Ozymandes/TENDRIL/releases/tag/v0.2.1"><img alt="Version v0.2.1" src="https://img.shields.io/badge/version-v0.2.1-CBFD75?style=flat-square&labelColor=111111"></a>
@@ -17,30 +17,49 @@
   <a href="https://herdr.dev"><img alt="Herdr 0.9.3+" src="https://img.shields.io/badge/runtime-Herdr%200.9.3%2B-F0B54A?style=flat-square&labelColor=111111"></a>
 </p>
 
+We’re entering a slightly strange new kind of computing.
+
+Your machine can now keep working after you walk away from it. Agents stay alive. Sessions persist. Subagents branch off. Providers reset. Tasks finish, block, recover and continue while you’re somewhere else entirely.
+
+That changes what “remote access” should mean.
+
+I didn’t want another remote desktop. I didn’t want a miniature chat client pretending to be my terminal. And I definitely didn’t want another platform trying to replace the tools I already liked.
+
+I wanted something much simpler:
+
+**a beautiful little instrument in my pocket that understands what my agent machine is doing.**
+
+TENDRIL is that instrument.
+
+It sits on top of the stack I already wanted to use — Herdr, SSH, Mosh, Tailscale, Termux and the terminal itself — and turns them into one coherent handheld operating surface.
+
+Your workstation stays plugged in, connected and doing the heavy lifting.
+
+You don’t have to.
+
+Take your phone to a meeting. Leave the laptop at home. Get on a train. Walk into a café with nothing but cellular data. Your agents are still working on the machine you trust, and TENDRIL gives you the context to understand what’s happening without hauling the machine around with you.
+
+> **Leave the laptop. Keep the machine.**
+
 ---
 
-Your agents keep running on your machine.
+## The real session, wherever you are
 
-TENDRIL gives you a handheld surface for seeing what they are doing,
-knowing what needs you, scheduling what happens next, watching provider
-capacity, recovering failures, and entering the exact persistent session
-that matters.
+TENDRIL doesn’t recreate your terminal on the phone.
 
-It does not replace Herdr, SSH, Mosh, Tailscale or your terminal.
+It doesn’t mirror a simplified version of your agent state either.
 
-It makes them behave like one coherent system you can hold in your hand.
+It takes you back to the real thing.
 
-> SSH gets you into the machine. TENDRIL tells you what the machine is doing.
+A notification, the LIVE view or a session card can resolve all the way down to the exact Herdr workspace, tab and pane that produced it. Tap once and TENDRIL hands you back to the actual persistent session over Mosh.
 
-### From overview to exact context
+No reconstructed conversation.
 
-**TENDRIL does not replace your terminal. It gets you to the right one.**
+No competing mobile copy.
 
-A notification, a session card or the LIVE view can resolve all the way
-down to the exact Herdr workspace, tab and pane.
+No fake state.
 
-One tap hands you back to the real session — not a reconstructed mobile
-copy of it.
+Just the same computation, still alive on the host.
 
 <p align="center">
   <img src="docs/assets/readme/board-05-exact-session-entry.png"
@@ -48,19 +67,29 @@ copy of it.
        width="100%">
 </p>
 
-### The session doesn't move. You do.
+---
 
-The laptop and phone are two entry points into the same persistent Herdr
-session.
+## The session doesn’t move. You do.
 
-The computation stays on the host. TENDRIL gives you secure remote control,
-state and exact-session entry without pretending the terminal became a
-mobile dashboard.
+Start an agent at your desk.
 
-Same host.
-Same Herdr.
-Same session.
-Same state.
+Check it twenty minutes later from your phone.
+
+Answer it from the back of a cab.
+
+Come home, open the laptop and carry on from exactly where you left off.
+
+Nothing moved.
+
+Nothing synced between two copies.
+
+Nothing had to be rebuilt.
+
+Your laptop and your phone are simply two entry points into the same persistent Herdr session.
+
+**Same host. Same Herdr. Same session. Same state.**
+
+That distinction is the whole product.
 
 <p align="center">
   <img src="docs/assets/readme/board-06-same-session-anywhere.png"
@@ -68,19 +97,35 @@ Same state.
        width="100%">
 </p>
 
-### Four surfaces. One control plane.
+---
 
-**HOME** is system synthesis — what is alive, what needs you, what is under
-pressure, and the one action that matters now.
+## One machine. Four questions.
 
-**LIVE** is present computation — every session and subagent, with truthful
-working, idle, failed and needs-input states.
+TENDRIL Link is deliberately small.
 
-**CAPACITY** is available computation — provider windows, reset times,
-pressure, tokens and reported spend across Claude, OpenAI/Codex and Z.AI.
+It isn’t trying to become a new operating system for AI, a file manager, a cloud agent platform, an IDE and a chat client at the same time.
 
-**SCHEDULE** is future computation — prompts that live on the host and start
-later, at a provider reset, or when capacity returns.
+It answers four questions well.
+
+**HOME — What matters right now?**
+
+What’s alive, what needs you, what just finished, whether the system is healthy, and the one thing actually worth paying attention to.
+
+**LIVE — What is happening right now?**
+
+Every active Herdr session, agent and subagent, with truthful working, idle, failed, completed and needs-input states.
+
+**CAPACITY — How much computation do I have left?**
+
+Provider windows, reset times, pressure, token usage and reported spend across Claude, OpenAI/Codex and Z.AI.
+
+**SCHEDULE — What should happen next?**
+
+Work that can begin at a particular time, at a provider reset, or the moment useful capacity comes back.
+
+That’s the control plane.
+
+Everything else stays where it belongs.
 
 <p align="center">
   <img src="docs/assets/readme/board-01-control-plane.png"
@@ -88,130 +133,312 @@ later, at a provider reset, or when capacity returns.
        width="100%">
 </p>
 
-## Why TENDRIL exists
+---
 
-Starting an agent is easy.
+# Why TENDRIL exists
 
-Keeping several long-running agents honest over an entire day is not.
+Remote access wasn’t the problem.
 
-Once work is spread across providers, workspaces and subagents, "just SSH in
-and look" stops being a useful operating model.
+We already have excellent tools for that.
 
-One session is waiting for input.
-Another finished twenty minutes ago.
-A provider is near its limit.
-A scheduled task is waiting for capacity.
-Herdr may be down while the host itself is perfectly reachable.
+SSH gives you a shell. Mosh makes that shell survive dreadful mobile connections. Tailscale makes your machines reachable without turning networking into a weekend project. RustDesk gives you the desktop when you genuinely need a desktop.
 
-The primitives were already good.
+And Herdr already gets the most important architectural decision right:
 
-Herdr keeps the work alive.
-SSH and Mosh carry the session.
-Tailscale makes the machine reachable.
-Termux puts a real terminal on Android.
+**the agents and their sessions live on your machine.**
 
-What was missing was the layer that knows what all of that means.
+TENDRIL is built around that idea, not against it.
 
-**TENDRIL is that layer.**
+Its philosophy is closer to UNIX than to the modern instinct to absorb everything into one enormous platform: keep the primitives small, let good tools keep doing what they’re good at, compose them cleanly, and avoid inventing a second source of truth unless you absolutely have to.
 
-It observes the host, keeps durable state where the work lives, tells you
-what needs attention, and gets out of the way when you decide to enter the
-real session.
+The problem starts one layer above remote access.
 
-It began as a way to check on a small agent lab from a phone over the
-first cup of Earl Grey. Version 0.1 was a launcher and a terminal
-selector. It kept growing until it needed an app of its own.
+Once you’re running several agents across workspaces, providers and subagents, “Can I SSH into the machine?” becomes the least interesting question.
+
+Of course you can.
+
+The useful questions are different.
+
+Which session is actually working?
+
+Which one is waiting for me?
+
+What finished while I was away?
+
+Where did that notification come from?
+
+Which provider is about to run out of room?
+
+When does capacity return?
+
+Did Herdr crash, or did I deliberately stop it?
+
+Can I schedule something now and trust the host to run it later?
+
+And when something really does need me, can I get into the exact pane that produced it without hunting around?
+
+That’s the layer TENDRIL owns.
+
+It watches the machine without pretending to become the machine. It keeps durable state beside the work. It understands just enough about Herdr, sessions, providers, scheduling and recovery to tell you what matters, then gets out of your way when you want the terminal itself.
+
+That narrowness is intentional.
+
+TENDRIL is built for AI-native engineers who already like working this way: persistent agents, terminals, machines they control themselves, Herdr, SSH, Mosh and small composable tools.
+
+If that already sounds like your setup, TENDRIL shouldn’t feel like learning a new platform.
+
+It should feel like your existing machine suddenly grew a very good handheld instrument.
+
+That was the product I wanted for myself.
+
+Not a general-purpose remote access app.
+
+Not “AI from your phone.”
+
+A purpose-built instrument for this weird new reality where the computer keeps thinking after you close the lid and walk away.
 
 <p align="center">
   <img src="docs/assets/readme/board-02-sessions-scheduling.png"
-       alt="TENDRIL Link: scheduling a task, LIVE detail and a session's context, output and cost"
+       alt="Sessions, scheduling and live agent detail in TENDRIL Link"
        width="100%">
 </p>
 
-## Sessions and scheduling
+---
 
-TENDRIL is not a chat UI. It doesn't put a text box between you and your
-agents; it shows you what they are doing and gets you to the terminal
-where they're doing it.
+# Sessions and scheduling
 
-**Schedule work for later.** Give a task a title and the exact prompt the
-agent will receive, then pick where it lands: a new session in a
-workspace, or an agent pane that is already running. It can start at a
-set time, at a provider's next reset, or as soon as capacity comes back.
-Tasks live on the host, so your phone can be asleep when they start. A
-task that was running when the host crashed is marked *interrupted*, never
-silently launched twice.
+TENDRIL isn’t a chat UI with a terminal buried somewhere behind it.
 
-**Inspect a session.** Open any session to see its state, model, how much
-of the context window it has used, output tokens, cost where the harness
-reports it, and its subagents. Then **Open session** — TENDRIL focuses that
-exact workspace, tab and pane and attaches you over Mosh.
+The terminal is still the real thing.
 
-The session lives on the host, so both of you are always looking at the
-same thing — start a job on the laptop, check it from the phone on the
-train, finish it at the desk. Nothing is mirrored or synced; there is one
-session and you are simply where it is.
+TENDRIL gives you the operational context around it.
 
-## What it does
+You can schedule work for later, send it into a new or existing session, start it at a fixed time, wait for a provider reset, or let it begin when useful capacity returns.
 
-**Live operations.**
-Every Herdr workspace, agent and subagent, with honest working, idle, failed
-and needs-input states; session titles you can rename from the phone; and
-one-tap entry into the exact pane.
+The task lives on the host.
 
-**Scheduling.**
-Future tasks for new or existing sessions, including time, on-reset and
-when-capacity-returns triggers. Durable host state survives reboots and a
-sleeping phone.
+Your phone doesn’t have to stay awake. It doesn’t even have to stay online.
 
-**Capacity.**
-Claude, OpenAI/Codex and Z.AI provider state, including available quota
-windows, reset times, pressure, token usage and reported spend where the
-provider exposes it.
+If the host disappears while a task is running, TENDRIL marks it **interrupted** rather than quietly running it twice later.
 
-**Notifications.**
-Finished work, needs-input events, scheduled-task state and Herdr recovery
-arrive through the user's private notification channel. Tapping one opens
-the exact session it belongs to.
+That principle runs through the whole system:
 
-**Recovery.**
-Herdr outage detection, truthful intentional-stop semantics and a verified,
-rate-limited revive path.
+**truth before convenience.**
 
-**Host management.**
-QR pairing, health diagnostics, release/update state and direct host
-maintenance from the handheld control surface.
+Open any session and TENDRIL shows you the parts that actually help you make a decision: state, model, harness, context usage, output, reported cost where available, and the subagents beneath it.
 
-<p align="center">
-  <img src="docs/assets/readme/board-03-reliability-recovery.png"
-       alt="TENDRIL Link: NEEDS YOU, HERDR OFFLINE with Revive Herdr, diagnostics and host pairing"
-       width="100%">
-</p>
+Then tap **Open session**.
 
-## It tells the truth about the system
+TENDRIL focuses the exact Herdr workspace, tab and pane and attaches you over Mosh.
 
-A control plane that guesses is worse than none. TENDRIL keeps the
-failure states apart, because they need different things from you:
+The pattern is simple:
 
-- **Unreachable is not offline.** If your phone can't reach the host,
-  that's a network problem. If the host answers but Herdr doesn't, the
-  phone says **HERDR OFFLINE** — *host reachable, Herdr stopped 21 s
-  ago* — and offers **Revive Herdr**.
-- **Stopped on purpose is not crashed.** `tendril herdr stop` sets a
-  guard. The guardian stays quiet, and the phone won't offer to undo your
-  decision.
-- **Recovery is explicit.** A guardian checks Herdr every 30 seconds and
-  notifies you once when it goes down and once when it's back. It never
-  restarts anything by itself. Revive is your call: one rate-limited
-  restart that is only reported as done once Herdr is verifiably serving
-  again.
-- **Human attention comes first.** **NEEDS YOU** lists every agent
-  waiting on input, and how long it has waited. Otherwise HOME shows the
-  most recently active session; tapping it opens that exact pane's dossier.
-- **Diagnostics show the real boundaries.** Termux, its permission, the
-  launcher, the SSH alias, deep links, the notification bridge, the host,
-  Herdr, TENDRIL and the notifier — each with its own state, so a broken
-  link is named rather than implied.
+**observe from a distance; enter only when you need to.**
+
+---
+
+# What TENDRIL gives you
+
+### A live operational picture
+
+Every Herdr workspace, agent and subagent, with honest working, idle, failed, completed and needs-input states.
+
+### Exact session entry
+
+A notification or card doesn’t dump you somewhere vaguely near the right project. It resolves to the pane that produced it.
+
+### Work that can happen without you watching
+
+Schedule prompts for a specific time, a provider reset or the return of capacity. Durable host-side state means your phone doesn’t have to babysit anything.
+
+### Provider awareness
+
+Claude, OpenAI/Codex and Z.AI capacity, reset windows, pressure, token usage and reported spend where the provider exposes it.
+
+### Notifications that actually mean something
+
+Finished work, blocked agents, scheduled tasks and recovery events arrive through your private notification channel. Tap one and TENDRIL takes you back to its source.
+
+### Recovery without fiction
+
+An unreachable host isn’t the same thing as Herdr being down. A process you intentionally stopped isn’t a crash. TENDRIL keeps those distinctions intact instead of flattening them into one generic red warning.
+
+### A machine you can leave behind
+
+This may be the simplest feature, but it’s the one that motivated the entire project.
+
+Your workstation can stay plugged in, connected and running the agents.
+
+You can go somewhere else.
+
+---
+
+# Built around good tools
+
+TENDRIL’s product philosophy is deliberately compositional.
+
+Herdr remains the runtime.
+
+SSH remains SSH.
+
+Mosh remains Mosh.
+
+Tailscale remains the network.
+
+Your terminal remains your terminal.
+
+The host remains authoritative.
+
+TENDRIL adds the missing operational layer between **having access to an agentic machine** and **understanding what that machine is doing**.
+
+That distinction is important because TENDRIL isn’t really competing with SSH, Mosh or RustDesk.
+
+Those tools solve different problems.
+
+A remote desktop gives you pixels.
+
+SSH gives you a shell.
+
+Mosh gives you a resilient shell.
+
+Herdr keeps the agent sessions alive.
+
+TENDRIL gives you **situational awareness of the entire agent system**, then the shortest possible path back into the real underlying tool when you need it.
+
+It doesn’t swallow the stack.
+
+It conducts it.
+
+---
+
+## Three commands
+
+One of the goals of v0.2.1 was to make all of that machinery disappear for the person installing it.
+
+On the host:
+
+```sh
+tendril install
+```
+
+On the phone:
+
+```sh
+tendril install
+```
+
+Then on the host:
+
+```sh
+tendril --pair
+```
+
+Scan the QR.
+
+That’s the product.
+
+Underneath those three commands, TENDRIL handles host setup, its runtime services, private notification identity, one-shot SSH enrollment, host-key pinning, Termux integration, Link configuration and the signed update channel.
+
+Those details still exist.
+
+You just shouldn’t have to perform them by hand.
+
+That’s an important part of the design philosophy too:
+
+complexity is allowed inside the machine. It shouldn’t leak into the ritual of using it.
+
+<sub>Android may ask for two permissions during first pairing: notifications, and permission for TENDRIL Link to run commands through Termux. Grant them and you’re done. On a server, also run `sudo loginctl enable-linger $USER` so the timers keep running after you log out.</sub>
+
+<sub>**First bootstrap** — a completely fresh machine cannot run `tendril install` before the `tendril` command exists. Run the tested bootstrap once (it installs `tendril`, then does exactly `tendril install`): host `curl -fsSL https://raw.githubusercontent.com/Ozymandes/TENDRIL/main/setup.sh | sh` · phone `curl -fsSL https://raw.githubusercontent.com/Ozymandes/TENDRIL/main/phone/setup.sh | sh`. Other paths: [Android guide](docs/ANDROID.md), [step-by-step setup guide](docs/TENDRIL-SETUP-GUIDE.md).</sub>
+
+## What v0.2.1 changed
+
+v0.2.1 is the release where TENDRIL stopped feeling like several clever pieces that happened to work together and started behaving like one product.
+
+Pairing became a one-shot trust flow with QR enrollment and host-key pinning.
+
+Notifications configure themselves.
+
+Android asks for notification and Termux command permissions when they’re actually needed instead of hiding setup requirements inside diagnostics.
+
+The phone installer became idempotent and learned how to repair its own state.
+
+TENDRIL Link became production-signed.
+
+The host became the phone’s update server.
+
+New builds appear as a small lime indicator on HOME, About explains what’s available, and the app can install the verified update in place without losing its pairing.
+
+The operating model improved too.
+
+HOME follows the active session instead of allowing provider pressure to dominate the story.
+
+Recently completed work has its own state.
+
+Capacity discovers providers dynamically, including OpenAI/Codex.
+
+Notifications return you to the exact session that produced them.
+
+Herdr finally scrolls naturally under your finger in Termux.
+
+And because terminal mouse tracking can swallow the usual keyboard gesture, TENDRIL even makes sure you have a reliable keyboard control waiting in the extra-keys row.
+
+A surprising amount of work went into making the final interaction feel simple.
+
+That’s usually how it goes.
+
+The details are in the [changelog](CHANGELOG.md) and the
+[release notes](https://github.com/Ozymandes/TENDRIL/releases/tag/v0.2.1).
+
+## The edge is yours
+
+TENDRIL started with a question I couldn’t stop thinking about:
+
+What should an engineer’s computer feel like once the work keeps going after the engineer walks away?
+
+Not in ten years.
+
+Now.
+
+We already have the models.
+
+We already have agents that can work for long stretches.
+
+We already have persistent runtimes like Herdr.
+
+What’s still being invented is the relationship between the engineer and all that ongoing computation.
+
+I don’t think the answer is to cram the entire workstation onto a smaller screen.
+
+I think the more interesting answer is to build better instruments.
+
+Small ones.
+
+Purposeful ones.
+
+Things that tell you exactly enough.
+
+Things that respect the tools underneath them instead of trying to replace them.
+
+Things that let the machine stay powerful and complicated while the interface in your hand stays calm.
+
+That’s what I want TENDRIL to become.
+
+v0.2.1 is still early, and there’s a lot more I want to explore — richer ways of understanding groups of agents, a much more expressive handheld interface, deeper operational views, and what a genuinely beautiful instrument for agentic engineering should feel like as this entire field keeps changing underneath us.
+
+But the principle is already clear.
+
+Don’t replace good tools. Compose them beautifully.
+
+Leave the workstation plugged in.
+
+Let the agents work.
+
+Put the phone in your pocket.
+
+The edge is yours.
+
+---
 
 ## Architecture
 
@@ -247,15 +474,36 @@ and asks it to act. Details in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
 and the binding phone ↔ host contract,
 [docs/LINK-CONTRACT-0.2.md](docs/LINK-CONTRACT-0.2.md).
 
-A few opinions hold it together:
+<p align="center">
+  <img src="docs/assets/readme/board-03-reliability-recovery.png"
+       alt="TENDRIL Link: NEEDS YOU, HERDR OFFLINE with Revive Herdr, diagnostics and host pairing"
+       width="100%">
+</p>
 
-- **Use the primitives.** If SSH, Mosh, Tailscale, Herdr or Termux already
-  do something well, TENDRIL calls them rather than reinventing them.
-- **The host is authoritative.** Durable state lives where the work does.
-- **Exact context matters.** A notification about pane `w15:p3` should
-  land you in `w15:p3`.
-- **Failure is a state, not a surprise.** Degraded is something you can
-  see, name and fix.
+## It tells the truth about the system
+
+A control plane that guesses is worse than none. TENDRIL keeps the
+failure states apart, because they need different things from you:
+
+- **Unreachable is not offline.** If your phone can't reach the host,
+  that's a network problem. If the host answers but Herdr doesn't, the
+  phone says **HERDR OFFLINE** — *host reachable, Herdr stopped 21 s
+  ago* — and offers **Revive Herdr**.
+- **Stopped on purpose is not crashed.** `tendril herdr stop` sets a
+  guard. The guardian stays quiet, and the phone won't offer to undo your
+  decision.
+- **Recovery is explicit.** A guardian checks Herdr every 30 seconds and
+  notifies you once when it goes down and once when it's back. It never
+  restarts anything by itself. Revive is your call: one rate-limited
+  restart that is only reported as done once Herdr is verifiably serving
+  again.
+- **Human attention comes first.** **NEEDS YOU** lists every agent
+  waiting on input, and how long it has waited. Otherwise HOME shows the
+  most recently active session; tapping it opens that exact pane's dossier.
+- **Diagnostics show the real boundaries.** Termux, its permission, the
+  launcher, the SSH alias, deep links, the notification bridge, the host,
+  Herdr, TENDRIL and the notifier — each with its own state, so a broken
+  link is named rather than implied.
 
 <p align="center">
   <img src="docs/assets/readme/board-04-release-loop.png"
@@ -322,54 +570,6 @@ native handheld notifications and Link-style deep integration are coming
 later. See [docs/IOS_BLINK.md](docs/IOS_BLINK.md) for a worked example
 with Blink Shell.
 
-## Quick start
-
-TENDRIL is designed around one memorable command on each side.
-
-**Host**
-
-```sh
-tendril install
-```
-
-**Phone / Termux**
-
-```sh
-tendril install
-```
-
-**Then, on the host:**
-
-```sh
-tendril --pair
-```
-
-Open TENDRIL Link and scan the QR.
-
-Android may ask for two permissions during first pairing:
-
-- notifications
-- permission for TENDRIL Link to run commands through Termux
-
-Grant them and you're done.
-
-TENDRIL handles the host runtime, private notification identity, one-shot
-SSH enrollment, phone launcher, Link integration and trusted update channel.
-On a server, also run `sudo loginctl enable-linger $USER` so the timers
-keep running after you log out.
-
-<sub>**First bootstrap** — a completely fresh machine cannot run
-`tendril install` before the `tendril` command exists. Run the tested
-bootstrap once (it installs `tendril`, then does exactly
-`tendril install`): host
-`curl -fsSL https://raw.githubusercontent.com/Ozymandes/TENDRIL/main/setup.sh | sh`
-· phone
-`curl -fsSL https://raw.githubusercontent.com/Ozymandes/TENDRIL/main/phone/setup.sh | sh`.
-Other paths: [Android guide](docs/ANDROID.md),
-[step-by-step setup guide](docs/TENDRIL-SETUP-GUIDE.md).</sub>
-
-The memorable command after bootstrap is always: `tendril install`.
-
 ## Day to day
 
 ```sh
@@ -417,48 +617,6 @@ Mosh, no accounts, no analytics, no TENDRIL cloud.
   notification token.
 
 The full model is in [SECURITY.md](SECURITY.md).
-
-## What TENDRIL isn't
-
-TENDRIL is not a cloud agent platform, a chat front end, a remote desktop
-or a file manager.
-
-It is not a replacement for SSH, Mosh, Tailscale, Herdr or your terminal.
-
-Your agents still run on your machine, under your account.
-
-TENDRIL is the control layer that tells you what they are doing, what
-needs you, and where to go next.
-
-## v0.2.1 — Interaction + Installation Polish
-
-v0.2.1 is the release where TENDRIL stops feeling like a collection of
-working pieces and starts behaving like one product.
-
-Pairing is now a one-shot trust flow with QR enrollment and host-key
-pinning. Notifications configure themselves. Android asks for permissions
-at the moment they are actually needed. The phone installer is idempotent,
-and TENDRIL Link now has a production-signed, physically verified in-place
-update path.
-
-The operating surface became more truthful too.
-
-HOME follows the active session instead of turning provider pressure into
-the main story. Recently completed work gets its own state. Capacity
-discovers providers dynamically, including OpenAI/Codex. Herdr sessions
-scroll naturally under your finger in Termux, and the phone keeps a
-keyboard-recovery control available even while terminal mouse tracking is
-active.
-
-The release also tightens exact-session entry, notification routing,
-recovery semantics and the install/repair path across the host and phone.
-
-Most importantly, TENDRIL now has a simple product contract:
-
-install → pair → operate → update
-
-The details are in the [changelog](CHANGELOG.md) and the
-[release notes](https://github.com/Ozymandes/TENDRIL/releases/tag/v0.2.1).
 
 ## Contributing
 
