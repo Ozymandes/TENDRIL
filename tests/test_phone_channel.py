@@ -90,6 +90,7 @@ class PhoneEnv(unittest.TestCase):
         self.open_log = os.path.join(self.tmp, "open.log")
         self.cmd_log = os.path.join(self.tmp, "cmd.log")
         self.reload_log = os.path.join(self.tmp, "reload.log")
+        self.am_log = os.path.join(self.tmp, "am.log")
         self.vc_file = os.path.join(self.tmp, "vc.count")
 
     # -- paths ------------------------------------------------------------
@@ -154,6 +155,8 @@ class PhoneEnv(unittest.TestCase):
         self.stub("ssh", SSH_STUB)
         self.stub("termux-open", OPEN_STUB)
         self.stub("cmd", CMD_STUB)
+        self.stub("pm", PM_STUB)
+        self.stub("am", AM_STUB)
         self.stub("termux-reload-settings", RELOAD_STUB)
 
     # -- environment --------------------------------------------------------
@@ -169,8 +172,10 @@ class PhoneEnv(unittest.TestCase):
         e["TENDRIL_CMD_LOG"] = self.cmd_log
         e["TENDRIL_RELOAD_LOG"] = self.reload_log
         e["TENDRIL_VC_FILE"] = self.vc_file
+        e["TENDRIL_AM_LOG"] = self.am_log
         for k in ("TENDRIL_ALIAS", "AGENT_ALIAS", "PREFIX", "TENDRIL_FAKE_VC",
-                  "TENDRIL_FAKE_VC2", "TENDRIL_CORRUPT", "TENDRIL_SSH_FAIL"):
+                  "TENDRIL_FAKE_VC2", "TENDRIL_FAKE_PM", "TENDRIL_CORRUPT",
+                  "TENDRIL_SSH_FAIL"):
             e.pop(k, None)
         e.update(over)
         return e
@@ -259,6 +264,23 @@ exit 0
 
 RELOAD_STUB = """#!/bin/sh
 printf 'termux-reload-settings\\n' >> "$TENDRIL_RELOAD_LOG"
+exit 0
+"""
+
+PM_STUB = """#!/bin/sh
+# Android package-manager reality, faked: TENDRIL_FAKE_PM=1 (default) =
+# app.tendril.link present; anything else = ABSENT (pm path answers
+# nothing). `pm path` is the script's FIRST presence probe.
+if [ "$1" = "path" ] && [ "$2" = "app.tendril.link" ]; then
+    if [ "${TENDRIL_FAKE_PM:-1}" = "1" ]; then
+        printf 'package:/data/app/~~fake~~/app.tendril.link/base.apk\\n'
+    fi
+fi
+exit 0
+"""
+
+AM_STUB = """#!/bin/sh
+{ printf 'am'; for a in "$@"; do printf ' <%s>' "$a"; done; printf '\\n'; } >> "$TENDRIL_AM_LOG"
 exit 0
 """
 
@@ -855,11 +877,12 @@ class UpgradeScriptRun(PhoneEnv):
         self.assertIn("<-o> <BatchMode=yes>", calls[0])
 
     def test_staged_apk_downloaded_verified_and_opened(self):
-        # Android 11+ package visibility: cmd usually answers nothing, so
-        # the recorded sha (written after the user presses Enter) decides
+        # An OLDER installed build: the staged APK downloads, verifies,
+        # opens and the versionCode is confirmed after the user's Enter
+        # (presence itself is `pm path` reality, never the recorded sha).
         self.fresh_phone(recorded=False)
         p = self.run_generated("upgrade", stdin="\n", tty=True,
-                               TENDRIL_FAKE_VC="")
+                               TENDRIL_FAKE_VC="5", TENDRIL_FAKE_VC2="42")
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
         apk = os.path.join(self.home, ".cache", "tendril",
@@ -872,7 +895,7 @@ class UpgradeScriptRun(PhoneEnv):
         self.assertIn("<application/vnd.android.package-archive>", opens[0])
         self.assertIn(apk, opens[0])
         self.assertIn("Tap Update, then press Enter here", p.stdout)
-        self.assertIn("recorded the APK sha", p.stdout)
+        self.assertIn("recorded (versionCode 42 installed)", p.stdout)
         rec = os.path.join(self.home, ".config", "tendril",
                            "link-apk.sha256")
         with open(rec) as f:
@@ -895,7 +918,7 @@ class UpgradeScriptRun(PhoneEnv):
         # start) and then blocked on `read`. Headless now: verify, park,
         # print the handoff, exit — no installer from Termux, no prompt.
         doc = self.fresh_phone(recorded=False)
-        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="")
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="5")
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
         apk = os.path.join(self.home, ".cache", "tendril",
@@ -927,7 +950,7 @@ class UpgradeScriptRun(PhoneEnv):
         proc = subprocess.Popen(
             ["sh", path], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True,
-            env=self.env(TENDRIL_ALIAS="stubhost", TENDRIL_FAKE_VC=""))
+            env=self.env(TENDRIL_ALIAS="stubhost", TENDRIL_FAKE_VC="5"))
         try:
             rc = proc.wait(timeout=60)                # stdin still open
         except subprocess.TimeoutExpired:
@@ -951,7 +974,7 @@ class UpgradeScriptRun(PhoneEnv):
 
     def test_headless_corrupt_download_refuses_without_handoff(self):
         self.fresh_phone(recorded=False)
-        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="",
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="5",
                                TENDRIL_CORRUPT="link-apk")
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 1, out)
@@ -1017,12 +1040,70 @@ class UpgradeScriptRun(PhoneEnv):
         self.assertFalse(os.path.exists(
             os.path.join(self.home, ".cache", "tendril")))
 
-    def test_staged_apk_current_when_recorded_sha_matches(self):
+    def test_recorded_sha_is_never_install_evidence_when_package_absent(self):
+        # THE physical regression (v0.2.1 RC): the app was manually
+        # uninstalled, the recorded sha from the PAST install matched the
+        # staged manifest, and `tendril install` said "current" and then
+        # failed to launch a package that was not there. Android package
+        # reality (pm path) decides - the recorded sha never overrides it.
         self.fresh_phone(recorded=True)
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="",
+                               TENDRIL_FAKE_PM="0")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("  TENDRIL Link   not installed - installer ready",
+                      p.stdout)
+        self.assertNotIn("  TENDRIL Link   current", out)
+        # the APK was re-fetched (no cached copy) and handed off
+        self.assertIn("  handoff: app", out)
+
+    def test_cached_apk_is_reused_when_the_package_is_absent(self):
+        # A cached copy passes the same sha256+size check and is handed to
+        # Android's installer WITHOUT a re-download - the manual-uninstall
+        # recovery is exactly `tendril install`, zero re-download.
+        doc = self.fresh_phone(recorded=True)
+        cache = os.path.join(self.home, ".cache", "tendril")
+        os.makedirs(cache, exist_ok=True)
+        parked = os.path.join(cache, "tendril-link-%s.apk" % doc["versionName"])
+        with open(parked, "wb") as f:
+            f.write(APK_BYTES)
+        calls_before = len(self.asset_calls())
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="",
+                               TENDRIL_FAKE_PM="0")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, out)
+        self.assertEqual(len(self.asset_calls()), calls_before)   # no re-download
+        self.assertIn("  APK saved: %s" % parked, p.stdout)
+        self.assertIn("  APK verified: %d %s %d %s" % (
+            doc["versionCode"], doc["sha256"], doc["size"],
+            doc["signer_sha256"]), p.stdout)
+        self.assertIn("  handoff: app", out)
+
+    def test_newer_installed_build_is_never_downgraded(self):
+        # the phone runs a NEWER production build than the host has staged:
+        # no download, no installer, one honest row, exit 0
+        self.fresh_phone(recorded=False)
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="99")
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("  TENDRIL Link   phone has 99 > staged 42 - kept",
+                      p.stdout)
+        self.assertEqual(
+            [c for c in self.asset_calls() if "link-apk" in c], [])
+        self.assertEqual(self.log_lines(self.open_log), [])
+        self.assertNotIn("handoff", out)
+
+    def test_present_but_unreadable_version_is_left_alone(self):
+        # pm path proves PRESENCE while the versionCode listing cannot
+        # answer: never reinstall over an unknown version from Termux
+        self.fresh_phone(recorded=False)
         p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="")
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        self.assertEqual(self.asset_calls(), [])
-        self.assertIn("  TENDRIL Link   current", p.stdout)
+        out = p.stdout + p.stderr
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn("  TENDRIL Link   installed", p.stdout)
+        self.assertEqual(
+            [c for c in self.asset_calls() if "link-apk" in c], [])
+        self.assertNotIn("handoff", out)
 
     def test_link_not_staged_row(self):
         self.seed_snapshot()
@@ -1096,7 +1177,11 @@ class SetupScriptRun(PhoneEnv):
         self.assertEqual(stat.S_IMODE(os.stat(alias).st_mode), 0o600)
         props = os.path.join(self.home, ".termux", "termux.properties")
         with open(props) as f:
-            self.assertEqual(f.read(), "allow-external-apps = true\n")
+            self.assertEqual(f.read(),
+                             "extra-keys = [['ESC','/',{key: '-', popup: '|'},"
+                             "'HOME','UP','END','PGUP','KEYBOARD'], "
+                             "['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]\n"
+                             "allow-external-apps = true\n")
         self.assertEqual(self.log_lines(self.reload_log),
                          ["termux-reload-settings"])
         bashrc = os.path.join(self.home, ".bashrc")
@@ -1107,14 +1192,16 @@ class SetupScriptRun(PhoneEnv):
         self.assertIn("LINK READY", p.stdout)
 
     def test_setup_installs_staged_link_apk(self):
-        # a brand-new phone gets TENDRIL Link from the same verified path
+        # a brand-new phone has NO app.tendril.link package (pm path
+        # answers nothing): the staged APK downloads, verifies and opens
         self.host_ready()
         self.stage()
         p = self.run_generated("setup", stdin="\n", tty=True,
-                               TENDRIL_FAKE_VC="")
+                               TENDRIL_FAKE_VC="", TENDRIL_FAKE_PM="0")
         out = p.stdout + p.stderr
         self.assertEqual(p.returncode, 0, out)
-        self.assertIn("  TENDRIL Link   update ready", p.stdout)
+        self.assertIn("  TENDRIL Link   not installed - installer ready",
+                      p.stdout)
         opens = self.log_lines(self.open_log)
         self.assertEqual(len(opens), 1)
         self.assertIn("<application/vnd.android.package-archive>", opens[0])
@@ -1188,8 +1275,42 @@ class SetupScriptRun(PhoneEnv):
         self.assertEqual(lines[1], "allow-external-apps = true")
         self.assertEqual(lines[2],
                          "# allow-external-apps = false (kept as a comment)")
-        self.assertEqual(len(lines), 3)
+        # the keyboard toggle: the user had no extra-keys layout, so the
+        # default row + KEYBOARD lands AFTER their untouched lines
+        self.assertTrue(lines[3].startswith("extra-keys = [["), lines[3])
+        self.assertIn("'KEYBOARD'", lines[3])
+        self.assertEqual(len(lines), 4)
         self.assertEqual(len(self.log_lines(self.reload_log)), 1)
+
+    def test_setup_preserves_a_custom_extra_keys_layout(self):
+        # a user's own extra-keys layout is THEIRS: the keyboard toggle is
+        # only guaranteed when no extra-keys line exists at all
+        self.host_ready()
+        props = os.path.join(self.home, ".termux", "termux.properties")
+        os.makedirs(os.path.dirname(props), exist_ok=True)
+        with open(props, "w") as f:
+            f.write("allow-external-apps = false\nextra-keys = [[CTRL]]\n")
+        p = self.run_generated("setup", stdin="")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(props) as f:
+            self.assertEqual(f.read(),
+                             "allow-external-apps = true\nextra-keys = [[CTRL]]\n")
+
+    def test_setup_extra_keys_is_idempotent(self):
+        self.host_ready()
+        self.assertEqual(self.run_generated("setup", stdin="").returncode, 0)
+        props = os.path.join(self.home, ".termux", "termux.properties")
+        with open(props) as f:
+            first = f.read()
+        self.assertEqual(first.count("extra-keys"), 1)
+        self.assertIn("'KEYBOARD'", first)
+        reloads_after_run1 = len(self.log_lines(self.reload_log))
+        self.assertEqual(self.run_generated("setup", stdin="").returncode, 0)
+        with open(props) as f:
+            self.assertEqual(f.read(), first)          # byte-identical
+        # nothing left to reload on the second run
+        self.assertEqual(len(self.log_lines(self.reload_log)),
+                         reloads_after_run1)
 
     def test_setup_never_touches_ssh(self):
         self.host_ready()

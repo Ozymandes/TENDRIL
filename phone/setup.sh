@@ -126,6 +126,21 @@ if ! grep -Eq '^[[:space:]]*allow-external-apps[[:space:]]*=[[:space:]]*true' "$
 fi
 ok "Deep links" "TENDRIL Link may run its fixed commands"
 
+# The extra-keys toolbar's KEYBOARD toggle: inside a TENDRIL session the
+# host bridge turns mouse tracking on (touch scrolling) and Termux then
+# consumes every terminal tap as a mouse click - its onSingleTapUp shows
+# the soft keyboard only when tracking is off, so a collapsed keyboard
+# cannot be re-raised by tapping the screen (upstream termux-app#5184).
+# The toolbar stays visible with the keyboard down and its KEYBOARD key
+# raises it regardless of tracking. The user's own extra-keys layout is
+# never replaced; the default show/hide toggle behaviour is never
+# overridden here.
+if ! grep -Eq '^[[:space:]]*extra-keys[[:space:]]*=' "$PROPS" 2>/dev/null; then
+    mkdir -p "$HOME/.termux"
+    printf '%s\n' "extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]" >> "$PROPS"
+    termux-reload-settings >>"$LOG" 2>&1 || true
+fi
+
 # ---------------------------------------------------------------- phone key
 # Prepared here, enrolled by pairing: TENDRIL Link scans the host QR and the
 # host installs this PUBLIC key (one-time, proof-checked). Never copied by hand.

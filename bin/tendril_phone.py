@@ -348,6 +348,7 @@ APK_NAME='@APK_NAME@'
 APK_SHA='@APK_SHA@'
 APK_SIZE='@APK_SIZE@'
 APK_SIGNER='@APK_SIGNER@'       # host-pinned signing-cert sha256 (the Link app re-checks it)
+LINK_PACKAGE='app.tendril.link'
 
 command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 || {
     echo "PHONE // neither sha256sum nor shasum found - refusing to install unverified." >&2
@@ -426,9 +427,23 @@ fetch_asset() {
 # (best effort; empty when `cmd` cannot answer).
 link_installed_code() {
     command -v cmd >/dev/null 2>&1 || return 0
-    cmd package list packages --show-versioncode app.tendril.link 2>/dev/null |
-        sed -n 's/^package:app\.tendril\.link .*versionCode:\([0-9][0-9]*\).*$/\1/p' |
+    cmd package list packages --show-versioncode "$LINK_PACKAGE" 2>/dev/null |
+        sed -n "s/^package:$LINK_PACKAGE .*versionCode:\\([0-9][0-9]*\\).*$/\\1/p" |
         head -n 1
+    return 0
+}
+
+# link_absent - ANDROID PACKAGE REALITY for app.tendril.link (exit 0 =
+# ABSENT). Read-only Termux probes, in order: `pm path`, `cmd package
+# path`, then the versionCode listing as a last resort. A cached APK and
+# a recorded sha from a PAST install are NEVER install evidence: when
+# every probe answers empty the package is not installed (installing
+# over absent is always safe; "current" over absent is the bug this
+# guards - a manual uninstall must be repaired by exactly this command).
+link_absent() {
+    [ -n "$(pm path "$LINK_PACKAGE" 2>/dev/null | head -n 1)" ] && return 1
+    [ -n "$(cmd package path "$LINK_PACKAGE" 2>/dev/null | head -n 1)" ] && return 1
+    [ -n "$(link_installed_code)" ] && return 1
     return 0
 }
 
@@ -453,6 +468,28 @@ ensure_external_apps() {
             || { rm -f "$_ea_new"; return 1; }
     fi
     mv -f "$_ea_new" "$_ea_props"
+    return 0
+}
+
+# ensure_extra_keys - put a KEYBOARD toggle on Termux's extra-keys
+# toolbar when the user has no extra-keys layout of their own. Inside a
+# TENDRIL session the host bridge turns mouse tracking on (touch
+# scrolling), and Termux then consumes every terminal TAP as a mouse
+# click: its onSingleTapUp shows the soft keyboard ONLY when tracking is
+# off, so a collapsed keyboard can never be re-raised by tapping the
+# screen (upstream termux-app#5184). The toolbar stays visible with the
+# keyboard down and its KEYBOARD key raises it regardless of tracking.
+# The user's own extra-keys layout is never touched; the default
+# show/hide toggle behaviour is never overridden (this file never writes
+# soft-keyboard-toggle-behaviour). Returns 0 when it wrote the row.
+ensure_extra_keys() {
+    _ek_props="$HOME/.termux/termux.properties"
+    if [ -f "$_ek_props" ] \
+       && grep -Eq '^[[:space:]]*extra-keys[[:space:]]*=' "$_ek_props"; then
+        return 1                                 # the user's layout wins
+    fi
+    mkdir -p "$HOME/.termux" || return 1
+    printf '%s\n' "extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]" >> "$_ek_props"
     return 0
 }
 
@@ -511,6 +548,23 @@ download_link_apk() {
     printf '%s' "$_dl_apk"
 }
 
+# obtain_link_apk - the staged APK, verified and parked: a cached copy is
+# reused ONLY when it passes the exact same sha256+size check (a cached
+# APK is a download optimization, NEVER install evidence).
+obtain_link_apk() {
+    _ob_parked="$HOME/.cache/tendril/tendril-link-$APK_NAME.apk"
+    if [ -s "$_ob_parked" ]; then
+        _ob_sha=$(sha_file "$_ob_parked")
+        _ob_size=$(wc -c < "$_ob_parked" | tr -d ' ')
+        if [ "$_ob_sha" = "$APK_SHA" ] && [ "$_ob_size" = "$APK_SIZE" ]; then
+            printf '%s' "$_ob_parked"
+            return 0
+        fi
+        rm -f "$_ob_parked"
+    fi
+    download_link_apk
+}
+
 FAILED=0
 ROW_LAUNCHER=current
 ROW_URL=current
@@ -550,14 +604,17 @@ if [ "$MODE" = setup ]; then
             FAILED=1
         fi
     fi
+    if ensure_extra_keys; then _ek_changed=1; else _ek_changed=0; fi
     if ensure_external_apps; then
         ROW_TERMUX="allow-external-apps = true"
+    else
+        ROW_TERMUX="allow-external-apps already true"
+    fi
+    if [ "$_ek_changed" -eq 1 ] || [ "$ROW_TERMUX" = "allow-external-apps = true" ]; then
         if command -v termux-reload-settings >/dev/null 2>&1; then
             termux-reload-settings >/dev/null 2>&1 || true
             ROW_TERMUX="$ROW_TERMUX, settings reloaded"
         fi
-    else
-        ROW_TERMUX="allow-external-apps already true"
     fi
     if ensure_rc_path; then
         ROW_PATH="PATH line added to ~/.bashrc"
@@ -567,26 +624,46 @@ if [ "$MODE" = setup ]; then
 fi
 
 if [ -n "$APK_SHA" ]; then
-    _rec=""
-    [ -r "$HOME/.config/tendril/link-apk.sha256" ] \
-        && IFS= read -r _rec < "$HOME/.config/tendril/link-apk.sha256"
+    # ANDROID PACKAGE REALITY decides - never a cached APK and never a
+    # recorded sha from a PAST install (a manual uninstall must be
+    # repaired by exactly this command), and a newer build on the phone
+    # is never silently downgraded:
     _inst=$(link_installed_code)
     case $_inst in
         "" | *[!0-9]*) _inst="" ;;
     esac
-    if [ -n "$_inst" ] && [ "$_inst" -ge "$APK_CODE" ]; then
-        LINK_ROW=current                      # the phone already runs this build
-    elif [ "$_rec" = "$APK_SHA" ]; then
-        LINK_ROW=current                      # the user already installed this APK
-    else
-        PENDING_APK=$(download_link_apk); _dl_rc=$?
-        if [ "$_dl_rc" -eq 0 ] && [ -n "$PENDING_APK" ]; then
-            LINK_ROW="update ready"
-        else
-            LINK_ROW="download failed"
-            FAILED=1
-        fi
+    _link_state=older
+    if link_absent; then
+        _link_state=absent
+    elif [ -z "$_inst" ]; then
+        _link_state=installed             # present; version unreadable
+    elif [ "$_inst" -eq "$APK_CODE" ]; then
+        _link_state=current
+    elif [ "$_inst" -gt "$APK_CODE" ]; then
+        _link_state=newer
     fi
+    case $_link_state in
+        current)
+            LINK_ROW=current
+            record_link_sha || true ;;
+        newer)
+            LINK_ROW="phone has $_inst > staged $APK_CODE - kept"
+            record_link_sha || true ;;
+        installed)
+            LINK_ROW="installed" ;;
+        absent | older)
+            PENDING_APK=$(obtain_link_apk); _dl_rc=$?
+            if [ "$_dl_rc" -eq 0 ] && [ -n "$PENDING_APK" ]; then
+                if [ "$_link_state" = absent ]; then
+                    LINK_ROW="not installed - installer ready"
+                else
+                    LINK_ROW="update ready"
+                fi
+            else
+                LINK_ROW="download failed"
+                FAILED=1
+            fi ;;
+    esac
 fi
 
 if [ "$MODE" = setup ]; then
@@ -673,6 +750,14 @@ if [ "$MODE" = setup ] && [ "$FAILED" -eq 0 ]; then
 fi
 
 [ "$FAILED" -eq 1 ] && exit 1
+
+# launch_link - open TENDRIL Link when this ran interactively: install,
+# repair and update all end on the app. Headless (the Link app's own
+# background RUN_COMMAND) never starts activities - Android suppresses
+# them from the background anyway, and the handoff is the app's.
+if [ -t 0 ] && command -v am >/dev/null 2>&1; then
+    am start -n "$LINK_PACKAGE/.MainActivity" >/dev/null 2>&1 || true
+fi
 exit 0
 """
 
