@@ -541,11 +541,13 @@ migrate_extra_keys() {
     _ek_old="extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]"
     _ek_new="extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','SHIFT','LEFT','DOWN','RIGHT','PGDN']]"
     [ -f "$_ek_props" ] && grep -qFx "$_ek_old" "$_ek_props" || return 1
-    { grep -vFx "$_ek_old" "$_ek_props"; printf '%s\n' "$_ek_new"; } \
+    if { grep -vFx "$_ek_old" "$_ek_props"; printf '%s\n' "$_ek_new"; } \
         > "$_ek_props.new.$$" \
-        && mv -f "$_ek_props.new.$$" "$_ek_props" \
-        || { rm -f "$_ek_props.new.$$"; return 1; }
-    return 0
+        && mv -f "$_ek_props.new.$$" "$_ek_props"; then
+        return 0
+    fi
+    rm -f "$_ek_props.new.$$"
+    return 1
 }
 ensure_extra_keys() {
     if migrate_extra_keys; then
