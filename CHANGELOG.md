@@ -2,6 +2,57 @@
 
 All notable changes to TENDRIL are documented here.
 
+## v0.2.3 — Version honesty + a keyboard that fits thumbs (2026-10-29)
+
+Product-quality follow-up to v0.2.2: the version/update story becomes
+truthful across all four components, and the default Termux extra-keys
+row is redesigned for actual thumbs.
+
+**Why `tendril --version` looked stale.** It prints the launcher FILE's
+content hash (`tendril-phone <sha12>`) — a revision, not a release. The
+launcher did not change in v0.2.2, so the id correctly stayed put while
+the host moved to 0.2.2. It was right and it read wrong. Now the last
+upgrade also records WHICH Link build the phone runs
+(`~/.config/tendril/link-apk.json`), and `--version` says so:
+
+```
+tendril-phone 9b512446a033
+link app 0.2.2 (build 173) - as of the last upgrade
+```
+
+**Why Link said “up to date”.** That status was the APP's status (staged
+vs installed) with no label. Link 0.2.2's About sheet now carries three
+rails: App update (the same phase machine, correctly labeled), Phone
+(Termux) — the upgrade run's own component rows (current/updated), and
+Connected host — the host tendril release from the phone manifest's
+existing `version` line, display-only and never compared across trains
+(unknown when an older host omits it). The update slab names what it
+does before you tap: **Update phone + app — runs tendril --upgrade in
+Termux; the host is not touched.** The host updates itself, on the host;
+when the host has staged nothing, the reason now says exactly that.
+A one-tap host upgrade from Link needs a new cross-repo contract verb
+and is deliberately not invented here.
+
+**The keyboard.** One intent per row, seven balanced keys each:
+
+```
+[['ESC','CTRL','ALT','SHIFT','TAB','HOME','END'],
+ ['LEFT','DOWN','UP','RIGHT','PGUP','PGDN','KEYBOARD']]
+```
+
+ESC keeps its reflex spot; the chord modifiers sit together with TAB
+right of them (Shift+Tab is one arc); the arrows read LEFT DOWN UP
+RIGHT — a T-shape in the order thumbs trace them; PGUP/PGDN pair on the
+right; KEYBOARD keeps the far-right spot that raises the soft keyboard
+while mouse tracking is on. Both published defaults (pre-SHIFT and
+SHIFT) migrate under the same whole-line rule: a row you edited — even
+by one character — is never touched.
+
+**TENDRIL Link 0.2.2 (build 173)** ships with this release: the update
+transparency above, plus the instrument UI passes already merged on the
+link train. Component versions stay independent: host 0.2.3, Link app
+0.2.2 (173), phone launcher revision `9b512446a033` (unchanged).
+
 ## v0.2.2 — Shift+Tab on the phone (2026-10-29)
 
 Surgical compatibility fix, certified byte-for-byte on the host side: the

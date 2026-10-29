@@ -34,7 +34,7 @@ import sys
 import tempfile
 import time
 
-DEFAULT_VERSION = "0.2.2"
+DEFAULT_VERSION = "0.2.3"
 INSTALLER = "install"
 PHONE_FILES = ("tendril", "termux-url-opener", "agent")
 # Config keys ./install --upgrade may update (LINK-CONTRACT-0.2 §7.4: the

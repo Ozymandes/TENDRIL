@@ -126,7 +126,7 @@ If you wrote your own `extra-keys` layout in `~/.termux/termux.properties`,
 TENDRIL never touches it — add `'SHIFT'` to a row yourself, e.g.
 
 ```
-extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','SHIFT','LEFT','DOWN','RIGHT','PGDN']]
+extra-keys = [['ESC','CTRL','ALT','SHIFT','TAB','HOME','END'], ['LEFT','DOWN','UP','RIGHT','PGUP','PGDN','KEYBOARD']]
 ```
 
 then run `termux-reload-settings`. An install that still carries the exact
@@ -134,10 +134,36 @@ pre-SHIFT default row TENDRIL wrote earlier is migrated automatically on the
 next `tendril install` / `tendril --upgrade` from the host (or re-running the
 public setup script); a layout you have edited since is left alone.
 
+then run `termux-reload-settings`. TENDRIL's own published defaults (the
+pre-SHIFT row and the v0.2.2 SHIFT row) migrate automatically — whole
+line, exact match only — on the next `tendril install` /
+`tendril --upgrade` from the host (or re-running the public setup
+script); a layout you have edited since is left alone.
+
 Verify the whole path from a plain Termux shell: `cat -v`, tap `SHIFT` then
 `TAB` — the terminal must print `^[[Z` (a plain `TAB` only moves the cursor to
 the next tab stop). Inside a session, pi's status line shows the effort level
 the toggle lands on.
+
+## What version is what
+
+Four components, four independent version stories — none of them is
+"the" TENDRIL version:
+
+- **The host CLI** (`tendril --version` on the host): the release, e.g.
+  `0.2.3 (5556cd793b59)`. It updates itself: `tendril --upgrade` or
+  `./install --upgrade` on the host.
+- **The phone launcher** (`tendril --version` in Termux): the launcher
+  file's content revision, e.g. `tendril-phone 9b512446a033`. It only
+  changes when the launcher script changes — a host release that does
+  not touch it leaves the id alone (that is correctness, not staleness).
+  The line under it names the app build recorded at the last upgrade.
+- **TENDRIL Link (the app)**: its own About sheet — version line plus
+  the three update rails (app / phone components / connected host).
+- **The connected host, as the app sees it**: the About sheet's
+  `Connected host` rail reads the phone manifest's `version` line; a
+  host older than 0.2.2 simply answers without it and the rail says
+  `unknown` rather than guessing.
 
 ## Daily use
 
