@@ -532,16 +532,40 @@ ensure_external_apps() {
 # The default show/hide toggle behaviour is never overridden (this file
 # never writes soft-keyboard-toggle-behaviour). Returns 0 when it wrote
 # or migrated the row (a settings reload is due), 1 otherwise.
+#
+# v0.2.3 redesigns the row for thumbs, not for key count. One intent per
+# row: modifiers-then-row-keys on top, navigation on the bottom, seven
+# balanced keys each (≈ the whole thumb pad per key on a 6.7" portrait).
+#   [['ESC','CTRL','ALT','SHIFT','TAB','HOME','END'],
+#    ['LEFT','DOWN','UP','RIGHT','PGUP','PGDN','KEYBOARD']]
+# ESC keeps its reflex spot at far left; the chord modifiers sit together
+# with TAB right of them (Shift+Tab is one arc); HOME/END close the row.
+# The arrows read LEFT DOWN UP RIGHT — a T-shape in the order thumbs
+# actually trace them; PGUP/PGDN pair on the right; KEYBOARD keeps the
+# far-right spot it has always had (it raises the soft keyboard while
+# mouse tracking is on). '/' and the '-|-popup' key are gone: the soft
+# keyboard types them better than a crammed strip ever did.
 migrate_extra_keys() {
-    # One-time repair of TENDRIL's own pre-SHIFT row, whole-line exact
+    # One-time repair of TENDRIL's own pre-v0.2.3 rows, whole-line exact
     # match only - anything else on that line means the user edited it
-    # and it stays theirs. Also the only extra-keys change the upgrade
-    # script is allowed to make (a missing row is setup business).
+    # and it stays theirs. Both published defaults migrate: the pre-SHIFT
+    # row (v0.2.1 and earlier) and the SHIFT row (v0.2.2). Also the only
+    # extra-keys change the upgrade script is allowed to make (a missing
+    # row is setup business).
     _ek_props="$HOME/.termux/termux.properties"
-    _ek_old="extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]"
-    _ek_new="extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','SHIFT','LEFT','DOWN','RIGHT','PGDN']]"
-    [ -f "$_ek_props" ] && grep -qFx "$_ek_old" "$_ek_props" || return 1
-    if { grep -vFx "$_ek_old" "$_ek_props"; printf '%s\n' "$_ek_new"; } \
+    _ek_row="extra-keys = [['ESC','CTRL','ALT','SHIFT','TAB','HOME','END'], ['LEFT','DOWN','UP','RIGHT','PGUP','PGDN','KEYBOARD']]"
+    _ek_old1="extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]"
+    _ek_old2="extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','SHIFT','LEFT','DOWN','RIGHT','PGDN']]"
+    _ek_have=""
+    if [ -f "$_ek_props" ]; then
+        if grep -qFx "$_ek_old1" "$_ek_props"; then
+            _ek_have="$_ek_old1"
+        elif grep -qFx "$_ek_old2" "$_ek_props"; then
+            _ek_have="$_ek_old2"
+        fi
+    fi
+    [ -n "$_ek_have" ] || return 1
+    if { grep -vFx "$_ek_have" "$_ek_props"; printf '%s\n' "$_ek_row"; } \
         > "$_ek_props.new.$$" \
         && mv -f "$_ek_props.new.$$" "$_ek_props"; then
         return 0
@@ -551,7 +575,7 @@ migrate_extra_keys() {
 }
 ensure_extra_keys() {
     if migrate_extra_keys; then
-        return 0                             # an unmodified pre-SHIFT row
+        return 0                             # an unmodified published default
     fi
     _ek_props="$HOME/.termux/termux.properties"
     if [ -f "$_ek_props" ] \
@@ -559,7 +583,7 @@ ensure_extra_keys() {
         return 1                                 # the user's layout wins
     fi
     mkdir -p "$HOME/.termux" || return 1
-    printf '%s\n' "extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','SHIFT','LEFT','DOWN','RIGHT','PGDN']]" >> "$_ek_props"
+    printf '%s\n' "extra-keys = [['ESC','CTRL','ALT','SHIFT','TAB','HOME','END'], ['LEFT','DOWN','UP','RIGHT','PGUP','PGDN','KEYBOARD']]" >> "$_ek_props"
     return 0
 }
 
@@ -579,6 +603,17 @@ record_link_sha() {
     _rl="$HOME/.config/tendril/link-apk.sha256.new.$$"
     if printf '%s\n' "$APK_SHA" > "$_rl" && chmod 600 "$_rl"; then
         mv -f "$_rl" "$HOME/.config/tendril/link-apk.sha256"
+        # v0.2.3: also record WHICH build that sha names, so
+        # `tendril --version` can identify the app truthfully (as of this
+        # upgrade; the app's own About sheet is the live authority).
+        _rj="$HOME/.config/tendril/link-apk.json.new.$$"
+        if printf '{"versionName": "%s", "versionCode": "%s", "sha256": "%s"}\n' \
+            "$APK_NAME" "$APK_CODE" "$APK_SHA" > "$_rj" \
+            && chmod 600 "$_rj"; then
+            mv -f "$_rj" "$HOME/.config/tendril/link-apk.json"
+        else
+            rm -f "$_rj"
+        fi
         return 0
     fi
     rm -f "$_rl"

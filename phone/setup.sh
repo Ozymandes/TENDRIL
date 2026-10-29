@@ -145,11 +145,33 @@ ok "Deep links" "TENDRIL Link may run its fixed commands"
 # TENDRIL-written layout from before SHIFT is migrated only when it
 # still matches that exact line, whole-line; anything else is the
 # user's own and stays untouched.
-_ek_old="extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]"
-_ek_new="extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','SHIFT','LEFT','DOWN','RIGHT','PGDN']]"
+#
+# v0.2.3 redesigns the row for thumbs, one intent per row, seven balanced
+# keys each:
+#   [['ESC','CTRL','ALT','SHIFT','TAB','HOME','END'],
+#    ['LEFT','DOWN','UP','RIGHT','PGUP','PGDN','KEYBOARD']]
+# ESC stays far left; the chord modifiers sit together with TAB right of
+# them (Shift+Tab is one arc); HOME/END close the row. The arrows read
+# LEFT DOWN UP RIGHT — a T-shape in the order thumbs trace them; PGUP and
+# PGDN pair on the right; KEYBOARD keeps the far-right spot (it raises
+# the soft keyboard while mouse tracking is on). '/' and '-|popup' are
+# gone: the soft keyboard types them better than a crammed strip. Both
+# published defaults (pre-SHIFT and SHIFT) migrate when still exact;
+# anything else is the user's own and stays untouched.
+_ek_row="extra-keys = [['ESC','CTRL','ALT','SHIFT','TAB','HOME','END'], ['LEFT','DOWN','UP','RIGHT','PGUP','PGDN','KEYBOARD']]"
+_ek_old1="extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]"
+_ek_old2="extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','SHIFT','LEFT','DOWN','RIGHT','PGDN']]"
 _ek_changed=0
-if [ -f "$PROPS" ] && grep -qFx "$_ek_old" "$PROPS" 2>/dev/null; then
-    if { grep -vFx "$_ek_old" "$PROPS"; printf '%s\n' "$_ek_new"; } > "$PROPS.new.$$" \
+_ek_have=""
+if [ -f "$PROPS" ]; then
+    if grep -qFx "$_ek_old1" "$PROPS" 2>/dev/null; then
+        _ek_have="$_ek_old1"
+    elif grep -qFx "$_ek_old2" "$PROPS" 2>/dev/null; then
+        _ek_have="$_ek_old2"
+    fi
+fi
+if [ -n "$_ek_have" ]; then
+    if { grep -vFx "$_ek_have" "$PROPS"; printf '%s\n' "$_ek_row"; } > "$PROPS.new.$$" \
        && mv -f "$PROPS.new.$$" "$PROPS"; then
         _ek_changed=1
     fi
@@ -157,7 +179,7 @@ if [ -f "$PROPS" ] && grep -qFx "$_ek_old" "$PROPS" 2>/dev/null; then
 fi
 if ! grep -Eq '^[[:space:]]*extra-keys[[:space:]]*=' "$PROPS" 2>/dev/null; then
     mkdir -p "$HOME/.termux"
-    printf '%s\n' "$_ek_new" >> "$PROPS"
+    printf '%s\n' "$_ek_row" >> "$PROPS"
     _ek_changed=1
 fi
 [ "$_ek_changed" -eq 1 ] && termux-reload-settings >>"$LOG" 2>&1 || true

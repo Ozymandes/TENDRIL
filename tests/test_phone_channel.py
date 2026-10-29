@@ -1019,6 +1019,14 @@ class UpgradeScriptRun(PhoneEnv):
         with open(os.path.join(self.home, ".config", "tendril",
                                "link-apk.sha256")) as f:
             self.assertEqual(f.read().strip(), sha_bytes(APK_BYTES))
+        # v0.2.3: the confirmed install also records WHICH build that sha
+        # names, so `tendril --version` can identify the app truthfully
+        import json as _json
+        with open(os.path.join(self.home, ".config", "tendril",
+                               "link-apk.json")) as f:
+            meta = _json.load(f)
+        self.assertEqual(meta, {"versionName": "0.2.0", "versionCode": "42",
+                                "sha256": sha_bytes(APK_BYTES)})
         # a CONFIRMED install may launch the exact MainActivity
         self.assertEqual(self.log_lines(self.am_log),
                          ["am <start> <-n> <app.tendril.link/.MainActivity>"])
@@ -1261,9 +1269,9 @@ class SetupScriptRun(PhoneEnv):
         props = os.path.join(self.home, ".termux", "termux.properties")
         with open(props) as f:
             self.assertEqual(f.read(),
-                             "extra-keys = [['ESC','/',{key: '-', popup: '|'},"
-                             "'HOME','UP','END','PGUP','KEYBOARD'], "
-                             "['TAB','CTRL','ALT','SHIFT','LEFT','DOWN','RIGHT','PGDN']]\n"
+                             "extra-keys = [['ESC','CTRL','ALT','SHIFT',"
+                             "'TAB','HOME','END'], "
+                             "['LEFT','DOWN','UP','RIGHT','PGUP','PGDN','KEYBOARD']]\n"
                              "allow-external-apps = true\n")
         self.assertEqual(self.log_lines(self.reload_log),
                          ["termux-reload-settings"])
@@ -1362,7 +1370,9 @@ class SetupScriptRun(PhoneEnv):
         # default row + KEYBOARD lands AFTER their untouched lines
         self.assertTrue(lines[3].startswith("extra-keys = [["), lines[3])
         self.assertIn("'KEYBOARD'", lines[3])
-        self.assertIn("'SHIFT'", lines[3])          # v0.2.2: Shift+Tab producible
+        self.assertIn("'SHIFT'", lines[3])          # Shift+Tab producible
+        self.assertIn("'ESC'", lines[3])            # and the full chord set
+        self.assertIn("'KEYBOARD'", lines[3])       # soft-keyboard raise kept
         self.assertEqual(len(lines), 4)
         self.assertEqual(len(self.log_lines(self.reload_log)), 1)
 
@@ -1396,14 +1406,17 @@ class SetupScriptRun(PhoneEnv):
         self.assertEqual(len(self.log_lines(self.reload_log)),
                          reloads_after_run1)
 
-    # ---- v0.2.2: the pre-SHIFT TENDRIL default migrates to the SHIFT row
+    # ---- v0.2.3: both published TENDRIL defaults migrate to the v3 row
 
     OLD_DEFAULT = ("extra-keys = [['ESC','/',{key: '-', popup: '|'},"
                    "'HOME','UP','END','PGUP','KEYBOARD'], "
                    "['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]")
-    NEW_DEFAULT = ("extra-keys = [['ESC','/',{key: '-', popup: '|'},"
-                   "'HOME','UP','END','PGUP','KEYBOARD'], "
-                   "['TAB','CTRL','ALT','SHIFT','LEFT','DOWN','RIGHT','PGDN']]")
+    OLD_SHIFT = ("extra-keys = [['ESC','/',{key: '-', popup: '|'},"
+                 "'HOME','UP','END','PGUP','KEYBOARD'], "
+                 "['TAB','CTRL','ALT','SHIFT','LEFT','DOWN','RIGHT','PGDN']]")
+    NEW_DEFAULT = ("extra-keys = [['ESC','CTRL','ALT','SHIFT',"
+                   "'TAB','HOME','END'], "
+                   "['LEFT','DOWN','UP','RIGHT','PGUP','PGDN','KEYBOARD']]")
 
     def _seed_props(self, body):
         props = os.path.join(self.home, ".termux", "termux.properties")
@@ -1429,38 +1442,58 @@ class SetupScriptRun(PhoneEnv):
         # the migrated row IS a settings change: exactly one reload
         self.assertEqual(len(self.log_lines(self.reload_log)), 1)
 
-    def test_setup_migration_is_idempotent(self):
+    def test_setup_migrates_the_v022_shift_row_too(self):
+        # a phone already migrated to the v0.2.2 SHIFT row moves up to the
+        # v0.2.3 row through the same whole-line rule
         self.host_ready()
-        props = self._seed_props(self.OLD_DEFAULT + "\n")
-        self.assertEqual(self.run_generated("setup", stdin="").returncode, 0)
+        props = self._seed_props(self.OLD_SHIFT + "\n")
+        p = self.run_generated("setup", stdin="")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         with open(props) as f:
-            once = f.read()
-        self.assertIn("'SHIFT'", once)
-        self.assertEqual(once.count("extra-keys"), 1)
-        reloads_after_run1 = len(self.log_lines(self.reload_log))
-        self.assertEqual(self.run_generated("setup", stdin="").returncode, 0)
-        with open(props) as f:
-            self.assertEqual(f.read(), once)           # byte-identical
-        self.assertEqual(len(self.log_lines(self.reload_log)),
-                         reloads_after_run1)
+            self.assertEqual(f.read(),
+                             self.NEW_DEFAULT + "\nallow-external-apps = true\n")
+        self.assertEqual(len(self.log_lines(self.reload_log)), 1)
+
+    def test_setup_migration_is_idempotent(self):
+        for seed in (self.OLD_DEFAULT, self.OLD_SHIFT, self.NEW_DEFAULT):
+            with self.subTest(seed=seed[:60]):
+                self.host_ready()
+                props = self._seed_props(seed + "\n")
+                self.assertEqual(self.run_generated("setup", stdin="").returncode, 0)
+                with open(props) as f:
+                    once = f.read()
+                self.assertEqual(once.count("extra-keys"), 1)
+                self.assertIn("'SHIFT'", once)
+                reloads_after_run1 = len(self.log_lines(self.reload_log))
+                self.assertEqual(self.run_generated("setup", stdin="").returncode, 0)
+                with open(props) as f:
+                    self.assertEqual(f.read(), once)        # byte-identical
+                self.assertEqual(len(self.log_lines(self.reload_log)),
+                                 reloads_after_run1)
 
     def test_setup_does_not_migrate_a_modified_tendril_layout(self):
         # a TENDRIL default the user has since edited is THEIRS: no
         # whole-line match, no rewrite, no extra-keys reload (the
         # allow-external-apps write is a separate, pre-existing behaviour
-        # and its own reload)
-        self.host_ready()
-        props = self._seed_props(self.OLD_DEFAULT + "   # tuned by me\n")
-        p = self.run_generated("setup", stdin="")
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        with open(props) as f:
-            self.assertEqual(
-                f.read(),
-                self.OLD_DEFAULT + "   # tuned by me\n"
-                "allow-external-apps = true\n")
-        # exactly one reload, and it is allow-external-apps' doing - the
-        # extra-keys row was untouched
-        self.assertEqual(len(self.log_lines(self.reload_log)), 1)
+        # and its own reload). Both published generations are protected
+        # the same way.
+        for seed in (self.OLD_DEFAULT, self.OLD_SHIFT):
+            with self.subTest(seed=seed[:60]):
+                self.host_ready()
+                props = self._seed_props(seed + "   # tuned by me\n")
+                before = len(self.log_lines(self.reload_log))
+                p = self.run_generated("setup", stdin="")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                with open(props) as f:
+                    self.assertEqual(
+                        f.read(),
+                        seed + "   # tuned by me\n"
+                        "allow-external-apps = true\n")
+                # exactly one reload per run, and it is
+                # allow-external-apps' doing - the extra-keys row was
+                # untouched
+                self.assertEqual(
+                    len(self.log_lines(self.reload_log)) - before, 1)
 
     def test_setup_migrated_layout_still_passes_through_upgrade(self):
         # the upgrade script does not touch a current (migrated) layout:
@@ -1477,15 +1510,20 @@ class SetupScriptRun(PhoneEnv):
 
     def test_upgrade_migrates_the_pre_shift_tendril_default(self):
         # the normal upgrade workflow carries the fix: a phone that never
-        # re-runs setup still gains SHIFT on its next `tendril --upgrade`
-        self.host_ready()
-        self.install_launchers()
-        props = self._seed_props(self.OLD_DEFAULT + "\n")
-        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="42")
-        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
-        with open(props) as f:
-            self.assertEqual(f.read(), self.NEW_DEFAULT + "\n")
-        self.assertEqual(len(self.log_lines(self.reload_log)), 1)
+        # re-runs setup still gains the current row on its next
+        # `tendril --upgrade`, from either published default
+        for seed in (self.OLD_DEFAULT, self.OLD_SHIFT):
+            with self.subTest(seed=seed[:60]):
+                self.host_ready()
+                self.install_launchers()
+                props = self._seed_props(seed + "\n")
+                before = len(self.log_lines(self.reload_log))
+                p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="42")
+                self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+                with open(props) as f:
+                    self.assertEqual(f.read(), self.NEW_DEFAULT + "\n")
+                self.assertEqual(
+                    len(self.log_lines(self.reload_log)) - before, 1)
 
     def test_upgrade_does_not_write_a_fresh_extra_keys_layout(self):
         # upgrade repairs TENDRIL's own row; a MISSING row is setup
@@ -1584,6 +1622,35 @@ esac
         want = "tendril-phone %s" % sha_bytes(
             open(LAUNCHER, "rb").read())[:12]
         self.assertEqual(p.stdout.strip(), want)
+
+    def test_version_names_the_recorded_app_build(self):
+        # the launcher id is a content revision, not a release number; the
+        # last upgrade records which app build the phone actually runs so
+        # --version can say so truthfully
+        meta = os.path.join(self.home, ".config", "tendril", "link-apk.json")
+        os.makedirs(os.path.dirname(meta), exist_ok=True)
+        with open(meta, "w") as f:
+            f.write('{"versionName": "0.2.2", "versionCode": "173", '
+                    '"sha256": "%s"}\n' % ("a" * 64))
+        p = self.run_launcher("--version")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        lines = p.stdout.splitlines()
+        want = "tendril-phone %s" % sha_bytes(
+            open(LAUNCHER, "rb").read())[:12]
+        self.assertEqual(lines[0], want)               # the id stays line 1
+        self.assertEqual(lines[1],
+                         "link app 0.2.2 (build 173) - as of the last upgrade")
+
+    def test_version_ignores_a_corrupt_app_record(self):
+        meta = os.path.join(self.home, ".config", "tendril", "link-apk.json")
+        os.makedirs(os.path.dirname(meta), exist_ok=True)
+        with open(meta, "w") as f:
+            f.write("{not json at all")
+        p = self.run_launcher("--version")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        lines = p.stdout.splitlines()
+        self.assertEqual(len(lines), 1)               # the id, nothing invented
+        self.assertTrue(lines[0].startswith("tendril-phone "))
 
     def test_version_beats_alias_position_too(self):
         # `tendril --version` with no alias at all still prints the id

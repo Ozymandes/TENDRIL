@@ -362,6 +362,20 @@ case "${1:-}" in
         else
             echo "tendril-phone unknown"
         fi
+        # The id above is this LAUNCHER FILE's content revision - the
+        # launcher only changes when its script changes, so it stays put
+        # across host releases that do not touch it (it is not the host
+        # version; `ssh <alias> tendril --version` reads that). What the
+        # last upgrade recorded about the LINK APP is known locally:
+        _v_meta="$HOME/.config/tendril/link-apk.json"
+        if [ -r "$_v_meta" ]; then
+            _v_name=$(sed -n 's/.*"versionName": "\([^"]*\)".*/\1/p' "$_v_meta" | head -n 1)
+            _v_code=$(sed -n 's/.*"versionCode": "\([0-9]*\)".*/\1/p' "$_v_meta" | head -n 1)
+            case "${_v_name:+set}${_v_code:+set}" in
+                setset) printf 'link app %s (build %s) - as of the last upgrade\n' \
+                            "$_v_name" "$_v_code" ;;
+            esac
+        fi
         exit 0 ;;
     install)
         [ "$#" -eq 1 ] || { echo "usage: tendril install"; exit 2; }
