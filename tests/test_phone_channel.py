@@ -1263,7 +1263,7 @@ class SetupScriptRun(PhoneEnv):
             self.assertEqual(f.read(),
                              "extra-keys = [['ESC','/',{key: '-', popup: '|'},"
                              "'HOME','UP','END','PGUP','KEYBOARD'], "
-                             "['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]\n"
+                             "['TAB','CTRL','ALT','SHIFT','LEFT','DOWN','RIGHT','PGDN']]\n"
                              "allow-external-apps = true\n")
         self.assertEqual(self.log_lines(self.reload_log),
                          ["termux-reload-settings"])
@@ -1362,6 +1362,7 @@ class SetupScriptRun(PhoneEnv):
         # default row + KEYBOARD lands AFTER their untouched lines
         self.assertTrue(lines[3].startswith("extra-keys = [["), lines[3])
         self.assertIn("'KEYBOARD'", lines[3])
+        self.assertIn("'SHIFT'", lines[3])          # v0.2.2: Shift+Tab producible
         self.assertEqual(len(lines), 4)
         self.assertEqual(len(self.log_lines(self.reload_log)), 1)
 
@@ -1394,6 +1395,122 @@ class SetupScriptRun(PhoneEnv):
         # nothing left to reload on the second run
         self.assertEqual(len(self.log_lines(self.reload_log)),
                          reloads_after_run1)
+
+    # ---- v0.2.2: the pre-SHIFT TENDRIL default migrates to the SHIFT row
+
+    OLD_DEFAULT = ("extra-keys = [['ESC','/',{key: '-', popup: '|'},"
+                   "'HOME','UP','END','PGUP','KEYBOARD'], "
+                   "['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]")
+    NEW_DEFAULT = ("extra-keys = [['ESC','/',{key: '-', popup: '|'},"
+                   "'HOME','UP','END','PGUP','KEYBOARD'], "
+                   "['TAB','CTRL','ALT','SHIFT','LEFT','DOWN','RIGHT','PGDN']]")
+
+    def _seed_props(self, body):
+        props = os.path.join(self.home, ".termux", "termux.properties")
+        os.makedirs(os.path.dirname(props), exist_ok=True)
+        with open(props, "w") as f:
+            f.write(body)
+        return props
+
+    def test_setup_migrates_the_pre_shift_tendril_default(self):
+        # an existing install that took TENDRIL's old default gains SHIFT
+        # (Shift+Tab -> ESC [ Z -> the reasoning-effort toggle) without the
+        # user re-typing anything; their other lines keep their order
+        self.host_ready()
+        props = self._seed_props("use-black-ui = true\n" + self.OLD_DEFAULT
+                                 + "\nallow-external-apps = true\n")
+        p = self.run_generated("setup", stdin="")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(props) as f:
+            self.assertEqual(f.read(),
+                             "use-black-ui = true\n"
+                             "allow-external-apps = true\n"
+                             + self.NEW_DEFAULT + "\n")
+        # the migrated row IS a settings change: exactly one reload
+        self.assertEqual(len(self.log_lines(self.reload_log)), 1)
+
+    def test_setup_migration_is_idempotent(self):
+        self.host_ready()
+        props = self._seed_props(self.OLD_DEFAULT + "\n")
+        self.assertEqual(self.run_generated("setup", stdin="").returncode, 0)
+        with open(props) as f:
+            once = f.read()
+        self.assertIn("'SHIFT'", once)
+        self.assertEqual(once.count("extra-keys"), 1)
+        reloads_after_run1 = len(self.log_lines(self.reload_log))
+        self.assertEqual(self.run_generated("setup", stdin="").returncode, 0)
+        with open(props) as f:
+            self.assertEqual(f.read(), once)           # byte-identical
+        self.assertEqual(len(self.log_lines(self.reload_log)),
+                         reloads_after_run1)
+
+    def test_setup_does_not_migrate_a_modified_tendril_layout(self):
+        # a TENDRIL default the user has since edited is THEIRS: no
+        # whole-line match, no rewrite, no extra-keys reload (the
+        # allow-external-apps write is a separate, pre-existing behaviour
+        # and its own reload)
+        self.host_ready()
+        props = self._seed_props(self.OLD_DEFAULT + "   # tuned by me\n")
+        p = self.run_generated("setup", stdin="")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(props) as f:
+            self.assertEqual(
+                f.read(),
+                self.OLD_DEFAULT + "   # tuned by me\n"
+                "allow-external-apps = true\n")
+        # exactly one reload, and it is allow-external-apps' doing - the
+        # extra-keys row was untouched
+        self.assertEqual(len(self.log_lines(self.reload_log)), 1)
+
+    def test_setup_migrated_layout_still_passes_through_upgrade(self):
+        # the upgrade script does not touch a current (migrated) layout:
+        # a migrated layout survives it byte-identically
+        self.host_ready()
+        props = self._seed_props(self.OLD_DEFAULT + "\n")
+        self.assertEqual(self.run_generated("setup", stdin="").returncode, 0)
+        with open(props) as f:
+            after_setup = f.read()
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="42")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(props) as f:
+            self.assertEqual(f.read(), after_setup)
+
+    def test_upgrade_migrates_the_pre_shift_tendril_default(self):
+        # the normal upgrade workflow carries the fix: a phone that never
+        # re-runs setup still gains SHIFT on its next `tendril --upgrade`
+        self.host_ready()
+        self.install_launchers()
+        props = self._seed_props(self.OLD_DEFAULT + "\n")
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="42")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(props) as f:
+            self.assertEqual(f.read(), self.NEW_DEFAULT + "\n")
+        self.assertEqual(len(self.log_lines(self.reload_log)), 1)
+
+    def test_upgrade_does_not_write_a_fresh_extra_keys_layout(self):
+        # upgrade repairs TENDRIL's own row; a MISSING row is setup
+        # business and upgrade must not start writing toolbars
+        self.host_ready()
+        self.install_launchers()
+        props = self._seed_props("use-black-ui = true\n")
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="42")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(props) as f:
+            self.assertEqual(f.read(), "use-black-ui = true\n")
+        self.assertEqual(self.log_lines(self.reload_log), [])
+
+    def test_upgrade_leaves_a_custom_extra_keys_layout_alone(self):
+        self.host_ready()
+        self.install_launchers()
+        props = self._seed_props("extra-keys = [[CTRL]]\n"
+                                 "allow-external-apps = true\n")
+        p = self.run_generated("upgrade", stdin="", TENDRIL_FAKE_VC="42")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        with open(props) as f:
+            self.assertEqual(f.read(),
+                             "extra-keys = [[CTRL]]\n"
+                             "allow-external-apps = true\n")
+        self.assertEqual(self.log_lines(self.reload_log), [])
 
     def test_setup_never_touches_ssh(self):
         self.host_ready()

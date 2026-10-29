@@ -2,6 +2,37 @@
 
 All notable changes to TENDRIL are documented here.
 
+## v0.2.2 — Shift+Tab on the phone (2026-10-29)
+
+Surgical compatibility fix, certified byte-for-byte on the host side: the
+reasoning-effort toggle (`Shift+Tab` in a Herdr agent pane) was unreachable
+from Termux. The whole transport was verified clean — Termux sends `ESC [ Z`
+for SHIFT+TAB (KeyHandler, v0.118+), and that sequence passes Mosh, the
+TENDRIL attach bridge and `herdr session attach` through to the pane
+byte-for-byte, identical to a laptop session. The failure was the phone's
+keyboard surface: TENDRIL's suggested extra-keys toolbar had no SHIFT key,
+so on-screen users could not produce Shift+Tab at all. A laptop could; a
+phone could not. That is the whole bug.
+
+- **SHIFT on the toolbar**: the default extra-keys row gains Termux's sticky
+  `SHIFT` button (`TAB` → `ESC [ Z` → pi's `app.thinking.cycle`). Fresh
+  installs get it from `phone/setup.sh` and the host-served `tendril install`
+  script alike.
+- **One-time migration**: an existing install that still carries the exact
+  pre-SHIFT row TENDRIL wrote is migrated automatically on the next
+  `tendril install` / `tendril --upgrade` (settings reload included). A
+  layout the user has edited since — even by one character — is theirs and
+  is never touched; docs/ANDROID.md tells those users how to add `SHIFT`.
+- **Regression coverage**: the attach bridge now has byte-level Shift+Tab
+  tests (one-shot, split across reads, interleaved with the Ctrl+Home
+  detach rewrite, distinct from plain TAB, and a real-PTY round trip), and
+  the phone-channel suite covers fresh-install layout, migration,
+  migration idempotence and the modified-layout refusal.
+
+No transport, bridge, or Herdr behavior changed. Ctrl+Home detach, touch
+scrolling, Tab, arrows, Ctrl combinations and escape sequences are covered
+by the existing suites and by the new byte-level tests.
+
 ## v0.2.1 — Interaction + Installation Polish (2026-10-14)
 
 v0.2.1 turns the working pieces of v0.2.0 into one product, and gives the
