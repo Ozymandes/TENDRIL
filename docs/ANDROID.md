@@ -112,6 +112,33 @@ To check what your Termux keyboard sends, run `cat -v` in a plain Termux shell
 (not inside Herdr), then tap CTRL followed by HOME. The bridge recognizes
 `^[[1;5H`; `Ctrl+C` exits.
 
+## Shift+Tab: the reasoning-effort toggle
+
+Inside a Herdr agent pane, `Shift+Tab` cycles pi's thinking/reasoning-effort
+level (pi binds `shift+tab` to `app.thinking.cycle`). On a phone there is no
+hardware Shift key, so the extra-keys toolbar TENDRIL installs carries a
+sticky `SHIFT` button: tap `SHIFT`, then `TAB`. Termux sends the backtab
+sequence `ESC [ Z` (`^[[Z` under `cat -v`), and that sequence passes through
+Mosh, the TENDRIL attach bridge and `herdr session attach` byte-for-byte to
+the pane — the same bytes a laptop keyboard produces.
+
+If you wrote your own `extra-keys` layout in `~/.termux/termux.properties`,
+TENDRIL never touches it — add `'SHIFT'` to a row yourself, e.g.
+
+```
+extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','SHIFT','LEFT','DOWN','RIGHT','PGDN']]
+```
+
+then run `termux-reload-settings`. An install that still carries the exact
+pre-SHIFT default row TENDRIL wrote earlier is migrated automatically on the
+next `tendril install` / `tendril --upgrade` from the host (or re-running the
+public setup script); a layout you have edited since is left alone.
+
+Verify the whole path from a plain Termux shell: `cat -v`, tap `SHIFT` then
+`TAB` — the terminal must print `^[[Z` (a plain `TAB` only moves the cursor to
+the next tab stop). Inside a session, pi's status line shows the effort level
+the toggle lands on.
+
 ## Daily use
 
 ```

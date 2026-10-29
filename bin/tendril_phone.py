@@ -516,17 +516,48 @@ ensure_external_apps() {
 # off, so a collapsed keyboard can never be re-raised by tapping the
 # screen (upstream termux-app#5184). The toolbar stays visible with the
 # keyboard down and its KEYBOARD key raises it regardless of tracking.
-# The user's own extra-keys layout is never touched; the default
-# show/hide toggle behaviour is never overridden (this file never writes
-# soft-keyboard-toggle-behaviour). Returns 0 when it wrote the row.
+#
+# v0.2.2 adds SHIFT to the toolbar. Reasoning-effort toggling inside a
+# Herdr agent session is pi's Shift+Tab binding (app.thinking.cycle),
+# and on a phone there is no hardware Shift key: without a SHIFT button
+# on the toolbar the sequence is simply not producible, which is why
+# effort toggling worked from a laptop but never from Termux. The
+# transport is verified clean end to end - Termux sends ESC [ Z for
+# SHIFT+TAB (KeyHandler KEYCODE_TAB + KEYMOD_SHIFT, v0.118+), and that
+# sequence passes mosh, the TENDRIL attach bridge and herdr session
+# attach through to the pane byte-for-byte - so the toolbar key is the
+# whole fix. SHIFT is Termux's own sticky special button; the user's
+# own extra-keys layout is never touched, and a layout TENDRIL wrote
+# earlier is migrated only when it still matches that exact line.
+# The default show/hide toggle behaviour is never overridden (this file
+# never writes soft-keyboard-toggle-behaviour). Returns 0 when it wrote
+# or migrated the row (a settings reload is due), 1 otherwise.
+migrate_extra_keys() {
+    # One-time repair of TENDRIL's own pre-SHIFT row, whole-line exact
+    # match only - anything else on that line means the user edited it
+    # and it stays theirs. Also the only extra-keys change the upgrade
+    # script is allowed to make (a missing row is setup business).
+    _ek_props="$HOME/.termux/termux.properties"
+    _ek_old="extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]"
+    _ek_new="extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','SHIFT','LEFT','DOWN','RIGHT','PGDN']]"
+    [ -f "$_ek_props" ] && grep -qFx "$_ek_old" "$_ek_props" || return 1
+    { grep -vFx "$_ek_old" "$_ek_props"; printf '%s\n' "$_ek_new"; } \
+        > "$_ek_props.new.$$" \
+        && mv -f "$_ek_props.new.$$" "$_ek_props" \
+        || { rm -f "$_ek_props.new.$$"; return 1; }
+    return 0
+}
 ensure_extra_keys() {
+    if migrate_extra_keys; then
+        return 0                             # an unmodified pre-SHIFT row
+    fi
     _ek_props="$HOME/.termux/termux.properties"
     if [ -f "$_ek_props" ] \
        && grep -Eq '^[[:space:]]*extra-keys[[:space:]]*=' "$_ek_props"; then
         return 1                                 # the user's layout wins
     fi
     mkdir -p "$HOME/.termux" || return 1
-    printf '%s\n' "extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]" >> "$_ek_props"
+    printf '%s\n' "extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','SHIFT','LEFT','DOWN','RIGHT','PGDN']]" >> "$_ek_props"
     return 0
 }
 
@@ -621,6 +652,16 @@ fetch_asset termux-url-opener "$SHA_TERMUX_URL_OPENER" "$HOME/bin/termux-url-ope
 fetch_asset agent "$SHA_AGENT" "$HOME/bin/agent"; _rc=$?
 [ "$_rc" -eq 0 ] && ROW_AGENT=updated
 [ "$_rc" -eq 1 ] && FAILED=1
+
+if [ "$MODE" = upgrade ] && migrate_extra_keys; then
+    # v0.2.2 rides the routine upgrade: repair TENDRIL's own pre-SHIFT
+    # extra-keys row (Shift+Tab, the reasoning-effort toggle) so an
+    # existing phone gets the fix with zero action. Whole-line match
+    # only; a custom or missing layout is never upgrade business.
+    if command -v termux-reload-settings >/dev/null 2>&1; then
+        termux-reload-settings >/dev/null 2>&1 || true
+    fi
+fi
 
 if [ "$MODE" = setup ]; then
     ROW_ALIAS=""

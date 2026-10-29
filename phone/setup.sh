@@ -135,11 +135,32 @@ ok "Deep links" "TENDRIL Link may run its fixed commands"
 # raises it regardless of tracking. The user's own extra-keys layout is
 # never replaced; the default show/hide toggle behaviour is never
 # overridden here.
+#
+# v0.2.2 adds SHIFT: reasoning-effort toggling in a Herdr agent session
+# is pi's Shift+Tab binding, and a phone has no hardware Shift key. A
+# toolbar SHIFT button (Termux's sticky special button; SHIFT+TAB sends
+# ESC [ Z) makes the toggle producible on screen. The sequence is
+# verified to pass mosh, the TENDRIL attach bridge and herdr session
+# attach byte-for-byte, so this key is the whole phone-side fix. A
+# TENDRIL-written layout from before SHIFT is migrated only when it
+# still matches that exact line, whole-line; anything else is the
+# user's own and stays untouched.
+_ek_old="extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]"
+_ek_new="extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','SHIFT','LEFT','DOWN','RIGHT','PGDN']]"
+_ek_changed=0
+if [ -f "$PROPS" ] && grep -qFx "$_ek_old" "$PROPS" 2>/dev/null; then
+    if { grep -vFx "$_ek_old" "$PROPS"; printf '%s\n' "$_ek_new"; } > "$PROPS.new.$$" \
+       && mv -f "$PROPS.new.$$" "$PROPS"; then
+        _ek_changed=1
+    fi
+    rm -f "$PROPS.new.$$"
+fi
 if ! grep -Eq '^[[:space:]]*extra-keys[[:space:]]*=' "$PROPS" 2>/dev/null; then
     mkdir -p "$HOME/.termux"
-    printf '%s\n' "extra-keys = [['ESC','/',{key: '-', popup: '|'},'HOME','UP','END','PGUP','KEYBOARD'], ['TAB','CTRL','ALT','LEFT','DOWN','RIGHT','PGDN']]" >> "$PROPS"
-    termux-reload-settings >>"$LOG" 2>&1 || true
+    printf '%s\n' "$_ek_new" >> "$PROPS"
+    _ek_changed=1
 fi
+[ "$_ek_changed" -eq 1 ] && termux-reload-settings >>"$LOG" 2>&1 || true
 
 # ---------------------------------------------------------------- phone key
 # Prepared here, enrolled by pairing: TENDRIL Link scans the host QR and the

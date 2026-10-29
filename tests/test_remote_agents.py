@@ -543,6 +543,37 @@ class CtrlHomeBridge(unittest.TestCase):
             self.assertEqual(out, home)          # byte-identical
             self.assertEqual(tail, b"")
 
+    def test_shift_tab_passes_through(self):
+        """Shift+Tab is ESC [ Z - Termux sends it for SHIFT+TAB
+        (KeyHandler KEYCODE_TAB + KEYMOD_SHIFT) and pi binds it to the
+        reasoning-effort toggle (app.thinking.cycle). It must reach the
+        session byte-for-byte and stay distinguishable from plain TAB."""
+        tail, out = ra._detach_translate(b"\x1b[Z")
+        self.assertEqual(out, b"\x1b[Z")
+        self.assertEqual(tail, b"")
+
+    def test_shift_tab_stays_distinct_from_plain_tab(self):
+        tail, out = ra._detach_translate(b"\x1b[Z\t")
+        self.assertEqual(out, b"\x1b[Z\t")       # both arrive, order kept
+        self.assertEqual(tail, b"")
+
+    def test_shift_tab_split_across_reads_reassembles(self):
+        # ESC alone is an ambiguous prefix (Ctrl+Home could still follow);
+        # the bridge may hold it, but the reassembled stream is intact
+        tail, out = ra._detach_translate(b"\x1b")
+        self.assertEqual(out, b"")
+        tail, out = ra._detach_translate(tail + b"[")
+        self.assertEqual(out, b"")
+        self.assertEqual(tail, b"\x1b[")
+        tail, out = ra._detach_translate(tail + b"Z")
+        self.assertEqual(out, b"\x1b[Z")
+        self.assertEqual(tail, b"")
+
+    def test_shift_tab_and_ctrl_home_interleave_correctly(self):
+        tail, out = ra._detach_translate(b"\x1b[Z\x1b[1;5H\t\x1b[Z")
+        self.assertEqual(out, b"\x1b[Z\x1bd\t\x1b[Z")   # only Ctrl+Home rewrites
+        self.assertEqual(tail, b"")
+
     def test_ctrl_end_and_other_sequences_pass_through(self):
         for seq in (b"\x1b[1;5F", b"\x1b[1;5D", b"\x1b[5~", b"\x1b[A"):
             tail, out = ra._detach_translate(seq)
@@ -665,6 +696,25 @@ class CtrlHomeBridge(unittest.TestCase):
         self.assertIn(b"1b5b481b64", out)    # ...then ESC d (the detach)
         self.assertEqual(proc.wait(10), 0)   # session exit reaped cleanly
         self.assertEqual(tty_settings(slave), orig)
+
+    def test_pty_roundtrip_shift_tab_reaches_session_verbatim(self):
+        """The phone-side regression this release fixes: Shift+Tab (ESC [ Z,
+        pi's reasoning-effort toggle) rides the live bridge byte-for-byte
+        and stays distinguishable from plain TAB."""
+        stub = self.ECHO_STUB.replace("buf = b''\n",
+                                      "print('BRIDGE_READY', flush=True)\nbuf = b''\n")
+        proc, master, slave, orig, tmp = self._bridge_session(stub)
+        self.addCleanup(self._cleanup, proc, master, slave, tmp)
+        self._read_until(master, lambda data: b"BRIDGE_READY" in data)
+        os.write(master, b"\x1b[Z\t")        # Shift+Tab, then plain Tab
+        out = self._read_until(master, lambda b: b"1b5b5a09" in b)
+        self.assertIn(b"1b5b5a09", out)      # ESC [ Z TAB: order and bytes kept
+        self.assertIsNone(proc.poll())       # session still alive, bridge intact
+        # a Ctrl+Home still detaches through the same bridge
+        os.write(master, b"\x1b[1;5H")
+        out = self._read_until(master, lambda b: b"1b64" in b)
+        self.assertIn(b"1b64", out)
+        self.assertEqual(proc.wait(10), 0)
 
     def test_clean_host_attach_uses_real_bridge_and_translates_ctrl_home(self):
         stub = self.ECHO_STUB.replace("buf = b''\n",
