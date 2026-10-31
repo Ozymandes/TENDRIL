@@ -1371,6 +1371,13 @@ def menu_loop(rows, tty_mode=False, fd=None, note="", preferred_id=None):
                 preferred_id = rows[index]["id"]
                 attach(rows[index])
         elif raw.lower() == "q":
+            if tty_mode:
+                # leave a clean screen behind: the dashboard draws on the
+                # main screen, so without this its last frame stayed on
+                # top of the returned prompt over plain SSH (the frame read
+                # as "Q did nothing"); cursor shown, attributes reset
+                sys.stdout.write(C_RESET + "\033[?25h\033[H\033[2J")
+                sys.stdout.flush()
             return 0
         elif raw.lower() == "l":
             # U9: the phone asked for the TENDRIL Link app. The selector

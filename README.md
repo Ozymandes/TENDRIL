@@ -9,10 +9,10 @@
 **A handheld control plane for persistent AI agents.**
 
 <p align="center">
-  <a href="https://github.com/Ozymandes/TENDRIL/releases/tag/v0.2.3"><img alt="Version v0.2.3" src="https://img.shields.io/badge/version-v0.2.3-CBFD75?style=flat-square&labelColor=111111"></a>
+  <a href="https://github.com/Ozymandes/TENDRIL/releases/tag/v0.2.4"><img alt="Version v0.2.4" src="https://img.shields.io/badge/version-v0.2.4-CBFD75?style=flat-square&labelColor=111111"></a>
   <a href="https://github.com/Ozymandes/TENDRIL/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/Ozymandes/TENDRIL/ci.yml?branch=main&style=flat-square&label=tests&labelColor=111111"></a>
   <a href="LICENSE"><img alt="MIT licence" src="https://img.shields.io/badge/licence-MIT-CBFD75?style=flat-square&labelColor=111111"></a>
-  <a href="#compatibility-v023"><img alt="Host: Linux" src="https://img.shields.io/badge/host-Linux-6FD3DE?style=flat-square&labelColor=111111&logo=linux&logoColor=white"></a>
+  <a href="#compatibility-v024"><img alt="Host: Linux" src="https://img.shields.io/badge/host-Linux-6FD3DE?style=flat-square&labelColor=111111&logo=linux&logoColor=white"></a>
   <a href="docs/ANDROID.md"><img alt="Phone: Android + Termux" src="https://img.shields.io/badge/phone-Android%20%C2%B7%20Termux-6FD3DE?style=flat-square&labelColor=111111&logo=android&logoColor=white"></a>
   <a href="https://herdr.dev"><img alt="Herdr 0.9.3+" src="https://img.shields.io/badge/runtime-Herdr%200.9.3%2B-F0B54A?style=flat-square&labelColor=111111"></a>
 </p>
@@ -539,7 +539,7 @@ later check fails. On the host, `tendril --upgrade` updates TENDRIL itself
 by fast-forwarding a clean checkout; your configuration and notification
 topic are left byte-for-byte untouched.
 
-## Compatibility (v0.2.3)
+## Compatibility (v0.2.4)
 
 | | Supported | Status |
 |---|---|---|

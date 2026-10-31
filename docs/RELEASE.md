@@ -112,6 +112,22 @@ The release assets are exactly two files: `tendril-link.apk` and
 versionName, build, sha256, size, signer_sha256`). `phone/setup.sh` and
 `tendril --link-fetch` both download exactly these names.
 
+## 5b. Every later release (v0.2.4 rules)
+
+- **Link source of truth:** the Link app ships from the Link repo's `main`
+  (production line). `feat/v0.3.0-*` branches never produce a release APK.
+- **versionCode** is `git rev-list --count HEAD`: confirm the build's code
+  is above the last published one before uploading (the host's
+  `--link-stage` refuses a lower code; Android refuses a downgrade).
+- **Assets:** an APK release attaches `tendril-link.apk` +
+  `tendril-link.json`. A host-only release attaches nothing - hosts
+  stage the newest release that carries Link assets.
+- **Delivery:** every host stages the official Link release on
+  `./install` and `tendril --upgrade` (`stage_link_release`, signer-pinned,
+  sha256/size-verified, never a downgrade). So: publish the release, then
+  a host's next `tendril --upgrade` makes its phones see "Update ready".
+  `TENDRIL_LINK_FETCH=0` skips it on an offline host.
+
 ## 6. Verify the published release
 
 ```sh

@@ -547,10 +547,26 @@ upgrade_install() {
         say "  note: provenance not recorded (non-fatal; the file enables tendril --upgrade)"
     fi
     say ""
+    stage_link_release
     hr
     say "Upgrade done. Health check:  tendril --upgrade"
     hr
     return 0
+}
+# stage_link_release - v0.2.4: every install and upgrade stages the
+# official TENDRIL Link release for this host's phones (signer-pinned,
+# sha256/size-verified, never a downgrade). Before this, only the release
+# machine ever staged a new Link build, so a phone paired to any OTHER host
+# saw "up to date" forever. Never fatal; TENDRIL_LINK_FETCH=0 skips it.
+stage_link_release() {
+    say "7) TENDRIL Link for this host's phones"
+    if [ "$DRY_RUN" = "1" ]; then
+        say "  [dry-run] stage the official TENDRIL Link release (tendril --link-fetch)"
+    else
+        "$PYTHON" "$PKG_DIR/bin/tendril_phone.py" --link-fetch-auto \
+            || say "  note: TENDRIL Link not staged (non-fatal) - retry: tendril --link-fetch"
+    fi
+    say ""
 }
 [ "$MODE" = upgrade ] && { upgrade_install; exit $?; }
 
@@ -986,7 +1002,9 @@ PLAN=$(herdr_detach plan)
     done
 say ""
 
-# ---------------- 7. pair a phone ----------------
+stage_link_release
+
+# ---------------- 8. pair a phone ----------------
 hr; say "TENDRIL // PHONE SETUP (for this host)"; hr
 say "Pair a phone:  tendril --pair"
 say "Manual Termux setup:  tendril --pair --manual"

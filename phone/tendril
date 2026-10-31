@@ -325,7 +325,40 @@ finish_interactive() {
         _t_log link-open
         open_link_app
         _t_log link-open-done "$?"
-        exit 0
+        leave_interactive 0
+    fi
+    leave_interactive "$1"
+}
+
+# launched_as_session_root - true when THIS launcher is the root process
+# of its Termux session: TENDRIL Link's session entry (RUN_COMMAND, a new
+# foreground session) and the share/URL opener start `tendril enter <id>`
+# with no shell underneath, so the parent is the Termux app itself. A
+# `tendril` typed at a prompt has a shell as its parent and is untouched.
+launched_as_session_root() {
+    if [ -z "${TERMUX_VERSION:-}" ]; then
+        case "${PREFIX:-}" in */com.termux/*) ;; *) return 1 ;; esac
+    fi
+    _lr_parent=${TENDRIL_FAKE_PARENT_COMM:-$(cat "/proc/$PPID/comm" 2>/dev/null)}
+    case "$_lr_parent" in
+        com.termux*) return 0 ;;
+    esac
+    return 1
+}
+
+# leave_interactive <status> - the end of an interactive session (the
+# dashboard quit with Q, or L, or the session ended). v0.2.4: a session
+# root used to exit into Termux's "[Process completed (code 0) - press
+# Enter]" with no shell behind it - Q never reached `~ $`. It now hands
+# the session to the user's login shell, so Q lands where a typed
+# `tendril` lands. Interactive TTY only; TENDRIL_SHELL_HANDOFF=0 opts out.
+leave_interactive() {
+    if [ -t 0 ] && [ "${TENDRIL_SHELL_HANDOFF:-1}" != 0 ] && launched_as_session_root; then
+        _t_log shell-handoff
+        if [ -x "${PREFIX:-}/bin/login" ]; then
+            exec "$PREFIX/bin/login"
+        fi
+        exec "${SHELL:-sh}" -l
     fi
     exit "$1"
 }
@@ -716,8 +749,20 @@ if [ -z "$FORCE_SSH" ] && command -v mosh >/dev/null 2>&1; then
         _t_log mosh-done
         if [ -n "$NONCE" ]; then
             _t_log link-consume
-            if ssh -o BatchMode=yes -o ConnectTimeout=6 $BATCH_CM_OPTS "$ALIAS" \
-                "$REMOTE_BIN --link-open-request $NONCE" 2>/dev/null \
+            # v0.2.4: this runs AFTER the dashboard quit, before the prompt
+            # returns - it must never hold the user. It used to ride the
+            # shared control master (ControlPersist): after a network
+            # change the master's TCP is dead while mosh roamed on, a
+            # multiplexed request waits on it (ConnectTimeout does not
+            # apply), and without -n it swallowed the keys typed meanwhile
+            # - Q "did nothing". Now: its own fresh connection, no stdin,
+            # 3 s to connect and a hard 4 s ceiling where `timeout` exists.
+            _lc_timeout=""
+            command -v timeout >/dev/null 2>&1 && _lc_timeout="timeout 4"
+            # shellcheck disable=SC2086  # _lc_timeout: empty or two words
+            if $_lc_timeout ssh -n -o BatchMode=yes -o ConnectTimeout=3 \
+                -o ConnectionAttempts=1 -o ControlMaster=no -o ControlPath=none \
+                "$ALIAS" "$REMOTE_BIN --link-open-request $NONCE" 2>/dev/null \
                 | grep -q '^open$'; then
                 _t_log link-open
                 open_link_app
@@ -726,7 +771,7 @@ if [ -z "$FORCE_SSH" ] && command -v mosh >/dev/null 2>&1; then
                 _t_log link-none
             fi
         fi
-        exit 0
+        leave_interactive 0
     fi
     _t_log fallback
     _PROBED=1

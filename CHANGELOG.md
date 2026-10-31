@@ -2,6 +2,59 @@
 
 All notable changes to TENDRIL are documented here.
 
+## v0.2.4 — Reliability hotfix: updates on every phone, Q that returns you (2026-10-31)
+
+Host 0.2.4 + **TENDRIL Link 0.2.3 (build 174)**, built from the Link
+production line (0.2.1 / 170) — no v0.3.0 instrument-UI code.
+
+**Updates failed on phones other than the developer's.** Three defects,
+all invisible on a phone whose Android answers every package probe and
+is paired to the release machine:
+
+- *The app-driven update could not finish on many devices.* The host's
+  upgrade script prints eight TENDRIL Link rows; Link parsed four. Where
+  Android will not report the installed versionCode, refuses the probes
+  (Samsung transaction errors), or answers `pm path` empty (a secondary
+  user), the app-driven run ended in "the upgrade did not report a
+  result" — permanently. Proven with the real production 0.2.1 parser
+  against the real 0.2.3 host output: 4 of 5 probe shapes failed; only the
+  S21's worked. Now, in the app's own (headless) run, the app —
+  installed by definition, and the authority on its own versionCode —
+  is handed the verified staged build whenever probes cannot tell, and
+  every row is one the INSTALLED 0.2.1/0.2.2 apps already parse. Proven:
+  production 0.2.1 maps every shape to a verified handoff or up-to-date.
+  Typed `tendril --upgrade` keeps its strict three-state rules.
+- *Hosts other than the release machine never offered a new Link build.*
+  Only `build-release.sh` (or a manual `--link-fetch`) staged one.
+  `./install` and `tendril --upgrade` now stage the official release
+  (signer-pinned, sha256/size-verified, never a downgrade; the newest
+  release that carries Link assets when the latest is host-only).
+- *An alias kept only in `~/.bashrc` was invisible to Link* (Termux's
+  background RUN_COMMAND never reads it). The phone script persists it
+  once to `~/.config/tendril/alias`; an existing file is never touched.
+
+**TENDRIL Link 0.2.3:** "Update ready · <version>  Update" on Home — one
+tap opens About and starts the trusted update; About keeps App update /
+Phone (Termux) / Connected host apart. Every host answer, old or new, is
+actionable (a handoff is honoured whatever the row word says).
+
+**Q on the dashboard.** The dashboard itself exits on q/Q at once —
+proven over real mosh, directly, after a Herdr attach/detach, and via
+`enter`. What held the user came after, on the phone:
+
+- the post-session Link-open check rode the shared ssh control master;
+  after a network change (mosh roams, the master's TCP does not) it
+  waited on a dead connection and swallowed keys typed meanwhile
+  (reproduced: 6.45 s with a stalled master; now 0.43 s — its own
+  connection, no stdin, hard 4 s ceiling);
+- a session opened from TENDRIL Link ended in Termux's "[Process
+  completed]" with no shell behind it — it now hands over to your
+  login shell;
+- Q leaves a clean screen (cursor shown).
+
+Remote-session input, Herdr, the detach bridge and Shift+Tab are
+unchanged.
+
 ## v0.2.3 — Version honesty + a keyboard that fits thumbs (2026-10-29)
 
 Product-quality follow-up to v0.2.2: the version/update story becomes

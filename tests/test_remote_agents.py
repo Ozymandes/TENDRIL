@@ -883,3 +883,36 @@ def tempfile_directory():
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DashboardQuit(unittest.TestCase):
+    """q / Q on the dashboard: exits at once (0) and, on a TTY, leaves a
+    clean screen with the cursor shown - the last frame no longer sits on
+    top of the returned prompt (v0.2.4). Proven end to end over real mosh
+    (direct, after a Herdr attach/detach cycle, and via `enter`); this pins
+    the dashboard's own half."""
+
+    def run_quit(self, key, tty_mode):
+        rows = [{"id": "w1", "label": "a", "number": 1, "focused": True,
+                 "path": "/tmp", "rank": 0, "agents": []}]
+        buf = io.StringIO()
+        with mock.patch.object(ra, "render"), \
+                mock.patch.object(ra, "collect") as collect, \
+                mock.patch.object(ra, "read_menu_action",
+                                  return_value=("line", key)), \
+                contextlib.redirect_stdout(buf):
+            rc = ra.menu_loop(rows, tty_mode=tty_mode, fd=0)
+        collect.assert_not_called()                 # no host round trip on quit
+        return rc, buf.getvalue()
+
+    def test_q_and_Q_exit_with_a_clean_screen_on_a_tty(self):
+        for key in ("q", "Q"):
+            with self.subTest(key=key):
+                rc, out = self.run_quit(key, tty_mode=True)
+                self.assertEqual(rc, 0)
+                self.assertTrue(out.endswith("\033[?25h\033[H\033[2J"), repr(out))
+
+    def test_line_mode_quit_prints_nothing(self):
+        rc, out = self.run_quit("q", tty_mode=False)
+        self.assertEqual(rc, 0)
+        self.assertEqual(out, "")

@@ -24,6 +24,10 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TIMEOUT = float(os.environ.get("TENDRIL_TEST_TIMEOUT", "90"))
+# The installer stages the official TENDRIL Link release from GitHub on
+# every install (v0.2.4); the suite runs the installer many times and must
+# never touch the network for it. Tests of that step inject their opener.
+os.environ["TENDRIL_LINK_FETCH"] = "0"
 
 
 def _descendants():
