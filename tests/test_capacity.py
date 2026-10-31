@@ -268,6 +268,53 @@ class TestProviderDiscovery(Base):
         self.assertEqual(rec["reason"], "stale")
         self.assertNotIn("windows", rec)
 
+    def test_aged_transport_failure_reads_stale_never_definitive(self):
+        # Physical device, v0.2.4: one connectivity blip left every adapter
+        # fail=net in exponential backoff for the better part of an hour
+        # while the host's egress had already recovered - Capacity kept
+        # saying "the host cannot reach the provider" about providers a
+        # direct request reached in under a second. A connection-level
+        # failure older than the minimum re-check interval is an AGED
+        # observation: stale, never a definitive network_error.
+        st = tc._fresh_net_state()
+        st.update({"observed_at": NOW - tc.NET_MIN_S - 1, "fail": "net"})
+        cache = {"net": {"codex_wham": st}, "presence": {
+            "codex": {"last_seen_at": NOW, "models": ["gpt-5.6-sol"],
+                      "harnesses": ["pi"], "sources": ["active_sessions"]}}}
+        rec = tc._assemble(cache, NOW, enabled=["codex_wham"])["providers"][0]
+        self.assertEqual(rec["state"], "unavailable")
+        self.assertEqual(rec["reason"], "stale")
+
+    def test_fresh_transport_failure_is_still_a_verified_answer(self):
+        # Within the minimum re-check interval the connection failure is
+        # fresh evidence: the host really could not reach the provider
+        # just now, and the word stays Unavailable/network_error.
+        st = tc._fresh_net_state()
+        st.update({"observed_at": NOW - 5, "fail": "net"})
+        cache = {"net": {"codex_wham": st}, "presence": {
+            "codex": {"last_seen_at": NOW, "models": ["gpt-5.6-sol"],
+                      "harnesses": ["pi"], "sources": ["active_sessions"]}}}
+        rec = tc._assemble(cache, NOW, enabled=["codex_wham"])["providers"][0]
+        self.assertEqual(rec["state"], "unavailable")
+        self.assertEqual(rec["reason"], "network_error")
+
+    def test_provider_answered_failures_stay_definitive_when_aged(self):
+        # http/rate/shape mean the PROVIDER answered (bad endpoint, 429,
+        # malformed body) - that verdict does not go stale the way our
+        # own transport failures do.
+        for kind in ("http", "rate", "shape"):
+            st = tc._fresh_net_state()
+            st.update({"observed_at": NOW - tc.NET_MIN_S * 10,
+                       "fail": kind})
+            cache = {"net": {"codex_wham": st}, "presence": {
+                "codex": {"last_seen_at": NOW, "models": ["gpt-5.6-sol"],
+                          "harnesses": ["pi"],
+                          "sources": ["active_sessions"]}}}
+            rec = tc._assemble(cache, NOW,
+                               enabled=["codex_wham"])["providers"][0]
+            self.assertEqual(rec["state"], "unavailable", kind)
+            self.assertEqual(rec["reason"], "network_error", kind)
+
     def test_one_broken_adapter_does_not_break_other_providers(self):
         self.cred("claude")
         self.cred("codex")

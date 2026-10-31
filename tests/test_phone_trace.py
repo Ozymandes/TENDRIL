@@ -50,7 +50,11 @@ MOSH_STUB = ('printf \'mosh %s\\n\' "$*" >> "$TENDRIL_RECORD"\n'
              'sh -c "$1"\n'
              'exit "${TENDRIL_MOSH_RC:-0}"\n')
 REMOTE_STUB = ('printf \'remote-agents %s\\n\' "$*" >> "$TENDRIL_RECORD"\n'
-               'exit 0\n')
+               'exit "${TENDRIL_REMOTE_RC:-0}"\n')
+LOGIN_STUB = ('{ printf "login %s\\n" "$*"; } >> "$TENDRIL_RECORD"\n'
+              'exit 0\n')
+AM_STUB = ('printf \'am %s\\n\' "$*" >> "$TENDRIL_RECORD"\n'
+           'exit 0\n')
 
 
 class TraceEnv(unittest.TestCase):
@@ -84,9 +88,9 @@ class TraceEnv(unittest.TestCase):
         e.update(over)
         return e
 
-    def run_launcher(self, args, **over):
+    def run_launcher(self, args, stdin=None, **over):
         return subprocess.run(["sh", LAUNCHER] + list(args),
-                              env=self.env(**over),
+                              env=self.env(**over), stdin=stdin,
                               capture_output=True, text=True, timeout=60)
 
     def calls(self):
@@ -246,6 +250,109 @@ class Rotation(TraceEnv):
         self.assertTrue(os.path.exists(self.log_path() + ".old"))
         stages, _ = self.log_stages()
         self.assertEqual(stages[0], "start")            # fresh small log
+
+
+class DashboardExitDestination(TraceEnv):
+    """Physical-device regression (v0.2.4 report, pinned in v0.2.5):
+    Termux -> TENDRIL dashboard -> q/Q must land in an interactive local
+    shell (`~ $`), never in TENDRIL Link, never in Termux's "[Process
+    completed]". The test verifies the DESTINATION, not the timing:
+
+    - a Link-initiated launch (RUN_COMMAND) makes the launcher the ROOT
+      process of its Termux session; after the dashboard quits the
+      launcher must EXEC the login shell (leave_interactive's handoff)
+      and must never invoke `am` (no Link reopen, no link-open request
+      on the q path - the nonce-scoped consume answers link-none);
+    - a `tendril` typed at a shell prompt has a shell behind it: the
+      launcher must simply exit into that existing shell (no second
+      shell spawned, no Link);
+    - the selector's L key stays the ONE intentional Link handoff: over
+      ssh its status 75 opens the app, and the session still ends in a
+      usable shell underneath.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Fake Termux world: PREFIX/bin/login is the handoff destination
+        # (records + exits), `am` records every Android intent attempt.
+        self.prefix = os.path.join(self.tmp, "prefix")
+        os.makedirs(os.path.join(self.prefix, "bin"))
+        self._stub(os.path.join(self.prefix, "bin", "login"), LOGIN_STUB)
+        self._stub(os.path.join(self.bindir, "am"), AM_STUB)
+
+    def _stub(self, path, body):
+        with open(path, "w") as f:
+            f.write("#!/bin/sh\n" + body)
+        os.chmod(path, 0o755)
+
+    def _pty(self):
+        import pty
+        master, slave = pty.openpty()
+        self.addCleanup(os.close, master)
+        self.addCleanup(os.close, slave)
+        return slave
+
+    def _root_env(self, **over):
+        over.setdefault("TERMUX_VERSION", "0.118")
+        over.setdefault("PREFIX", self.prefix)
+        over.setdefault("TENDRIL_FAKE_PARENT_COMM", "com.termux.arm64")
+        over.setdefault("TENDRIL_TRACE", "1")
+        return over
+
+    def am_calls(self):
+        return [c for c in self.calls() if c.startswith("am ")]
+
+    def login_calls(self):
+        return [c for c in self.calls() if c.startswith("login")]
+
+    def test_q_from_link_launch_lands_in_the_login_shell_never_link(self):
+        slave = self._pty()
+        p = self.run_launcher(["testhost"], stdin=slave,
+                              TENDRIL_ALIAS="testhost", **self._root_env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        stages, _ = self.log_stages()
+        # the dashboard quit (mosh done), the nonce-scoped consume ran and
+        # found NO request (q never writes one), and the session was
+        # handed to the login shell - the destination the user lands in.
+        self.assertIn("mosh-done", stages)
+        self.assertIn("link-consume", stages)
+        self.assertIn("link-none", stages)
+        self.assertIn("shell-handoff", stages)
+        self.assertNotIn("link-open", stages)
+        self.assertEqual(self.am_calls(), [])          # Link never reopened
+        self.assertEqual(len(self.login_calls()), 1)   # ... a shell did
+
+    def test_q_from_a_typed_launch_returns_to_the_existing_shell(self):
+        slave = self._pty()
+        # NO TENDRIL_FAKE_PARENT_COMM: the parent is a shell, so the
+        # launcher must simply exit into it - no second shell, no Link.
+        p = self.run_launcher(["testhost"], stdin=slave,
+                              TENDRIL_ALIAS="testhost",
+                              TERMUX_VERSION="0.118", PREFIX=self.prefix,
+                              TENDRIL_TRACE="1")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        stages, _ = self.log_stages()
+        self.assertIn("mosh-done", stages)
+        self.assertNotIn("shell-handoff", stages)
+        self.assertNotIn("link-open", stages)
+        self.assertEqual(self.am_calls(), [])
+        self.assertEqual(self.login_calls(), [])
+
+    def test_l_stays_the_one_intentional_link_handoff(self):
+        slave = self._pty()
+        # Plain ssh path: the selector's L exits 75; ssh propagates it;
+        # finish_interactive opens Link AND still leaves a live shell.
+        p = self.run_launcher(["ssh", "testhost"], stdin=slave,
+                              TENDRIL_ALIAS="testhost", TENDRIL_SSH_RC="75",
+                              **self._root_env())
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        stages, _ = self.log_stages()
+        self.assertIn("link-open", stages)
+        self.assertIn("shell-handoff", stages)
+        am = self.am_calls()
+        self.assertEqual(len(am), 1)
+        self.assertIn("app.tendril.link/.MainActivity", am[0])
+        self.assertEqual(len(self.login_calls()), 1)
 
 
 if __name__ == "__main__":
