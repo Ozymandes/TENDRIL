@@ -33,6 +33,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from importlib.machinery import SourceFileLoader
 from unittest import mock
@@ -743,3 +744,112 @@ class LauncherHygiene(LauncherEnv):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PostSessionReturn(LauncherEnv):
+    """v0.2.4 (Q "did nothing" on the phone): the host dashboard exits on
+    q/Q at once (proven over real mosh); what followed on the PHONE is what
+    held the user. Two things now return them to `~ $`: the post-session
+    consume never rides the shared control master nor reads stdin, and a
+    session the launcher is ROOT of (TENDRIL Link's entry) hands off to the
+    login shell instead of Termux's "[Process completed]"."""
+
+    def test_consume_never_rides_the_shared_master_nor_stdin(self):
+        p = self.run_launcher(["testhost"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        consume = [c for c in self.ssh_calls() if "--link-open-request" in c]
+        self.assertEqual(len(consume), 1, self.calls())
+        argv = consume[0].split()
+        self.assertIn("-n", argv)                           # stdin untouched
+        self.assertIn("ControlPath=none", argv)             # its own connection
+        self.assertIn("ControlMaster=no", argv)
+        self.assertIn("ConnectTimeout=3", argv)
+        self.assertNotIn("ControlPersist=120", consume[0])
+
+    def test_consume_is_time_bounded_where_timeout_exists(self):
+        self.stub("timeout", 'printf \'timeout %s\\n\' "$*" >> "$TENDRIL_RECORD"\n'
+                             'shift\nexec "$@"\n')
+        p = self.run_launcher(["testhost"])
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        wrapped = [c for c in self.calls()
+                   if c.startswith("timeout 4 ssh") and "--link-open-request" in c]
+        self.assertEqual(len(wrapped), 1, self.calls())
+
+    def run_in_pty(self, args, **over):
+        """The launcher on a REAL terminal (the handoff is TTY-only)."""
+        import pty
+        import select
+        env = self.env(**over)
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execvpe("sh", ["sh", LAUNCHER] + list(args), env)
+        out = b""
+        end = time.time() + 30
+        while time.time() < end:
+            r, _, _ = select.select([fd], [], [], 0.2)
+            if r:
+                try:
+                    chunk = os.read(fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                out += chunk
+            if os.waitpid(pid, os.WNOHANG)[0]:
+                break
+        try:
+            os.waitpid(pid, 0)
+        except ChildProcessError:
+            pass
+        return out.decode(errors="replace")
+
+    def termux_prefix(self):
+        prefix = os.path.join(self.tmp, "usr")
+        os.makedirs(os.path.join(prefix, "bin"))
+        login = os.path.join(prefix, "bin", "login")
+        with open(login, "w") as f:
+            f.write('#!/bin/sh\nprintf \'login\\n\' >> "$TENDRIL_RECORD"\n'
+                    'echo LOGIN-SHELL-READY\n')
+        os.chmod(login, 0o755)
+        return prefix
+
+    def test_session_root_lands_in_the_login_shell(self):
+        out = self.run_in_pty(["testhost"], TERMUX_VERSION="0.118.0",
+                              PREFIX=self.termux_prefix(),
+                              TENDRIL_FAKE_PARENT_COMM="com.termux")
+        self.assertIn("LOGIN-SHELL-READY", out)
+        self.assertEqual(self.calls()[-1], "login")         # last thing that ran
+
+    def test_enter_from_link_lands_in_the_login_shell_too(self):
+        out = self.run_in_pty(["enter", "w15"], TENDRIL_ALIAS="testhost",
+                              TERMUX_VERSION="0.118.0",
+                              PREFIX=self.termux_prefix(),
+                              TENDRIL_FAKE_PARENT_COMM="com.termux")
+        self.assertIn("LOGIN-SHELL-READY", out)
+        self.assertTrue(any("remote-agents enter" in c for c in self.calls()))
+
+    def test_typed_from_a_shell_just_exits(self):
+        out = self.run_in_pty(["testhost"], TERMUX_VERSION="0.118.0",
+                              PREFIX=self.termux_prefix(),
+                              TENDRIL_FAKE_PARENT_COMM="bash")
+        self.assertNotIn("LOGIN-SHELL-READY", out)
+        self.assertNotIn("login", self.calls())
+
+    def test_background_runs_never_hand_off(self):
+        p = self.run_launcher(["testhost"], TERMUX_VERSION="0.118.0",
+                              PREFIX=self.termux_prefix(),
+                              TENDRIL_FAKE_PARENT_COMM="com.termux")
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn("login", self.calls())             # no TTY, no shell
+
+    def test_handoff_opt_out(self):
+        out = self.run_in_pty(["testhost"], TERMUX_VERSION="0.118.0",
+                              PREFIX=self.termux_prefix(),
+                              TENDRIL_FAKE_PARENT_COMM="com.termux",
+                              TENDRIL_SHELL_HANDOFF="0")
+        self.assertNotIn("LOGIN-SHELL-READY", out)
+
+    def test_off_termux_never_hands_off(self):
+        out = self.run_in_pty(["testhost"], PREFIX=self.termux_prefix(),
+                              TENDRIL_FAKE_PARENT_COMM="com.termux")
+        self.assertNotIn("LOGIN-SHELL-READY", out)

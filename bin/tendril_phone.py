@@ -53,6 +53,10 @@ USAGE = ("usage: tendril --phone-manifest\n"
 # keeps the per-host first-stage pin (development builds).
 LINK_RELEASE_SIGNER = "44fa9365d6ac01ef94b8f462a0161f946c023c7377013d198d654f526333e03b"
 LINK_RELEASE_BASE = "https://github.com/Ozymandes/TENDRIL/releases"
+# v0.2.4: the release list, read only when the LATEST release carries no
+# Link assets (a host-only release) - the newest one that does is staged.
+LINK_RELEASE_API = ("https://api.github.com/repos/Ozymandes/TENDRIL/"
+                    "releases?per_page=20")
 
 MANIFEST_HEADER = "tendril-phone-manifest 1"
 PHONE_ASSETS = ("tendril", "termux-url-opener", "agent")
@@ -390,6 +394,28 @@ case $ALIAS in
         exit 2
         ;;
 esac
+# v0.2.4: an alias that lives ONLY in the shell environment (the old
+# docs' `export TENDRIL_ALIAS=...` in ~/.bashrc) works when typed but is
+# invisible to TENDRIL Link: Termux's background RUN_COMMAND never reads
+# ~/.bashrc, so the app's update check and its one-tap update both failed
+# with "no host alias" on such phones. Persist it to the file the
+# launcher already reads - once, only when no file exists, only a plain
+# alias value; an existing file is never touched.
+_ENV_ALIAS_PERSISTED=0
+if [ -z "$CONF_ALIAS" ] && [ -n "${TENDRIL_ALIAS:-}${AGENT_ALIAS:-}" ]; then
+    case $ALIAS in
+        *[!A-Za-z0-9@._:-]*) ;;
+        *)
+            if mkdir -p "$HOME/.config/tendril" \
+               && printf '%s\n' "$ALIAS" > "$HOME/.config/tendril/alias.new.$$" \
+               && chmod 600 "$HOME/.config/tendril/alias.new.$$" \
+               && mv -f "$HOME/.config/tendril/alias.new.$$" "$HOME/.config/tendril/alias"; then
+                _ENV_ALIAS_PERSISTED=1
+            else
+                rm -f "$HOME/.config/tendril/alias.new.$$"
+            fi ;;
+    esac
+fi
 
 # fetch_asset <name> <sha> <dest> - fetch over ssh, verify, atomic replace
 # (mode 700). Returns 0 updated, 2 already current; on any failure: one
@@ -706,6 +732,8 @@ if [ "$MODE" = setup ]; then
     ROW_PATH=""
     if [ -n "$CONF_ALIAS" ]; then
         ROW_ALIAS="kept ($CONF_ALIAS)"
+    elif [ "$_ENV_ALIAS_PERSISTED" -eq 1 ]; then
+        ROW_ALIAS="written ($ALIAS, from the environment)"
     elif [ -n "${TENDRIL_ALIAS:-}" ] || [ -n "${AGENT_ALIAS:-}" ]; then
         ROW_ALIAS="kept (environment)"
     else
@@ -760,6 +788,25 @@ if [ -n "$APK_SHA" ]; then
         else
             _link_state=older
         fi
+    fi
+    # HEADLESS = the TENDRIL Link app's own background run (stdin is not a
+    # terminal). The app is installed by definition - it is the caller -
+    # and it knows its own versionCode authoritatively, re-verifying any
+    # handed-off APK (package, sha256, size, signer, versionCode newer than
+    # itself) before Android's installer opens. So when the Android probes
+    # cannot tell (versionCode unreadable, probes refused, or a profile/
+    # secondary user where `pm path` answers empty), the staged build is
+    # handed off and the APP decides. v0.2.4 (second-phone failure): those
+    # states used to end the app-driven update with a row no installed app
+    # can parse, so on such devices Link could never update itself. Every
+    # headless row is one the installed 0.2.1/0.2.2 parsers know (current,
+    # update ready, not staged, download failed). A typed run keeps the
+    # strict three-state machine below unchanged.
+    if [ ! -t 0 ]; then
+        case $_link_state in
+            newer) _link_state=current ;;
+            installed | unknown | absent) _link_state=older ;;
+        esac
     fi
     case $_link_state in
         current)
@@ -1063,6 +1110,69 @@ def link_stage(path):
     return 0
 
 
+def _newest_link_release_tag(open_):
+    """The newest published (non-draft, non-prerelease) release that carries
+    BOTH Link assets, from the GitHub release list (newest first). None
+    when no release carries them. Raises OSError/ValueError on transport
+    or parse failure. Only a tag string is taken from the answer - the
+    assets themselves are still fetched and verified by link_fetch."""
+    req = urllib.request.Request(
+        LINK_RELEASE_API,
+        headers={"User-Agent": "tendril-link-fetch",
+                 "Accept": "application/vnd.github+json"})
+    with open_(req, timeout=30) as resp:
+        body = resp.read(4 * 1024 * 1024 + 1)
+    if len(body) > 4 * 1024 * 1024:
+        raise ValueError("release list is larger than expected")
+    releases = json.loads(body.decode("utf-8"))
+    if not isinstance(releases, list):
+        raise ValueError("release list is not a list")
+    for rel in releases:
+        if not isinstance(rel, dict) or rel.get("draft") or rel.get("prerelease"):
+            continue
+        names = {a.get("name") for a in rel.get("assets") or []
+                 if isinstance(a, dict)}
+        tag = rel.get("tag_name")
+        if ({"tendril-link.json", "tendril-link.apk"} <= names
+                and isinstance(tag, str) and TOKEN_RE.match(tag)):
+            return tag
+    return None
+
+
+def link_fetch_auto(opener=None, out=sys.stdout):
+    """The installer's step (v0.2.4): stage the official TENDRIL Link
+    release for this host's phones on EVERY install / upgrade, so a phone
+    paired to any host - not only the release machine - discovers a new
+    Link build after its host runs `tendril --upgrade`. The same signer-
+    pinned, sha256/size-verified, never-downgrading path as
+    `tendril --link-fetch`. Never fatal: one indented outcome line,
+    always exit 0. TENDRIL_LINK_FETCH=0 skips it (offline hosts, tests)."""
+    if os.environ.get("TENDRIL_LINK_FETCH", "").strip() == "0":
+        out.write("  skipped (TENDRIL_LINK_FETCH=0) - phones keep the "
+                  "currently staged build\n")
+        return 0
+    import contextlib
+    import io
+    err = io.StringIO()
+    msg = io.StringIO()
+    try:
+        with contextlib.redirect_stderr(err):
+            rc = link_fetch(None, opener=opener, out=msg)
+    except Exception as exc:              # never break an install on this
+        rc = 1
+        err.write("%s\n" % exc)
+    for line in (msg.getvalue() + err.getvalue()).splitlines():
+        if line.strip():
+            out.write("  %s\n" % line.strip())
+    if rc != 0:
+        staged = staged_manifest()
+        out.write("  phones keep %s - retry later: tendril --link-fetch\n"
+                  % ("TENDRIL Link %s (%s)" % (staged.get("versionName"),
+                                               staged.get("versionCode"))
+                     if staged else "no staged TENDRIL Link build"))
+    return 0
+
+
 def link_fetch(tag=None, opener=None, out=sys.stdout):
     """`tendril --link-fetch [<tag>]` (v0.2.1): stage the OFFICIAL TENDRIL
     Link release for this host's phones - download the release manifest
@@ -1094,6 +1204,15 @@ def link_fetch(tag=None, opener=None, out=sys.stdout):
     try:
         doc = json.loads(get("tendril-link.json", 64 * 1024).decode("utf-8"))
     except (OSError, ValueError) as exc:
+        if tag is None:
+            # v0.2.4: the latest release can be host-only (no Link assets;
+            # v0.2.2 was) - stage the newest release that carries them.
+            try:
+                found = _newest_link_release_tag(open_)
+            except (OSError, ValueError):
+                found = None
+            if found:
+                return link_fetch(found, opener=opener, out=out)
         sys.stderr.write("tendril --link-fetch: could not read the release "
                          "manifest (%s)\n" % exc)
         return 1
@@ -1105,6 +1224,16 @@ def link_fetch(tag=None, opener=None, out=sys.stdout):
     if staged and staged.get("sha256") == doc.get("sha256"):
         out.write("TENDRIL Link %s (%s) already staged\n"
                   % (doc.get("versionName"), doc.get("versionCode")))
+        return 0
+    if (staged and type(staged.get("versionCode")) is int
+            and type(doc.get("versionCode")) is int
+            and staged["versionCode"] > doc["versionCode"]):
+        # a newer build is already staged here (the release machine's own
+        # build-release.sh) - never an error, never a downgrade
+        out.write("TENDRIL Link %s (%s) already staged - newer than the "
+                  "release (%s), kept\n"
+                  % (staged.get("versionName"), staged["versionCode"],
+                     doc["versionCode"]))
         return 0
     size = doc.get("size")
     if type(size) is not int or not 0 < size <= 200 * 1024 * 1024:
@@ -1178,6 +1307,11 @@ def main(argv=None):
             sys.stderr.write(USAGE + "\n")
             return 2
         return link_fetch(argv[1] if len(argv) == 2 else None)
+    if head == "--link-fetch-auto":
+        if len(argv) != 1:
+            sys.stderr.write(USAGE + "\n")
+            return 2
+        return link_fetch_auto()
     if head == "--link-stage":
         if len(argv) != 2:
             sys.stderr.write(USAGE + "\n")

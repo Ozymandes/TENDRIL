@@ -169,9 +169,41 @@ Four components, four independent version stories — none of them is
 
 ```
 tendril      → workspace menu → ↑/↓ or number + Enter → work
-               → Ctrl+Home (bridge) or Alt+D → menu → close Termux
+               → Ctrl+Home (bridge) or Alt+D → menu → Q → back at ~ $
 tendril ssh  → force SSH if Mosh UDP is blocked
 ```
+
+`Q` (or `q`) on the menu quits TENDRIL and returns to the Termux prompt —
+also when the session was opened from TENDRIL Link (v0.2.4: that session
+hands over to your login shell instead of ending in "[Process
+completed]"). Inside a Herdr/agent session `q` is an ordinary letter:
+leave the session with Ctrl+Home or Alt+D first. Detaching never stops a
+session or an agent.
+
+## Updating TENDRIL (and when it does not)
+
+TENDRIL Link shows **Update ready** on Home when the paired host
+advertises a newer Link build; one tap runs the trusted update (phone
+components + the app, Android asks you to confirm the install). The host
+is never updated by the phone.
+
+A host only advertises a new Link build after **the host itself** is
+upgraded: on the host, run `tendril --upgrade` (since v0.2.4 that also
+stages the official TENDRIL Link release for its phones). A phone paired
+to a host that was never upgraded keeps seeing "up to date".
+
+If Update fails on a phone, run this once in Termux and keep the output:
+
+```sh
+tendril --version; cat ~/.config/tendril/alias; \
+ssh -o BatchMode=yes "$(cat ~/.config/tendril/alias)" 'remote-agents --version; remote-agents --phone-manifest | head -4'; \
+pm path app.tendril.link; cmd package list packages --show-versioncode app.tendril.link; \
+grep -E 'allow-external-apps' ~/.termux/termux.properties
+```
+
+It shows, in order: the phone launcher, the host alias Link uses, the
+host's own version and the Link build it offers, and whether Android
+answers the package probes this phone's updater depends on.
 
 The selector footer is `N New`, `I Info`, `? Help`, `R Refresh`, `Q Quit`.
 Press a footer key once; no Enter is needed. Enter remains for workspace
