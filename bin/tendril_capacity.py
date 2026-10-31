@@ -1830,6 +1830,24 @@ def _unknown_reason(pid, net, enabled, now=None):
     if fail == "auth":
         return "auth_error", None
     if fail in ("net", "http", "rate", "shape"):
+        # v0.2.5: a CONNECTION-level failure ("net") is this host's
+        # transport speaking, never the provider. While fresh it is a
+        # real answer ("unreachable right now"); past the minimum
+        # re-check interval it is an aged observation and must not read
+        # as a definitive outage. Physical device, v0.2.4: one
+        # connectivity blip left every adapter fail=net in exponential
+        # backoff for the better part of an hour while the host's egress
+        # had already recovered - Capacity kept saying "the host cannot
+        # reach the provider" about providers a direct request reached
+        # in under a second. Say `stale` instead (the phone renders it
+        # as Stale - honest, non-definitive); the next due probe
+        # replaces it with the real state. http/rate/shape stay
+        # definitive: the provider itself answered.
+        if fail == "net":
+            _obs = st.get("observed_at")
+            _now = _time() if now is None else now
+            if _obs and _now - _obs > NET_MIN_S:
+                return "stale", None
         return "network_error", None
     observed = st.get("observed_at")
     now = _time() if now is None else now

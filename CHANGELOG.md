@@ -2,6 +2,41 @@
 
 All notable changes to TENDRIL are documented here.
 
+## v0.2.5 — Capacity tells stale transport failures from dead providers (2026-10-31)
+
+Host 0.2.5 + **TENDRIL Link 0.2.4 (build 176)**. Two physical-device
+reports after a phone-side Tailscale off/on cycle, and what they actually
+were:
+
+- *Capacity said "Unavailable — the host cannot reach the provider" for
+  providers that were reachable.* The app was innocent: it displayed the
+  host's own answer faithfully, and Claude's exhausted state plus the
+  historical usage rows were real. The defect was on the host: one
+  connectivity blip left every provider adapter `fail=net` in
+  exponential backoff for the better part of an hour, and the capacity
+  answer kept presenting those aged transport failures as a definitive
+  network_error — while a direct request from the same host reached
+  every provider in under a second. Now a connection-level failure
+  older than the minimum re-check interval is reported as `stale` — the
+  phone renders it as **Stale — the last provider reading is stale** —
+  and the next due probe replaces it with the real state. Failures the
+  provider itself answered (HTTP, 429, malformed body) stay definitive;
+  fresh connection failures still read as Unavailable; exhausted states
+  and historical usage are untouched.
+- *The dashboard q/Q exit and the connected-host version.* Both reports
+  were real observations made against a phone that was still running
+  the pre-v0.2.4 launcher against a pre-v0.2.4 host: the shell handoff
+  and the fast link-open consume had simply not reached the phone yet,
+  and the host version line said 0.2.3 because the host genuinely was
+  0.2.3 until its own upgrade. No code defect existed in v0.2.4 for
+  either one — v0.2.5 pins both with regression tests that verify the
+  DESTINATION (a Link-initiated launch ends in an exec'd login shell,
+  never `[Process completed]`, never a reopened Link; a typed launch
+  exits into the existing shell; the selector's L stays the one
+  intentional Link handoff) and the version display (every
+  `link-manifest` check answers the installed truth, so the phone's
+  next check after a host upgrade sees it without re-pairing).
+
 ## v0.2.4 — Reliability hotfix: updates on every phone, Q that returns you (2026-10-31)
 
 Host 0.2.4 + **TENDRIL Link 0.2.3 (build 174)**, built from the Link

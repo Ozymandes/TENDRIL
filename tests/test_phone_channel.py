@@ -339,6 +339,22 @@ class Manifest(PhoneEnv):
         self.assertEqual(self.call_tp(tp.manifest_text),
                          self.expected_manifest())
 
+    def test_version_line_follows_the_installed_truth_on_refresh(self):
+        # Physical-device report (v0.2.4): the phone showed "tendril 0.2.3"
+        # while v0.2.4 was published - the host had genuinely not been
+        # upgraded yet, and after `./install --upgrade` the SAME verb must
+        # answer the new version on the next check (reconnect/refresh),
+        # never a cached copy of the pairing-time version.
+        self.seed_snapshot()
+        self.seed_provenance(version="0.2.4")
+        self.assertIn("version 0.2.4\n", self.call_tp(tp.manifest_text))
+        self.assertNotIn("version 0.2.3", self.call_tp(tp.manifest_text))
+        # the supported upgrade re-records provenance; the next phone
+        # check must see it without any restart or re-pairing.
+        self.seed_provenance(version="0.2.5")
+        self.assertIn("version 0.2.5\n", self.call_tp(tp.manifest_text))
+        self.assertNotIn("version 0.2.4\n", self.call_tp(tp.manifest_text))
+
     def test_apk_line_absent_when_not_staged(self):
         self.seed_snapshot()
         self.seed_provenance()
