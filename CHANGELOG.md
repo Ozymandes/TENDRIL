@@ -2,6 +2,56 @@
 
 All notable changes to TENDRIL are documented here.
 
+## v0.2.6 — Session identity you can trust, failures you can find (2026-11-01)
+
+Host 0.2.6 + **TENDRIL Link 0.2.5 (build 178)**. Two physical-device
+reports from the LIVE screen, and what they actually were:
+
+- *Two running sessions were both titled "Is the absolute path".* The
+  root cause was TENDRIL's own Pi extension: it derived a title from the
+  first prompt and stored it with `setSessionName()` — which Pi records
+  exactly like a user's `/name`. The host then trusted that guess as the
+  session's native name, ranked it above everything and never recomputed
+  it; the phone even labelled it "Pi session name". A prompt that begins
+  with an absolute path slipped past the deriver's narration guard (the
+  path broke it) and the path was dropped afterwards, leaving the fragment
+  "Is the absolute path"; two panes started from the same prompt got the
+  same "name". Now:
+  - the extension never invents a name — it only delivers names a human
+    or the scheduler chose (a rename from the phone, a scheduled task
+    title) and records where each came from;
+  - names follow one documented precedence: the pane's Herdr label →
+    the most recent explicit human name (a TENDRIL rename or Pi `/name`)
+    → the scheduled task that created the pane → a derived title → the
+    workspace fallback. A heuristic never outranks or overwrites a human
+    name, and a task sent to an existing session never renames it;
+  - legacy guesses already stored by older extensions are recognised and
+    re-derived; real human names (lane ids, all-caps names, Unicode) are
+    kept as they are;
+  - the deriver no longer turns questions, statements, path-first
+    prompts or bare "Read … and execute" commands into titles, and the
+    two-salient-words summary ("UI gdk4", "QA acting") is retired;
+  - the phone says when a title is a guess ("auto-named from first
+    instruction") and tells same-titled sessions apart (`#1`, `#2`).
+- *LIVE read "2 working · 2 failed · 7 idle", but no failed row existed.*
+  "working" and "idle" counted sessions; "failed" counted subagents
+  hidden inside idle sessions. Now the failure count names its unit
+  ("2 subagents failed") and is exactly the list you get when you tap it:
+  the page filters to the sessions that own the failures, each failed
+  subagent is listed under its parent with its evidence ("Exited with
+  code 1", or "Details unavailable" when the host has none), and opening
+  it names its parent. A failed subagent never makes a healthy parent
+  read failed. A session whose last turn ended in an error says so and
+  counts as a session failure.
+- *"2 children · all done" hid failures.* The subagent summary always
+  states the failed count now ("8 subagents · 1 failed · 6 done · 1
+  stale", "2 subagents · 2 done · 0 failed"), and an aborted subagent is
+  "cancelled", never "done".
+
+Wire changes are additive (docs/LINK-CONTRACT-0.2.md §8): `title_source`
+`herdr`; child `failure` / `exit_code`; agent `last_stop`. Older phones
+ignore them; Link 0.2.5 parses older hosts unchanged.
+
 ## v0.2.5 — Capacity tells stale transport failures from dead providers (2026-10-31)
 
 Host 0.2.5 + **TENDRIL Link 0.2.4 (build 176)**. Two physical-device

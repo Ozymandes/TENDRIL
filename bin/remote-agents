@@ -345,6 +345,20 @@ def snapshot():
         return None
 
 
+def _pane_labels(snap):
+    """{pane_id: label} for panes a human named in Herdr (PaneInfo.label is
+    omitted while unset). Labels only — never terminal titles."""
+    out = {}
+    for p in (snap or {}).get("panes", []) or []:
+        if not isinstance(p, dict):
+            continue
+        label = p.get("label")
+        if isinstance(p.get("pane_id"), str) and isinstance(label, str) \
+                and label.strip():
+            out[p["pane_id"]] = label.strip()
+    return out
+
+
 def collect(snap=None):
     """Selector rows from one `herdr api snapshot` payload. snap=None fetches
     one; callers that already hold the payload (snapshot --json) pass it in
@@ -357,8 +371,13 @@ def collect(snap=None):
     for p in snap.get("panes", []):
         if p.get("pane_id") and p.get("cwd"):
             pane_cwd[p["pane_id"]] = p["cwd"]
+    labels = _pane_labels(snap)
     by_ws = {}
     for a in snap.get("agents", []):
+        # the human's explicit Herdr pane name (`herdr pane rename`) lives
+        # on panes[], never on agents[]: joined here for the title resolver
+        if isinstance(a, dict) and labels.get(a.get("pane_id")):
+            a["pane_label"] = labels[a["pane_id"]]
         by_ws.setdefault(a.get("workspace_id"), []).append(a)
     rows = []
     for w in snap.get("workspaces", []):
@@ -2211,6 +2230,12 @@ def _rename_session_cmd(args):
         print(json.dumps({"ok": False, "error": phrase},
                          separators=(",", ":")))
         return 1
+    # A pane the human already named in Herdr outranks every other name
+    # (titles precedence 1): a rename from the phone must update THAT name
+    # too, or it would silently never show. Panes without a Herdr label
+    # are left alone — TENDRIL never starts labelling Herdr panes itself.
+    if phrase is not None and _pane_labels(snap).get(pane):
+        run([HERDR, "pane", "rename", pane, phrase], 8)
     reply = {"ok": True, "pane_id": pane}
     if phrase is not None:
         reply["title"] = phrase             # --clear echoes no title

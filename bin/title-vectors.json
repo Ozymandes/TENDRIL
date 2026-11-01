@@ -1,5 +1,5 @@
 {
-  "_comment": "Shared title-derivation test vectors — ONE contract for the Python deriver (bin/tendril_titles.py) and the TypeScript extension (pi/tendril-session-title.ts). Both suites load this file; keep every vector passing in both. `derive` = level-4 instruction title, `summary` = level-5 multi-turn summary; expect null = fall through. Titles are authored/locally-derived tokens (DESIGN-FINAL-POLISH §11), never transcript content.",
+  "_comment": "Shared title-derivation test vectors — the contract for the host deriver (bin/tendril_titles.py). Since 0.2.6 the Pi extension no longer derives titles (it only delivers host-queued names), so only the host runs these. `derive` = level-4 instruction title, `summary` = level-5 multi-turn summary; expect null = fall through. Titles are authored/locally-derived tokens (DESIGN-FINAL-POLISH §11), never transcript content.",
   "derive": [
     {"id": "imperative-plain", "input": "Fix the login redirect loop", "expect": "Fix the login redirect loop"},
     {"id": "long-cut-word-boundary", "input": "Fix the RC2 visual review issues in the LIVE session cards and the topology readout", "expect": "Fix the RC2 visual review"},
@@ -98,7 +98,16 @@
     {"id": "verb-led-kept", "input": "Finalize and merge PR", "expect": "Finalize and merge PR"},
     {"id": "verb-led-kept2", "input": "Update claude code pins", "expect": "Update claude code pins"},
     {"id": "neg-then-verb-object", "input": "Do not open the pdf. Rename the dossier verbs", "expect": "Rename the dossier verbs"},
-    {"id": "neg-noise-headed-preposition", "input": "2026-10-04 With parallel capability the lanes interleave", "expect": null}
+    {"id": "neg-noise-headed-preposition", "input": "2026-10-04 With parallel capability the lanes interleave", "expect": null},
+    {"id": "q-path-first-statement", "input": "/home/seeno/Projects/tendril is the absolute path, use it", "expect": null},
+    {"id": "q-capital-is-question", "input": "Is the absolute path correct?", "expect": null},
+    {"id": "q-question-with-path", "input": "Is the absolute path /home/seeno/x/y correct here?", "expect": null},
+    {"id": "q-can-you", "input": "Can you check why the build fails", "expect": null},
+    {"id": "q-wh-question", "input": "Where is the actual project manifest or persistent project-state file?", "expect": null},
+    {"id": "q-trailing-question", "input": "The updater still fails after reboot?", "expect": null},
+    {"id": "verb-only-read-execute", "input": "Read docs/development/wave-02/tasks/p7-app-convergence.md and execute it exactly.", "expect": null},
+    {"id": "location-object-weak", "input": "Read docs/development/wave-04/lanes/w04-buckle.md in this worktree.", "expect": null},
+    {"id": "we-now-need-to-filler", "input": "We now need to create the final one-page photography licensing agreement", "expect": "Create the final one-page"}
   ],
   "summary": [
     {"id": "two-turns-technical", "input": ["the CA field density drops near the meter cells", "render the density as a heat map"], "expect": "CA density"},
