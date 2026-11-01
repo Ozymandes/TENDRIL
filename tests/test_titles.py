@@ -716,8 +716,9 @@ class Rename(TitlesTestBase):
         titles = tt.load_cache(self.cache)
         # a tombstone, never a manual entry: the reset outlives the name
         # that was also delivered into the harness itself
-        self.assertNotEqual(titles[path].get("source"), "manual")
-        self.assertEqual(titles[path].get("cleared"), "Temp")
+        key = os.path.realpath(path)        # the cache keys realpaths (macOS /var)
+        self.assertNotEqual(titles[key].get("source"), "manual")
+        self.assertEqual(titles[key].get("cleared"), "Temp")
         # falls back through the chain again
         t, s = tt.resolve_agent(agent, "ws", [], titles=titles,
                                 home=self.home)
