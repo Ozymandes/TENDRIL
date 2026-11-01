@@ -1107,6 +1107,90 @@ class ChildStatusMapping(ChildBase):
         self.assertEqual(k["ended_at"], NOW - 100)
 
 
+class FailureEvidence026(ChildBase):
+    """0.2.6: "done" never hides an abort, a failed child says WHICH
+    evidence failed it (closed vocabulary, never transcript text), and a
+    primary session whose last turn ended in an error says so."""
+
+    SEQ = [0]
+
+    def scenario(self, lines, meta=None):
+        FailureEvidence026.SEQ[0] += 1
+        n = FailureEvidence026.SEQ[0]
+        parent = self.parent("f%d.jsonl" % n, [
+            pi_session_line(NOW - 1000), pi_user(NOW - 1000, "go")])
+        rid = "f000000%d-1111-4222-8333-444455556666" % (n % 10)
+        child = self.run_child(parent, rid, lines)
+        if meta is not None:
+            self.meta(child, rid, meta)
+        res = self.run_tele([self.pi_agent(parent)])[0]
+        return res["children"][0]
+
+    def test_aborted_child_is_cancelled_never_done(self):
+        k = self.scenario([
+            pi_session_header(NOW - 100, id="x"),
+            pi_user(NOW - 90, "child prompt"),
+            pi_assistant_stop(NOW - 80, pi_usage(1, 1, 0, 0, 0.0),
+                              stop="aborted")])
+        self.assertEqual(k["status"], "cancelled")
+        self.assertNotIn("failure", k)
+
+    def test_failure_reasons(self):
+        k = self.scenario([pi_session_header(NOW - 100, id="x"),
+                           pi_user(NOW - 90, "child prompt")],
+                          meta={"runId": "x", "exitCode": 2})
+        self.assertEqual((k["status"], k["failure"], k["exit_code"]),
+                         ("failed", "exit_code", 2))
+        k = self.scenario([
+            pi_session_header(NOW - 100, id="x"),
+            pi_user(NOW - 90, "child prompt"),
+            pi_assistant_stop(NOW - 80, pi_usage(1, 1, 0, 0, 0.0),
+                              stop="error")])
+        self.assertEqual((k["status"], k["failure"]), ("failed", "error_stop"))
+        self.assertNotIn("exit_code", k)
+        k = self.scenario([
+            pi_session_header(NOW - 200, id="x"),
+            pi_user(NOW - 150, "child prompt"),
+            pi_assistant(NOW - 120, pi_usage(1, 1, 0, 0, 0.0),
+                         [pi_tool_call("t1", "edit", NOW - 120)]),
+            pi_tool_result(NOW - 100, "t1", "edit", error=True)])
+        self.assertEqual((k["status"], k["failure"]), ("failed", "tool_error"))
+
+    def test_done_and_stale_children_carry_no_failure(self):
+        k = self.scenario([pi_session_header(NOW - 200, id="x"),
+                           pi_assistant_stop(NOW - 100,
+                                             pi_usage(1, 1, 0, 0, 0.0))])
+        self.assertEqual(k["status"], "done")
+        self.assertNotIn("failure", k)
+
+    def _parent_res(self, name, lines, status):
+        path = self.parent(name, lines)
+        return self.run_tele([self.pi_agent(path, status=status)])[0]
+
+    def test_parent_last_turn_error_is_reported(self):
+        lines = [pi_session_line(NOW - 300), pi_user(NOW - 300, "go"),
+                 pi_assistant_stop(NOW - 200, pi_usage(1, 1, 0, 0, 0.0),
+                                   stop="error")]
+        self.assertEqual(self._parent_res("pe1.jsonl", lines,
+                                          "idle")["last_stop"], "error")
+        # never while the agent is working or blocked on the human
+        self.assertNotIn("last_stop", self._parent_res(
+            "pe2.jsonl", lines, "working"))
+        # a newer prompt clears it
+        self.assertNotIn("last_stop", self._parent_res(
+            "pe3.jsonl", lines + [pi_user(NOW - 10, "again")], "idle"))
+        # a normal stop is never a failure
+        ok = [pi_session_line(NOW - 300), pi_user(NOW - 300, "go"),
+              pi_assistant_stop(NOW - 200, pi_usage(1, 1, 0, 0, 0.0))]
+        self.assertNotIn("last_stop", self._parent_res("pe4.jsonl", ok,
+                                                       "idle"))
+        ab = [pi_session_line(NOW - 300), pi_user(NOW - 300, "go"),
+              pi_assistant_stop(NOW - 200, pi_usage(1, 1, 0, 0, 0.0),
+                                stop="aborted")]
+        self.assertEqual(self._parent_res("pe5.jsonl", ab, "idle")
+                         ["last_stop"], "aborted")
+
+
 class ChildStatusEdges72(ChildBase):
     """§7.2 edge cases on REAL transcript shapes: an error followed by
     recovery is never failed; quiet history is stale or done; failed

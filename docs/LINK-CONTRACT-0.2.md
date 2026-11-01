@@ -313,3 +313,29 @@ unknown reason, and never invents a percentage.
 ### 7.6 Notification-driven invalidation (phone)
 
 Any received TENDRIL notification (TASK STARTED/WAITING/FAILED, agent finished, HERDR OFFLINE/RESTORED) schedules one snapshot refresh (debounce 1.5 s, single-flight, skipped when the app is backgrounded beyond the existing policy; HERDR events also refresh `health`). Background polling cadence is unchanged.
+
+## 8 · 0.2.6 addendum — session identity & failure evidence (binding, additive)
+
+### 8.1 Session titles
+
+`title_source` vocabulary adds `herdr`: `manual | herdr | native | scheduler | instruction | workspace` (`summary` is no longer emitted; phones keep parsing it). An unknown word is kept as unknown provenance — the title still stands.
+
+Precedence (the host's `resolve_agent` is the single authority; first that yields wins):
+
+1. `herdr` — the pane's explicit Herdr label (`herdr pane rename`; `panes[].label`). A scheduler routing token `tendril-<id8>` never counts.
+2. `manual` | `native` — the MOST RECENT explicit human name: a TENDRIL rename (phone / `rename-session`) or the harness's own session name (Pi `/name`/`--name`, Claude custom title). A rename from the phone of a pane that already has a Herdr label also renames that label.
+3. `scheduler` — the title of the scheduled task that CREATED the pane. A task sent to an existing session never names it.
+4. `instruction` — the deterministic deriver on the first user turn (questions, statements, path-first and verb-only commands never derive). Cached per deriver version.
+5. `workspace` — `<workspace label> · <Harness>`.
+6. omitted — the phone falls back to the harness name.
+
+A guess is never a name: the Pi extension no longer calls `setSessionName()` with a derived title; it only delivers host-queued names and appends a `{"type":"custom","customType":"tendril-title","data":{"source":"manual|scheduler","name":…}}` entry beside each. A Pi name that has the exact shape of a pre-0.2.6 extension guess (set once, no marker, the deriver's normal form, a contiguous run of the first instruction) is treated as a guess (`instruction`), never as `native`. Titles never contain the agent's current activity.
+
+### 8.2 Child failure evidence
+
+- A Pi `aborted` stop is `cancelled`, never `done`. `done` = ended normally with no error evidence.
+- A `failed` child adds `"failure": "exit_code|error_stop|tool_error"` naming the evidence (§7.2 order), plus `"exit_code": <int>` for `exit_code`. Vocabulary only — never transcript text. Absent ⇒ the phone says "details unavailable", never a guessed cause.
+
+### 8.3 Primary-session last-turn evidence
+
+An agent row adds `"last_stop": "error|aborted"` when the session's LAST recorded assistant turn stopped with an error / was aborted, no newer prompt followed, and Herdr does not report it `working`/`blocked`. It is evidence about the last turn, not a claim that the session is dead; Herdr's own `status` is unchanged.

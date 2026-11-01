@@ -171,16 +171,18 @@ class DeriverVectors(TitlesTestBase):
             self.assertEqual(tt.derive_summary(v["input"]), v["expect"],
                              "summary vector %s" % v["id"])
 
-    def test_typescript_parity_via_node(self):
+    def test_extension_never_invents_a_name_via_node(self):
+        """The Pi extension delivers only host-queued names (manual rename,
+        scheduled title) with a provenance entry — it never derives one."""
         if shutil.which("node") is None:
             self.skipTest("node not available")
         r = subprocess.run(["node", os.path.join(REPO, "pi",
-                                                 "deriver-test.mjs")],
+                                                 "extension-test.mjs")],
                            capture_output=True, text=True, timeout=120)
         self.assertEqual(r.returncode, 0,
-                         "TS deriver parity failed:\n%s%s"
+                         "extension contract failed:\n%s%s"
                          % (r.stdout, r.stderr))
-        self.assertIn("vectors pass", r.stdout)
+        self.assertIn("never invents a name", r.stdout)
 
     def test_secrets_never_survive(self):
         for blob in ("sk-live-9f4Kj2mN8pQ1zX7wL5rT3vB8yCd0AaE6",
@@ -248,13 +250,13 @@ class Precedence(TitlesTestBase):
         self.assertEqual((title, source),
                          ("Audit the capacity adapter math", "instruction"))
 
-    def test_herdr_name_hash_stripped_is_native(self):
+    def test_herdr_name_hash_stripped_is_herdr(self):
         path = self.write_pi("w/--home-x--/d.jsonl", _pi_session(
             1_800_000_000, "Fix the pairing bloom"))
         title, source = tt.resolve_agent(
             self._agent(path, name="focus-runner-9a1b2c"), "tendril", [],
             titles={}, home=self.home)
-        self.assertEqual((title, source), ("Focus runner", "native"))
+        self.assertEqual((title, source), ("Focus runner", "herdr"))
 
     def test_role_id_native_never_shown_raw(self):
         """A machine-assigned `<role>#<id8>` session name is a ROLE, never a
@@ -316,12 +318,13 @@ class Precedence(TitlesTestBase):
             name="Native name"))
         # the cache is keyed by the transcript's realpath (session_key)
         titles = {os.path.realpath(path): {"title": "Mine", "source": "manual",
+                                           "at": 1_800_000_500,
                                            "session_start": 1_800_000_000}}
         title, source = tt.resolve_agent(self._agent(path), "tendril", [],
                                          titles=titles, home=self.home)
         self.assertEqual((title, source), ("Mine", "manual"))
 
-    def test_summary_when_instruction_rejects(self):
+    def test_no_summary_guess_when_instruction_rejects(self):
         path = self.write_pi("w/--home-x--/f.jsonl", "\n".join([
             json.dumps({"type": "session", "version": 3, "id": "x1",
                         "timestamp": "2026-10-01T00:00:00.000Z",
@@ -338,8 +341,7 @@ class Precedence(TitlesTestBase):
         ]) + "\n")
         title, source = tt.resolve_agent(self._agent(path), "tendril", [],
                                          titles={}, home=self.home)
-        self.assertEqual(source, "summary")
-        self.assertTrue(title)
+        self.assertEqual((title, source), ("tendril · Pi", "workspace"))
 
     def test_workspace_fallback_and_omit(self):
         agent = self._agent(None, harness="pi")
@@ -540,7 +542,9 @@ class ClaudeTitles(TitlesTestBase):
                                          [], titles={}, home=self.home)
         self.assertEqual((title, source), ("tendril · Claude", "workspace"))
 
-    def test_summary_over_first_three_turns_when_instruction_rejects(self):
+    def test_no_summary_guess_when_instruction_rejects(self):
+        """v2: two salient words from later turns are not evidence of what
+        a session is about — the honest workspace fallback names it."""
         self.write_claude(self.U1, [
             self._user(1_800_000_000, "ok", uuid="c1"),
             self._user(1_800_000_100,
@@ -548,8 +552,7 @@ class ClaudeTitles(TitlesTestBase):
         ])
         title, source = tt.resolve_agent(self._agent(self.U1), "tendril",
                                          [], titles={}, home=self.home)
-        self.assertEqual(source, "summary")
-        self.assertTrue(title)
+        self.assertEqual((title, source), ("tendril · Claude", "workspace"))
 
     def test_pane_reuse_guard_and_start_pin(self):
         old_start = 1_800_000_000
@@ -711,7 +714,11 @@ class Rename(TitlesTestBase):
         ok, _ = tt.rename_session("w5:p1", None, agent=agent, home=self.home)
         self.assertTrue(ok)
         titles = tt.load_cache(self.cache)
-        self.assertNotIn(path, titles)
+        # a tombstone, never a manual entry: the reset outlives the name
+        # that was also delivered into the harness itself
+        key = os.path.realpath(path)        # the cache keys realpaths (macOS /var)
+        self.assertNotEqual(titles[key].get("source"), "manual")
+        self.assertEqual(titles[key].get("cleared"), "Temp")
         # falls back through the chain again
         t, s = tt.resolve_agent(agent, "ws", [], titles=titles,
                                 home=self.home)
@@ -904,6 +911,310 @@ class CliVerbs(TitlesTestBase):
         self.assertEqual(r.returncode, 2)
         doc = json.loads(r.stdout.strip().splitlines()[-1])
         self.assertEqual(doc["error"], "bad pane id")
+
+
+def _pi_tx(ts, instr, names=(), markers=(), assistant_first=False):
+    """A Pi transcript with any number of session_info names (each
+    (name, offset_s)) and tendril-title markers ((source, name, offset_s)),
+    in timestamp order, plus the first user message at ts+2."""
+    iso = lambda t: time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(t))
+    rows = [(0, {"type": "session", "version": 3, "id": "hdr",
+                 "timestamp": iso(ts), "cwd": "/home/x"})]
+    rows.append((2, {"type": "message", "id": "m1", "parentId": None,
+                     "timestamp": iso(ts + 2), "message": {
+                         "role": "user",
+                         "content": [{"type": "text", "text": instr}]}}))
+    for i, (name, off) in enumerate(names):
+        rows.append((off, {"type": "session_info", "id": "si%d" % i,
+                           "parentId": None, "timestamp": iso(ts + off),
+                           "name": name}))
+    for i, (src, name, off) in enumerate(markers):
+        rows.append((off, {"type": "custom", "id": "mk%d" % i,
+                           "parentId": None, "timestamp": iso(ts + off),
+                           "customType": "tendril-title",
+                           "data": {"source": src, "name": name}}))
+    rows.sort(key=lambda r: r[0])
+    return "\n".join(json.dumps(r[1]) for r in rows) + "\n"
+
+
+class SessionIdentity(TitlesTestBase):
+    """0.2.6: guesses are never names; human names are never overwritten.
+    Fixtures mirror real production sessions (Evidence A: two Live cards
+    titled "Is the absolute path")."""
+
+    T0 = 1_800_000_000
+    PATH_FIRST = ("/home/seeno/Projects/tendril is the absolute path, use it "
+                  "for every command in this session")
+
+    def _agent(self, path, pane="w9:pA", **extra):
+        a = {"pane_id": pane, "agent": "pi", "agent_status": "idle",
+             "agent_session": {"agent": "pi", "kind": "path",
+                               "source": "herdr:pi", "value": path}}
+        a.update(extra)
+        return a
+
+    def resolve(self, agent, titles=None, ws="tendril", tasks=()):
+        return tt.resolve_agent(agent, ws, list(tasks),
+                                titles={} if titles is None else titles,
+                                home=self.home)
+
+    # ---- Evidence A: the root cause -------------------------------------
+
+    def test_path_first_prompt_never_derives_a_fragment(self):
+        self.assertIsNone(tt.derive_title(self.PATH_FIRST))
+        for q in ("Is the absolute path correct?",
+                  "Is the absolute path /home/x/y right here?",
+                  "Can you check why the build fails",
+                  "What does the updater do when offline",
+                  "Where is the actual project manifest?"):
+            self.assertIsNone(tt.derive_title(q), q)
+
+    def test_legacy_extension_name_is_not_native(self):
+        """The pre-0.2.6 extension stored "Is the absolute path" with
+        setSessionName(): identical to a /name on disk, but it is a guess."""
+        path = self.write_pi("w/--h--/abs.jsonl", _pi_tx(
+            self.T0, self.PATH_FIRST, names=[("Is the absolute path", 1)]))
+        self.assertEqual(self.resolve(self._agent(path)),
+                         ("tendril · Pi", "workspace"))
+
+    def test_two_sessions_same_prompt_no_longer_share_a_fake_name(self):
+        a = self.write_pi("w/--h--/a1.jsonl", _pi_tx(
+            self.T0, self.PATH_FIRST, names=[("Is the absolute path", 1)]))
+        b = self.write_pi("w/--h--/a2.jsonl", _pi_tx(
+            self.T0 + 60, self.PATH_FIRST,
+            names=[("Is the absolute path", 1)]))
+        ta, sa = self.resolve(self._agent(a, pane="w9:pA"))
+        tb, sb = self.resolve(self._agent(b, pane="w9:pB"))
+        self.assertNotEqual(sa, "native")
+        self.assertNotEqual(sb, "native")
+        self.assertNotIn("absolute", ta.lower())
+
+    def test_legacy_good_guess_is_labelled_derived_not_native(self):
+        path = self.write_pi("w/--h--/good.jsonl", _pi_tx(
+            self.T0, "Audit the capacity adapter math",
+            names=[("Audit the capacity adapter math", 1)]))
+        self.assertEqual(self.resolve(self._agent(path)),
+                         ("Audit the capacity adapter math", "instruction"))
+
+    # ---- human names are protected ---------------------------------------
+
+    def test_human_names_stay_native(self):
+        for name, prompt in (
+                ("w02-p8app", "You are lane w02-p8app for Wave 02"),
+                ("ABYSSAL ULTIMATE", "Final system integration program"),
+                ("Omarchy Ricing", "Run an Omarchy refinement and ricing pass"),
+                ("Updater reliability", "Fix the APK staging race"),
+                ("Tendril 更新 信頼性", "Fix the APK staging race")):
+            path = self.write_pi("w/--h--/h-%d.jsonl" % abs(hash(name)),
+                                 _pi_tx(self.T0, prompt, names=[(name, 1)]))
+            self.assertEqual(self.resolve(self._agent(path)),
+                             (name, "native"), name)
+
+    def test_renamed_session_is_native_even_when_guess_shaped(self):
+        """Only the extension's FIRST name can be a stored guess: a name set
+        after another is a deliberate rename."""
+        path = self.write_pi("w/--h--/ren.jsonl", _pi_tx(
+            self.T0, "Audit the capacity adapter math",
+            names=[("Old name", 1), ("Audit the capacity adapter", 50)]))
+        self.assertEqual(self.resolve(self._agent(path)),
+                         ("Audit the capacity adapter", "native"))
+
+    def test_marker_names_keep_their_real_source(self):
+        p1 = self.write_pi("w/--h--/mk1.jsonl", _pi_tx(
+            self.T0, "Audit the capacity adapter math",
+            names=[("Audit the capacity adapter math", 3)],
+            markers=[("manual", "Audit the capacity adapter math", 3)]))
+        self.assertEqual(self.resolve(self._agent(p1)),
+                         ("Audit the capacity adapter math", "manual"))
+        p2 = self.write_pi("w/--h--/mk2.jsonl", _pi_tx(
+            self.T0, "whatever", names=[("BADM report", 3)],
+            markers=[("scheduler", "BADM report", 3)]))
+        self.assertEqual(self.resolve(self._agent(p2)),
+                         ("BADM report", "scheduler"))
+
+    def test_herdr_pane_label_is_authoritative(self):
+        path = self.write_pi("w/--h--/hl.jsonl", _pi_tx(
+            self.T0, "Audit the capacity adapter math",
+            names=[("Pi side name", 1)]))
+        titles = {os.path.realpath(path): {
+            "title": "Phone name", "source": "manual", "at": self.T0 + 9}}
+        agent = self._agent(path, pane_label="Updater reliability")
+        self.assertEqual(self.resolve(agent, titles),
+                         ("Updater reliability", "herdr"))
+        # a scheduler routing token is never a human Herdr label
+        agent = self._agent(path, pane_label="tendril-4be22c0a")
+        self.assertEqual(self.resolve(agent, titles), ("Phone name", "manual"))
+
+    def test_most_recent_explicit_name_wins(self):
+        key = None
+        # Pi /name typed AFTER the phone rename wins
+        path = self.write_pi("w/--h--/rec.jsonl", _pi_tx(
+            self.T0, "x", names=[("Typed in Pi", 600)]))
+        key = os.path.realpath(path)
+        titles = {key: {"title": "From the phone", "source": "manual",
+                        "at": self.T0 + 300}}
+        self.assertEqual(self.resolve(self._agent(path), titles),
+                         ("Typed in Pi", "native"))
+        # a phone rename AFTER the Pi name wins
+        titles = {key: {"title": "From the phone", "source": "manual",
+                        "at": self.T0 + 900}}
+        self.assertEqual(self.resolve(self._agent(path), titles),
+                         ("From the phone", "manual"))
+        # the phone rename delivered into Pi (same name, later ts) stays manual
+        p2 = self.write_pi("w/--h--/rec2.jsonl", _pi_tx(
+            self.T0, "x", names=[("From the phone", 950)]))
+        titles = {os.path.realpath(p2): {"title": "From the phone",
+                                         "source": "manual",
+                                         "at": self.T0 + 900}}
+        self.assertEqual(self.resolve(self._agent(p2), titles),
+                         ("From the phone", "manual"))
+
+    def test_reset_name_does_not_resurface_as_native(self):
+        path = self.write_pi("w/--h--/rst.jsonl", _pi_tx(
+            self.T0, "Stabilize the tendril attach handshake",
+            names=[("Temp label", 40)],
+            markers=[("manual", "Temp label", 40)]))
+        agent = self._agent(path, pane="w5:p1")
+        tt.rename_session("w5:p1", "Temp label", agent=agent, home=self.home)
+        tt.rename_session("w5:p1", None, agent=agent, home=self.home)
+        for _ in range(2):              # the tombstone survives re-derivation
+            titles = tt.load_cache(self.cache)
+            got = self.resolve(agent, titles)
+            tt._save_cache(titles, self.cache)
+            self.assertEqual(got, ("Stabilize the Tendril attach",
+                                   "instruction"))
+
+    def test_heuristic_never_overwrites_a_manual_name(self):
+        path = self.write_pi("w/--h--/man.jsonl", _pi_tx(
+            self.T0, "Audit the capacity adapter math"))
+        agent = self._agent(path, pane="w6:p1")
+        ok, _ = tt.rename_session("w6:p1", "Mine", agent=agent,
+                                  home=self.home)
+        self.assertTrue(ok)
+        for _ in range(3):
+            titles = tt.load_cache(self.cache)
+            self.assertEqual(self.resolve(agent, titles), ("Mine", "manual"))
+            tt._save_cache(titles, self.cache)
+
+    # ---- stability ---------------------------------------------------------
+
+    def test_stale_cached_guess_rederives_once_then_holds(self):
+        path = self.write_pi("w/--h--/dv.jsonl", _pi_tx(
+            self.T0, "Is the absolute path correct? Fix the APK staging race"))
+        key = os.path.realpath(path)
+        # a v1 cache entry (no `dv`) holding the old fragment
+        titles = {key: {"title": "Is the absolute path correct",
+                        "source": "instruction", "at": self.T0,
+                        "session_start": self.T0}}
+        first = self.resolve(self._agent(path), titles)
+        self.assertNotIn("absolute", first[0].lower())
+        self.assertEqual(titles[key].get("dv", tt.DERIVER_VERSION),
+                         tt.DERIVER_VERSION)
+        # within one deriver version the title never moves
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"type": "message", "message": {
+                "role": "user", "content": "Rewrite everything else"}}) + "\n")
+        self.assertEqual(self.resolve(self._agent(path), titles), first)
+
+    def test_activity_never_becomes_identity(self):
+        """The title is the session's first instruction / human name — never
+        what the agent is doing right now."""
+        path = self.write_pi("w/--h--/act.jsonl", _pi_tx(
+            self.T0, "Harden the updater signing checks"))
+        titles = {}
+        t1 = self.resolve(self._agent(path), titles)
+        with open(path, "a", encoding="utf-8") as f:
+            for msg in ("Running Android compatibility tests",
+                        "cat /home/seeno/.ssh/config"):
+                f.write(json.dumps({"type": "message", "message": {
+                    "role": "user", "content": msg}}) + "\n")
+        self.assertEqual(self.resolve(self._agent(path), titles), t1)
+
+    def test_old_host_cache_and_unnamed_sessions_never_crash(self):
+        path = self.write_pi("w/--h--/old.jsonl", _pi_tx(self.T0, "ok"))
+        junk = {os.path.realpath(path): {"title": 7, "source": "nope"},
+                "x": "not a dict"}
+        self.assertEqual(self.resolve(self._agent(path), junk),
+                         ("tendril · Pi", "workspace"))
+        self.assertEqual(self.resolve(self._agent(path), junk, ws=""),
+                         (None, None))
+
+
+class HerdrLabelWiring(TitlesTestBase):
+    """A pane's explicit Herdr label (panes[].label) reaches the resolver,
+    and a rename from the phone keeps an EXISTING Herdr label in step —
+    TENDRIL never starts labelling unlabelled panes."""
+
+    def _snap(self, path, label=None):
+        pane = {"pane_id": "w4:p1", "tab_id": "w4:t1", "workspace_id": "w4"}
+        if label is not None:
+            pane["label"] = label
+        return {"workspaces": [{"workspace_id": "w4", "label": "tendril",
+                                "number": 1, "active_tab_id": "w4:t1"}],
+                "panes": [pane],
+                "agents": [{"pane_id": "w4:p1", "workspace_id": "w4",
+                            "tab_id": "w4:t1", "agent": "pi",
+                            "agent_status": "idle",
+                            "agent_session": {"agent": "pi", "kind": "path",
+                                              "source": "herdr:pi",
+                                              "value": path}}]}
+
+    def test_collect_joins_the_pane_label(self):
+        path = self.write_pi("w/--h--/lbl.jsonl", _pi_session(
+            1_800_000_000, "Audit the capacity adapter math"))
+        rows = ra.collect(self._snap(path, label="Updater reliability"))
+        agent = rows[0]["agents"][0]
+        self.assertEqual(agent["pane_label"], "Updater reliability")
+        self.assertEqual(tt.resolve_agent(agent, "tendril", [], titles={},
+                                          home=self.home),
+                         ("Updater reliability", "herdr"))
+        rows = ra.collect(self._snap(path))
+        self.assertNotIn("pane_label", rows[0]["agents"][0])
+
+    def _rename(self, snap, title):
+        calls = []
+        orig = (ra.snapshot, ra.run, ra.HERDR)
+        ra.snapshot = lambda: snap
+        ra.HERDR = "/usr/bin/herdr-test"
+        ra.run = lambda cmd, timeout=None: (calls.append(cmd) or (0, "", ""))
+        try:
+            import io
+            from contextlib import redirect_stdout
+            with redirect_stdout(io.StringIO()):
+                rc = ra._rename_session_cmd(["w4:p1", title])
+        finally:
+            ra.snapshot, ra.run, ra.HERDR = orig
+        return rc, calls
+
+    def test_phone_rename_updates_an_existing_herdr_label_only(self):
+        path = self.write_pi("w/--h--/rn.jsonl", _pi_session(
+            1_800_000_000, "Audit the capacity adapter math"))
+        sys.modules["tendril_titles"] = tt
+        rc, calls = self._rename(self._snap(path, label="Old label"),
+                                 "New name")
+        self.assertEqual(rc, 0)
+        self.assertIn(["/usr/bin/herdr-test", "pane", "rename", "w4:p1",
+                       "New name"], calls)
+        rc, calls = self._rename(self._snap(path), "Second name")
+        self.assertEqual(rc, 0)
+        self.assertFalse([c for c in calls if "rename" in c])
+
+
+class LegacyAutoNameShape(unittest.TestCase):
+    def test_shape(self):
+        f = tt.looks_auto_named
+        self.assertTrue(f("Is the absolute path",
+                          "/home/x is the absolute path, use it"))
+        self.assertTrue(f("Android repository",
+                          "The Android repository has no remote."))
+        self.assertTrue(f("Last physical blockers",
+                          "TENDRIL v0.2.1 — LAST PHYSICAL BLOCKERS ONLY"))
+        self.assertFalse(f("w02-p8app", "You are lane w02-p8app"))
+        self.assertFalse(f("ABYSSAL ULTIMATE", "abyssal ultimate pass"))
+        self.assertFalse(f("Omarchy Ricing", "Omarchy refinement and ricing"))
+        self.assertFalse(f("Fix login", "Rewrite the capacity adapter"))
+        self.assertFalse(f("A" * 40, "a" * 40))
+        self.assertFalse(f(None, "x"))
 
 
 class PhoneLauncher(unittest.TestCase):

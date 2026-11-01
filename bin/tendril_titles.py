@@ -13,23 +13,34 @@ LOCALLY-DERIVED token (<= 48 chars), never terminal content — which is what
 keeps it allowed on the wire at all (CONTRACT §0 bans terminal titles and
 raw prompt text; `terminal_title` is never read here).
 
-Precedence (first that yields wins):
-  1. manual override        (rename from the phone or the host CLI)
-  2. native                 (Pi session_info name; Herdr agent name when it
-                             is not a scheduler token, `-<hash>` stripped)
-  3. scheduler              (task title of the task that launched the pane)
-  4. instruction            (deterministic deriver on the first user turn)
-  5. summary                (deterministic salient-term pass over the first
-                             three user turns)
-  6. workspace              ("<workspace label> · <Harness>" fallback)
-  7. omit                   (the phone falls back to the harness name)
+Precedence (first that yields wins; resolve_agent is the one authority):
+  1. herdr        the pane's explicit Herdr label (`herdr pane rename`)
+  2. manual |     the MOST RECENT explicit human name: a TENDRIL rename
+     native       (phone / host CLI) or the harness's own session name (Pi
+                  `/name` / `--name`, Claude custom title)
+  3. scheduler    title of the task that launched the pane
+  4. instruction  deterministic deriver on the first user turn
+  5. workspace    "<workspace label> · <Harness>" fallback
+  6. omit         the phone falls back to the harness name
 
-Stability: once a title resolves at levels 3-5 it is persisted in
+Guesses are never names. Pi stores `/name` and an extension's
+setSessionName() identically, and TENDRIL's pre-0.2.6 extension wrote its
+own derived titles that way — so a heuristic fragment ("Is the absolute
+path") reached the phone labelled as the user's own native name, outranked
+everything and could never improve. The extension no longer names sessions
+itself; it only delivers names the host queued (a phone rename, a scheduled
+task title) and records a `tendril-title` provenance entry beside each.
+Legacy stored guesses are recognised (looks_auto_named) and re-derived.
+The level-5 salient-term summary is retired from session naming: two
+co-occurring words are not evidence of what a session is about.
+
+Stability: scheduler and instruction titles persist in
 ~/.local/state/tendril/session-titles.json (0600, keyed by the harness
-session identity — transcript path or Claude UUID) and NEVER recomputed;
-only a manual label replaces it. Pane reuse can never inherit a title: the
-cache is keyed by the session identity, and every entry also stores the
-session's start time — a mismatched start invalidates the entry.
+session identity — transcript path or Claude UUID) and are not recomputed
+while DERIVER_VERSION is unchanged; an improved deriver re-derives each
+cached guess once. Pane reuse can never inherit a title: the cache is keyed
+by the session identity, and every entry also stores the session's start
+time — a mismatched start invalidates the entry.
 
 Claude Code panes report agent_session {kind:"id", value:<uuid>} — no
 local path. Their transcript is located under ~/.claude/projects/*/<uuid>.jsonl
@@ -68,8 +79,19 @@ CHILD_TASK_CAP = 24                     # the short task label after the role
 
 RESOLVE_BUDGET_S = 1.5                  # whole-snapshot title budget
 
-SOURCES = ("manual", "native", "scheduler", "instruction",
+SOURCES = ("manual", "herdr", "native", "scheduler", "instruction",
            "summary", "workspace")
+# Sources whose title is a deterministic GUESS (cached per deriver version).
+DERIVED_SOURCES = ("instruction", "summary")
+# Bump whenever derive_title's output can change for the same input: every
+# cached derived title re-derives once under the new rules (v2: questions,
+# path-first statements and verb-only commands no longer derive; the
+# summary level is retired from session naming).
+DERIVER_VERSION = 2
+# The Pi custom entry TENDRIL's extension appends beside a name it applied
+# (`{"source": "manual"|"scheduler", "name": ...}`) — provenance Pi's own
+# session_info entry cannot carry.
+TITLE_MARKER = "tendril-title"
 
 # The scheduler names agents `tendril-<id8>` (remote-agents _schedule_launcher);
 # such a name is a routing token, NOT a native title — level 3 owns it.
@@ -167,9 +189,23 @@ _PRODUCT_WORDS = frozenset(
 
 def _early_be_clause(clause):
     """Narration ("Claude opus is the sole reviewer"): a bare is/are within
-    the first few words is a statement, never a topic."""
+    the first few words is a statement, never a topic. Case-insensitive —
+    a capitalised head ("Is the absolute path …") is the same narration."""
     return bool(re.match(r"^[a-zA-Z0-9' .\-]{0,40}\b(is|are|was|were)\b",
-                         clause))
+                         clause, re.IGNORECASE))
+
+
+# A surviving prose head that is an auxiliary or a wh-word opens a QUESTION
+# or a statement ("Is the absolute path …", "Can you check …", "What does
+# …"), never a topic. Judged AFTER noise tokens (paths, ids, urls) drop: a
+# prompt that begins "/home/x/repo is the absolute path" must not surface
+# "Is the absolute path" once the path falls away.
+_LEAD_AUX = frozenset("""
+is are was were am be been do does did can could should would will shall
+may might must has have had what why how where when which who whom whose
+isn't aren't wasn't weren't don't doesn't didn't can't couldn't shouldn't
+wouldn't won't
+""".split())
 
 
 def _is_camel(tok):
@@ -223,6 +259,7 @@ here there please exactly verbatim yet still also both per via after before
 between during without within across against among around behind below above
 near since until toward towards upon while if because than when what which
 who whom whose where why how least itself themselves myself yourself
+final already
 """.split())
 _ADJ_TAIL_RE = re.compile(
     r"(ive|ful|ous|less|able|ible)$"        # authoritative, meaningful…
@@ -263,6 +300,8 @@ _GENERIC_NOUNS = frozenset("""
 result results sentence sentences word words composition compositions
 second seconds agent agents prompt prompts truth truths adapter adapters
 file files output outputs error errors pdf pdfs thing things stuff
+worktree worktrees repo repos repository repositories directory directories
+folder folders
 """.split())
 # bare verbs for the round-3 shapes: three in a row ("Locate inspect
 # synchronize") and verb-led weak objects
@@ -271,7 +310,7 @@ open close locate inspect synchronize synchronise rename copy move run fix
 update make build use get go work start stop launch add remove create delete
 write read send check verify test try finalize finalise prepare merge
 complete finish restore audit install integrate migrate deploy configure
-initialize initialise implement refactor
+initialize initialise implement refactor execute
 """.split())
 # internal-CamelCase product names stay salient summary terms; any other
 # CamelCase token is a code identifier ("MouseArea", "AgentReach"), never one
@@ -447,7 +486,7 @@ _FILLERS = (
     "please", "pls", "plz", "hey", "hi", "ok", "okay", "so", "then", "now",
     "also", "and", "but", "can you", "could you", "would you", "will you",
     "i want you to", "i need you to", "i'd like you to", "lets", "let's",
-    "let us", "we need to", "we should", "help me", "try to", "kindly",
+    "let us", "we need to", "we now need to", "now we need to", "we should", "help me", "try to", "kindly",
     "reply with", "respond with", "answer with",
     "exactly", "verbatim", "when ready", "asap",
 )
@@ -763,6 +802,16 @@ def derive_title(text, limit=DERIVE_CAP):
         # ("… With parallel capability")
         if heads[0].lower() in _LEAD_PREP:
             return None
+        # nor on an auxiliary / wh-word: a question or a statement
+        if heads[0].lower() in _LEAD_AUX:
+            return None
+        # narration re-checked on the surviving prose (the raw clause's
+        # head may have been a path the narration guard could not read)
+        if _early_be_clause(" ".join(heads)):
+            return None
+    # a question is never a topic, wherever its verb sits
+    if clause.rstrip().endswith("?"):
+        return None
     title = _finalize(kept, limit)
     return _weak_verb_object(title) if title else None
 
@@ -982,25 +1031,97 @@ def session_header(path):
     return _memo_put(key, out)
 
 
-def pi_native_name(path):
-    """The latest session_info name in a Pi transcript (<= 512 KB read),
-    or None. Cached per mtime."""
-    key = (path, _safe_mtime(path), "name")
+def pi_native_info(path):
+    """The Pi transcript's session NAME with its provenance evidence:
+    {name, ts, only, marker} — `name` the latest session_info name (None
+    when unnamed), `ts` its epoch, `only` True when that entry is also the
+    FIRST session_info in the file (the name was set once and never
+    changed), `marker` the source a TENDRIL provenance entry recorded for
+    that exact name ("manual" / "scheduler") or None. Head + tail windows,
+    cached per mtime.
+
+    Pi stores `/name`, `--name` and an extension's setSessionName() as the
+    SAME session_info entry — nothing in it says who wrote it. The marker
+    is how TENDRIL's own extension records the names it applied."""
+    key = (path, _safe_mtime(path), "nameinfo")
     hit = _memo_get(key)
-    if hit is not None and "name" in hit:
-        return hit["name"]
-    best = (None, None)                     # (ts, name)
+    if hit is not None:
+        return hit
+    first_id = None
+    best = None                             # (ts, name, id)
+    markers = {}                            # name -> source
     for d in _iter_jsonl(path, tail=True):
-        if d.get("type") != "session_info":
+        t = d.get("type")
+        if t == "custom" and d.get("customType") == TITLE_MARKER:
+            data = d.get("data")
+            if isinstance(data, dict) and isinstance(data.get("name"), str) \
+                    and data.get("source") in ("manual", "scheduler"):
+                markers[sanitize_title(data["name"])] = data["source"]
+            continue
+        if t != "session_info":
             continue
         name = d.get("name")
         if not isinstance(name, str) or not name.strip():
             continue
+        if first_id is None:
+            first_id = d.get("id") or id(d)
         ts = _iso_to_epoch(d.get("timestamp")) or 0
-        if best[0] is None or ts >= best[0]:
-            best = (ts, name.strip())
-    name = sanitize_title(best[1], WIRE_TITLE_CAP)
-    return _memo_put(key, {"name": name}).get("name")
+        if best is None or ts >= best[0]:
+            best = (ts, name.strip(), d.get("id") or id(d))
+    out = {"name": None, "ts": None, "only": False, "marker": None}
+    if best is not None:
+        name = sanitize_title(best[1], WIRE_TITLE_CAP)
+        out = {"name": name, "ts": best[0] or None,
+               "only": best[2] == first_id, "marker": markers.get(name)}
+    return _memo_put(key, out)
+
+
+def pi_native_name(path):
+    """The latest session_info name in a Pi transcript, or None."""
+    return pi_native_info(path).get("name")
+
+
+def _phrase_tokens(text):
+    """Lowercased prose tokens of a text, noise (paths, ids, secrets)
+    removed — the token stream a derived title's words were cut from."""
+    out = []
+    for raw in _TOKEN_SPLIT_RE.split(text or ""):
+        tok = _clean_token(raw)
+        # the deriver keeps only words with 2+ letters (_meaningful_words):
+        # "a", "&", "+" and bare numbers never reach a derived title
+        if tok and not _is_noise(tok) and _WORD_RE.search(tok):
+            out.append(tok.lower())
+    return out
+
+
+def looks_auto_named(name, first_instruction):
+    """True when a Pi session name has the exact shape of a title TENDRIL's
+    pre-0.2.6 extension derived from the first instruction and wrote with
+    setSessionName() — a heuristic guess that was stored like a user's
+    `/name`. The shape: <= DERIVE_CAP chars, 2-8 words, already in the
+    deriver's own sentence-case normal form, and its words a contiguous run
+    of the first instruction's prose tokens (a dropped leading article
+    allowed). Human names (`w02-p8app`, `ABYSSAL ULTIMATE`, `Omarchy
+    Ricing`, "Fix login" typed for a prompt about something else) fail it.
+    Callers also require the name to be the only one ever set."""
+    if not isinstance(name, str) or not isinstance(first_instruction, str):
+        return False
+    if len(name) > DERIVE_CAP:
+        return False
+    words = name.split(" ")
+    if not 2 <= len(words) <= 8:
+        return False
+    if " ".join(_sentence_case(words)) != name:
+        return False
+    want = [w.lower() for w in words]
+    toks = _phrase_tokens(first_instruction[:INSTRUCTION_CAP])
+    n = len(want)
+    for i in range(len(toks) - n + 1):
+        if toks[i:i + n] == want:
+            return True
+        if toks[i] in _LEAD_ARTICLE and toks[i + 1:i + 1 + n] == want:
+            return True
+    return False
 
 
 def _message_text(d):
@@ -1257,12 +1378,17 @@ def _save_cache(titles, cache_path=None):
 
 def _cache_valid(entry, start):
     """Pane-reuse guard: the entry pins the session's own start; a session
-    whose start differs (a reused pane, a new transcript) never inherits."""
+    whose start differs (a reused pane, a new transcript) never inherits.
+    A DERIVED entry is valid only for the deriver version that wrote it:
+    an improved deriver re-derives each cached guess exactly once."""
     if not isinstance(entry, dict):
         return False
     if not isinstance(entry.get("title"), str) or not entry["title"]:
         return False
     if entry.get("source") not in SOURCES:
+        return False
+    if entry.get("source") in DERIVED_SOURCES \
+            and entry.get("dv") != DERIVER_VERSION:
         return False
     cs, s = entry.get("session_start"), start
     if isinstance(cs, (int, float)) and isinstance(s, (int, float)):
@@ -1284,6 +1410,12 @@ def _start_of(agent, key):
 
 def _store(titles, key, title, source, start, pane=None):
     entry = {"title": title, "source": source, "at": int(time.time())}
+    if source in DERIVED_SOURCES:
+        entry["dv"] = DERIVER_VERSION
+    prev = titles.get(key)
+    if source != "manual" and isinstance(prev, dict) \
+            and isinstance(prev.get("cleared"), str):
+        entry["cleared"] = prev["cleared"]  # a reset outlives re-derivation
     if isinstance(start, (int, float)):
         entry["session_start"] = int(start)
     if pane:
@@ -1296,32 +1428,19 @@ def _store(titles, key, title, source, start, pane=None):
 # resolution
 
 
-def _native_title(agent, key, titles, now, home=None):
-    """Level 2: the Pi session_info name, the Claude transcript's native
-    summary / custom title, or else the Herdr agent name when it is
-    not a scheduler routing token (`-<hash>` stripped). A machine-assigned
-    role id (`general-purpose#20894abc`) is NEVER shown raw: it is the
-    child's ROLE — humanized, plus the short task label from the session's
-    own first instruction when one derives. (title, source) | None."""
-    home = home or HOME
-    if key and os.path.isabs(key) and key.endswith(".jsonl") \
-            and _is_regular(key):
-        name = pi_native_name(key)
-        if name:
-            role = _ROLE_ID_RE.match(name)
-            if role:
-                return _role_native_title(key, role.group(1), home)
-            # bare role names ("Explore", "Plan", "General purpose") are the
-            # harness's agent role, not a title: label them like children do
-            if name.strip().lower().replace("_", " ") in _ROLE_ONLY:
-                return _role_native_title(key, name, home, total_cap=32)
-            return name, "native"
-    elif key and UUID_RE.match(key):
-        cl = claude_transcript_path(key, home)
-        if cl:
-            name = claude_native_title(cl)
-            if name:
-                return name, "native"
+def _herdr_title(agent):
+    """Level 1: the name a human gave this pane IN HERDR — `herdr pane
+    rename` (PaneInfo.label, joined onto the agent row as `pane_label` by
+    collect()), or `name` when a Herdr build reports one on the agent row.
+    Herdr is the session manager: its explicit label is the authoritative
+    human name. A scheduler routing token (`tendril-<id8>`) never counts;
+    a token-shaped agent name (`focus-runner-9a1b2c`) is humanized."""
+    label = agent.get("pane_label")
+    if isinstance(label, str) and label.strip() \
+            and not SCHEDULER_NAME_RE.match(label.strip()):
+        t = sanitize_title(label)
+        if t:
+            return t
     name = agent.get("name")
     if isinstance(name, str) and name.strip() \
             and not SCHEDULER_NAME_RE.match(name.strip()):
@@ -1333,9 +1452,53 @@ def _native_title(agent, key, titles, now, home=None):
             if " " not in stripped and ("-" in stripped or "_" in stripped):
                 stripped = stripped.replace("_", " ").replace("-", " ")
                 stripped = stripped[:1].upper() + stripped[1:]
-            t = sanitize_title(stripped)
-            if t:
-                return t, "native"
+            return sanitize_title(stripped)
+    return None
+
+
+def _native_title(agent, key, titles, now, home=None):
+    """The harness's own explicit session name: (title, source, ts) | None.
+    Pi: the session_info name — EXCEPT a name TENDRIL's pre-0.2.6
+    extension derived and stored itself (looks_auto_named, set once, no
+    provenance marker): that is a guess, never the user's `/name`, and it
+    is re-derived like any other guess. A name the extension applied from
+    the host's queue carries a marker naming its real source. Claude: the
+    transcript's native summary / custom title. A machine-assigned role id
+    (`general-purpose#20894abc`) is NEVER shown raw: it is the child's ROLE
+    — humanized, plus the short task label from the session's own first
+    instruction when one derives."""
+    home = home or HOME
+    if key and os.path.isabs(key) and key.endswith(".jsonl") \
+            and _is_regular(key):
+        info = pi_native_info(key)
+        name = info.get("name")
+        if not name:
+            return None
+        cleared = (titles or {}).get(key) or {}
+        if isinstance(cleared, dict) and cleared.get("cleared") == name:
+            return None                 # reset from the phone: not a name
+        role = _ROLE_ID_RE.match(name)
+        if role:
+            r = _role_native_title(key, role.group(1), home)
+            return (r[0], r[1], info.get("ts")) if r else None
+        # bare role names ("Explore", "Plan", "General purpose") are the
+        # harness's agent role, not a title: label them like children do
+        if name.strip().lower().replace("_", " ") in _ROLE_ONLY:
+            r = _role_native_title(key, name, home, total_cap=32)
+            return (r[0], r[1], info.get("ts")) if r else None
+        if info.get("marker"):
+            return name, info["marker"], info.get("ts")
+        if info.get("only"):
+            turns = first_instructions(key, max_turns=1)
+            if turns and looks_auto_named(name, turns[0]):
+                return None             # a stored guess, not a native name
+        return name, "native", info.get("ts")
+    if key and UUID_RE.match(key):
+        cl = claude_transcript_path(key, home)
+        if cl:
+            name = claude_native_title(cl)
+            if name:
+                return name, "native", None
     return None
 
 
@@ -1364,14 +1527,28 @@ def _role_native_title(path, role, home, total_cap=None):
     return role_name, "native"
 
 
+def _target_kind(task):
+    """"new" | "existing" — the snapshot section carries the kind word, the
+    store the target dict; a task from before §7.3 targets always created
+    its own session."""
+    t = task.get("target")
+    if isinstance(t, dict):
+        t = t.get("kind")
+    return t if t in ("new", "existing") else "new"
+
+
 def _scheduler_title(pane, schedule_tasks):
     """Level 3: the title of the task that LAUNCHED this pane (the store
-    keeps pane_id once a task starts; terminal tasks keep it too)."""
+    keeps pane_id once a task starts; terminal tasks keep it too). A task
+    merely SENT to an existing session never names it: that session's
+    identity predates the task."""
     if not pane or not isinstance(schedule_tasks, list):
         return None
     best = None
     for t in schedule_tasks:
         if not isinstance(t, dict) or t.get("pane_id") != pane:
+            continue
+        if _target_kind(t) == "existing":
             continue
         title = t.get("title")
         if isinstance(title, str) and title.strip():
@@ -1385,10 +1562,37 @@ def _scheduler_title(pane, schedule_tasks):
     return sanitize_title(best[0], WIRE_TITLE_CAP)
 
 
+def _sent_to_existing(pane, schedule_tasks, title):
+    """True when the live schedule shows `title` belongs to a task that was
+    sent to this pane's EXISTING session (a cached scheduler title from
+    before 0.2.6 that must not stay the session's identity)."""
+    for t in schedule_tasks or []:
+        if isinstance(t, dict) and t.get("pane_id") == pane \
+                and _target_kind(t) == "existing" \
+                and sanitize_title(t.get("title"), WIRE_TITLE_CAP) == title:
+            return True
+    return False
+
+
 def resolve_agent(agent, workspace_label, schedule_tasks,
                   titles=None, home=None, now=None):
-    """(title|None, source|None) for one agent row, per §11 precedence.
-    `titles` = the loaded cache (mutated in memory; the caller persists)."""
+    """(title|None, source|None) for one agent row. The precedence (each
+    level only when every level above it yields nothing):
+
+      1. herdr       the pane's explicit Herdr label (`herdr pane rename`)
+      2. manual /    the most recent EXPLICIT human name: a TENDRIL rename
+         native      (phone / host CLI) or the harness's own session name
+                     (Pi `/name` / `--name`, Claude custom title) — a Pi
+                     rename made after a TENDRIL rename wins, and the reverse
+      3. scheduler   the title of the task that launched the pane
+      4. instruction the deterministic deriver on the first user turn
+                     (cached per deriver version, never recomputed within it)
+      5. workspace   "<workspace label> · <Harness>"
+      6. omit        the phone falls back to the harness name
+
+    A heuristic is never allowed to outrank or overwrite a human name, and
+    a guess is never presented as a human name. `titles` = the loaded cache
+    (mutated in memory; the caller persists)."""
     home = home or HOME
     now = now if now is not None else time.time()
     titles = titles if titles is not None else load_cache()
@@ -1401,57 +1605,67 @@ def resolve_agent(agent, workspace_label, schedule_tasks,
     if start is None and claude_tx:
         start = _claude_session_start(claude_tx)
 
-    cached = titles.get(key) if key else None
-    if _cache_valid(cached, start):
-        # levels 1-5 all persist: a valid entry IS the answer — manual
-        # overrides, natively named sessions and stored 3-5 titles never
-        # recompute (§11 stability)
-        return cached["title"], cached["source"]
+    # 1 herdr
+    h = _herdr_title(agent)
+    if h:
+        return h, "herdr"
 
-    # 2 native
+    cached = titles.get(key) if key else None
+    valid = _cache_valid(cached, start)
+    manual = cached if valid and cached.get("source") == "manual" else None
+
+    # 2 manual / native — the most recent explicit human act wins
     nat = _native_title(agent, key, titles, now, home=home)
+    if manual and nat:
+        n_title, n_source, n_ts = nat
+        m_at = manual.get("at")
+        if n_title == manual["title"] \
+                or not isinstance(n_ts, (int, float)) \
+                or not isinstance(m_at, (int, float)) or n_ts <= m_at:
+            return manual["title"], "manual"
+        return n_title, n_source       # renamed in the harness afterwards
+    if manual:
+        return manual["title"], "manual"
+    sched = _scheduler_title(pane, schedule_tasks)
     if nat:
-        return nat
+        n_title, n_source, _ts = nat
+        # a scheduler-applied native name IS the scheduler's title
+        if n_source == "native" and sched and n_title == sched:
+            n_source = "scheduler"
+        return n_title, n_source
 
     # 3 scheduler
-    sched = _scheduler_title(pane, schedule_tasks)
     if sched:
         if key:
             _store(titles, key, sched, "scheduler", start, pane)
         return sched, "scheduler"
+    if valid and cached.get("source") == "scheduler" \
+            and not _sent_to_existing(pane, schedule_tasks, cached["title"]):
+        return cached["title"], "scheduler"
 
-    # 4 instruction / 5 summary — only from a local transcript we may read:
-    # a Pi JSONL path, or the located transcript of a Claude session UUID
-    tx_path = None
+    # 4 instruction — cached guesses hold within one deriver version
+    if valid and cached.get("source") in DERIVED_SOURCES:
+        return cached["title"], cached["source"]
     tx_turns = []
     if key and os.path.isabs(key) and key.endswith(".jsonl") \
             and _is_regular(key) and _under_home(os.path.realpath(key), home):
-        tx_path = key
-        tx_turns = first_instructions(key)
+        tx_turns = first_instructions(key, max_turns=1)
     elif claude_tx:
-        tx_path = claude_tx
-        tx_turns = claude_first_instructions(claude_tx)
+        tx_turns = claude_first_instructions(claude_tx, max_turns=1)
     if tx_turns:
         t4 = derive_title(tx_turns[0])
+        t4 = sanitize_title(t4, WIRE_TITLE_CAP) if t4 else None
         if t4:
-            t4 = sanitize_title(t4, WIRE_TITLE_CAP)
-            if t4:
-                _store(titles, key, t4, "instruction", start, pane)
-                return t4, "instruction"
-        t5 = derive_summary(tx_turns)
-        if t5:
-            t5 = sanitize_title(t5, WIRE_TITLE_CAP)
-            if t5:
-                _store(titles, key, t5, "summary", start, pane)
-                return t5, "summary"
+            _store(titles, key, t4, "instruction", start, pane)
+            return t4, "instruction"
 
-    # 6 workspace fallback (deterministic; not persisted)
+    # 5 workspace fallback (deterministic; not persisted)
     wl = sanitize_title(workspace_label, 24) if workspace_label else None
     if wl:
         harness_disp = harness[:1].upper() + harness[1:] \
             if harness[:1].islower() else harness[:24]
         return "%s · %s" % (wl, harness_disp), "workspace"
-    # 7 omit — the phone falls back to the harness
+    # 6 omit — the phone falls back to the harness
     return None, None
 
 
@@ -1614,8 +1828,13 @@ def rename_session(pane_id, title, agent=None, home=None, now=None):
         return False, "session not identified"
     if title is None:
         titles = load_cache()
-        if key in titles and titles[key].get("source") == "manual":
-            del titles[key]
+        prev = titles.get(key)
+        if isinstance(prev, dict) and prev.get("source") == "manual":
+            # a tombstone, not a delete: the manual name was also delivered
+            # into the harness's own session name, which must not resurface
+            # as "native" once the human has reset it
+            titles[key] = {"cleared": prev.get("title"),
+                           "at": int(now)}
             _save_cache(titles)
         return True, None
     t = sanitize_title(title)
@@ -1723,19 +1942,19 @@ def backfill(dry_run=False, home=None, cache_path=None, limit=512,
         if h.get("parent"):
             skipped["child"] += 1
             continue
-        native = pi_native_name(path)
-        if native:
-            skipped["named"] += 1
-            continue
-        if path in titles:
+        info = pi_native_info(path)
+        if info.get("name"):
+            turns1 = first_instructions(path, max_turns=1)
+            if info.get("marker") or not info.get("only") or not (
+                    turns1 and looks_auto_named(info["name"], turns1[0])):
+                skipped["named"] += 1
+                continue
+        if _cache_valid(titles.get(path), None):
             skipped["cached"] += 1
             continue
-        turns = first_instructions(path)
+        turns = first_instructions(path, max_turns=1)
         title = derive_title(turns[0]) if turns else None
         source = "instruction" if title else None
-        if not title:
-            title = derive_summary(turns)
-            source = "summary" if title else None
         if not title:
             skipped["underived"] += 1
             continue
@@ -1752,19 +1971,16 @@ def backfill(dry_run=False, home=None, cache_path=None, limit=512,
     # (the identity live panes carry), guarded the same way, cache-only.
     for path, uuid, _mt in _root_claude_sessions(home)[:limit]:
         claude["scanned"] += 1
-        if uuid in titles:
+        if _cache_valid(titles.get(uuid), None):
             claude["skipped"]["cached"] += 1
             continue
         native = claude_native_title(path)
         if native:
             claude["skipped"]["native"] += 1
             continue
-        turns = claude_first_instructions(path)
+        turns = claude_first_instructions(path, max_turns=1)
         title = derive_title(turns[0]) if turns else None
         source = "instruction" if title else None
-        if not title:
-            title = derive_summary(turns)
-            source = "summary" if title else None
         if not title:
             claude["skipped"]["underived"] += 1
             continue

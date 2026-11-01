@@ -993,6 +993,16 @@ def _emit(harness, entry, status, now, home=None):
     ev = entry.get("last_event")
     if isinstance(ev, dict) and "at" in ev:
         out["last_event"] = dict(ev)
+    # 0.2.6: the session's LAST turn ended in an error / an abort — the one
+    # piece of primary-session failure evidence the transcript records
+    # (herdr's agent_status has no failed state). Only while that stop is
+    # still the latest act; a newer prompt clears it.
+    sr = entry.get("stop_reason")
+    if status not in ("working", "blocked") and _stop_is_last(entry):
+        if _error_stop(sr):
+            out["last_stop"] = "error"
+        elif _aborted_stop(sr):
+            out["last_stop"] = "aborted"
     if entry.get("trail"):
         out["trail"] = entry["trail"]
     events = entry.get("events")
@@ -1299,6 +1309,38 @@ def _error_stop(sr):
     return isinstance(sr, str) and (sr == "error" or sr.startswith("error_"))
 
 
+def _aborted_stop(sr):
+    """A user/harness ABORT (Pi "aborted"): the run ended without finishing
+    — cancelled, never 'done' (0.2.6: an aborted child used to count toward
+    "all done")."""
+    return sr == "aborted"
+
+
+def _stop_is_last(e):
+    """The recorded stop is the run's latest act: no newer prompt began
+    another turn after it."""
+    sa = e.get("stop_at")
+    rp = e.get("last_prompt_at")
+    return not isinstance(sa, (int, float)) or \
+        not isinstance(rp, (int, float)) or rp <= sa
+
+
+def _child_failure(ce, now):
+    """WHY a child reads failed — a closed vocabulary of the EVIDENCE, never
+    transcript text: ("exit_code", code) | ("error_stop", None) |
+    ("tool_error", None) | None. Mirrors _child_status's failure order."""
+    code = (ce.get("meta") or {}).get("exitCode")
+    if isinstance(code, int):
+        return ("exit_code", code) if code != 0 else None
+    if _error_stop(ce.get("stop_reason")):
+        return ("error_stop", None)
+    last = _child_last(ce)
+    if last is not None and now - last >= CHILD_QUIET_S \
+            and _error_is_final(ce):
+        return ("tool_error", None)
+    return None
+
+
 def _error_is_final(ce):
     """The child's last record is an error tool result: no assistant turn,
     no prompt and no later-opened tool call happened after it (§7.2
@@ -1353,11 +1395,10 @@ def _child_status(ce, now):
     # states need the anti-flap window). Guard: a NEWER prompt means the
     # child started another turn (multi-turn same-dir children) — then the
     # active-window rules below decide, as before.
+    if _aborted_stop(ce.get("stop_reason")) and _stop_is_last(ce):
+        return "cancelled"
     if _terminal_stop(ce.get("stop_reason")):
-        sa = ce.get("stop_at")
-        rp = ce.get("last_prompt_at")
-        if not isinstance(sa, (int, float)) or \
-                not isinstance(rp, (int, float)) or rp <= sa:
+        if _stop_is_last(ce):
             return "done"
     if quiet <= CHILD_ACTIVE_S:
         if ce.get("open_calls"):
@@ -1442,6 +1483,12 @@ def _child_emit(harness, ce, now, home=None, parent_provider=None, path=None):
         out["activity"] = phrase
     if status in ("done", "failed", "cancelled") and ce.get("last_seen_at"):
         out["ended_at"] = int(ce["last_seen_at"])
+    if status == "failed":
+        why = _child_failure(ce, now)
+        if why:
+            out["failure"] = why[0]
+            if why[1] is not None:
+                out["exit_code"] = int(why[1])
     if ce.get("async"):
         out["async"] = True
     if path:
